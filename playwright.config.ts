@@ -7,24 +7,30 @@ export default defineConfig({
   expect: { timeout: 12_000 },
   reporter: 'list',
   use: {
-    baseURL: 'http://localhost:5173',
+    baseURL: 'http://localhost:5174',
     browserName: 'chromium',
     ...(process.platform === 'win32' ? { channel: 'msedge' } : {}),
-    screenshot: 'only-on-failure'
+    screenshot: 'only-on-failure',
   },
   webServer: [
     {
       command: 'npx tsx server/index.ts',
-      url: 'http://127.0.0.1:3001/api/health',
-      env: { DATA_DIR: '.data/e2e', APP_ORIGIN: 'http://localhost:5173', NODE_ENV: 'test', PORT: '3001' },
+      url: 'http://127.0.0.1:3002/api/health',
+      env: {
+        DATA_DIR: '.data/e2e',
+        APP_ORIGIN: 'http://localhost:5174',
+        NODE_ENV: 'test',
+        PORT: '3002',
+      },
       reuseExistingServer: false,
-      timeout: 60_000
+      timeout: 60_000,
     },
     {
-      command: 'npx vite --host 127.0.0.1',
-      url: 'http://localhost:5173',
+      command: 'npx vite --host 127.0.0.1 --port 5174',
+      url: 'http://localhost:5174',
+      env: { API_ORIGIN: 'http://127.0.0.1:3002' },
       reuseExistingServer: false,
-      timeout: 60_000
-    }
-  ]
+      timeout: 60_000,
+    },
+  ],
 });

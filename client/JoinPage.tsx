@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
 import { api } from './api.js';
+import { Icon, StatusBadge, formatDate } from './ui.js';
 
 export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
@@ -14,12 +15,20 @@ export function JoinPage({ code }: { code: string }) {
     async function poll() {
       try {
         const value = await api<PublicRoom>(`/join/${code}`);
-        if (active) { setRoom(value); setError(''); }
-      } catch (error) { if (active) setError(error instanceof Error ? error.message : 'Unable to load room.'); }
+        if (active) {
+          setRoom(value);
+          setError('');
+        }
+      } catch (error) {
+        if (active) setError(error instanceof Error ? error.message : 'Unable to load room.');
+      }
       if (active) timer = setTimeout(() => void poll(), 5000);
     }
     void poll();
-    return () => { active = false; clearTimeout(timer); };
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
   }, [code]);
 
   async function join(event: FormEvent) {
@@ -29,21 +38,67 @@ export function JoinPage({ code }: { code: string }) {
       await api(`/join/${code}`, 'POST', { label });
       setRoom(await api<PublicRoom>(`/join/${code}`));
       setError('');
-    } catch (error) { setError(error instanceof Error ? error.message : 'Unable to request access.'); }
-    finally { setBusy(false); }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Unable to request access.');
+    } finally {
+      setBusy(false);
+    }
   }
 
   if (!room) return <p role={error ? 'alert' : 'status'}>{error || 'Finding room…'}</p>;
-  return <section className="join-page">
-    <p className="eyebrow">JOIN A WORKSHOP · {room.status}</p><h1>{room.title}</h1>
-    <p>{room.description}</p><p className="muted">Access ends {new Date(room.expiresAt).toLocaleString()}</p>
-    {error && <p role="alert" className="error">{error}</p>}
-    {room.status !== 'open' ? <p>{room.status === 'draft' ? 'The organizer has not opened this room yet.' : 'This room has closed.'}</p> :
-      room.isOwner || room.membershipStatus === 'approved' ? <a className="button" href={`/rooms/${room.id}`}>Enter room</a> :
-      room.membershipStatus === 'pending' ? <p role="status">Waiting for organizer approval. This page updates automatically.</p> :
-      room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? <p>The organizer has declined access for this browser.</p> :
-      <form onSubmit={join}><label>Your label<input required maxLength={50} value={label} onChange={event => setLabel(event.target.value)} placeholder="A nickname or team label" /></label>
-        <p className="muted">Use a label the organizer can recognize. No email, roll number, or external ID is required.</p>
-        <button disabled={busy}>{busy ? 'Requesting…' : 'Request access'}</button></form>}
-  </section>;
+  return (
+    <section className="panel join-page">
+      <div className="join-heading">
+        <span className="empty-symbol">
+          <Icon name="rooms" />
+        </span>
+        <StatusBadge status={room.status} />
+      </div>
+      <p className="eyebrow">YOU’RE INVITED</p>
+      <h1>{room.title}</h1>
+      <p>{room.description}</p>
+      <p className="join-deadline">
+        <Icon name="clock" />
+        Access ends {formatDate(room.expiresAt)}
+      </p>
+      {error && (
+        <p role="alert" className="error">
+          {error}
+        </p>
+      )}
+      {room.status !== 'open' ? (
+        <p>
+          {room.status === 'draft'
+            ? 'The organizer has not opened this room yet.'
+            : 'This room has closed.'}
+        </p>
+      ) : room.isOwner || room.membershipStatus === 'approved' ? (
+        <a className="button" href={`/rooms/${room.id}`}>
+          Enter room
+        </a>
+      ) : room.membershipStatus === 'pending' ? (
+        <p role="status">Waiting for organizer approval. This page updates automatically.</p>
+      ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
+        <p>The organizer has declined access for this browser.</p>
+      ) : (
+        <form onSubmit={join}>
+          <label>
+            Your label
+            <input
+              required
+              maxLength={50}
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+              placeholder="A nickname or team label"
+            />
+          </label>
+          <p className="muted">
+            Use a label the organizer can recognize. No email, roll number, or external ID is
+            required.
+          </p>
+          <button disabled={busy}>{busy ? 'Requesting…' : 'Request access'}</button>
+        </form>
+      )}
+    </section>
+  );
 }

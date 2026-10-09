@@ -8,11 +8,13 @@ Use Node.js 22.12 or newer. From this directory, run `npm ci`, then `npm run dev
 
 Local development uses PGlite, an embedded PostgreSQL engine, with persistent data under `.data/portkey`. Set `DATABASE_URL` to use a PostgreSQL server through the `pg` connection pool instead. Migrations run at startup; `npm run db:migrate` applies them separately. Migration checksums prevent silently changing an already-applied schema. Add a new numbered SQL file for future changes.
 
-The Vite development proxy targets port 3001. Change `vite.config.ts` as well if changing the API port. `APP_ORIGIN` must match the browser address exactly; localhost and 127.0.0.1 are different origins. For production, run `npm run build`, set `NODE_ENV=production` and an HTTPS `APP_ORIGIN`, and run `npm start` behind an HTTPS reverse proxy. The API then serves the built frontend. The included rate limiter is process-local; a multi-instance deployment needs a shared store.
+The Vite development proxy targets port 3001; set `API_ORIGIN` when using another API address. `APP_ORIGIN` must match the browser address exactly; localhost and 127.0.0.1 are different origins. For production, run `npm run build`, set `NODE_ENV=production` and an HTTPS `APP_ORIGIN`, and run `npm start` behind an HTTPS reverse proxy. The API then serves the built frontend. The included rate limiter is process-local; a multi-instance deployment needs a shared store.
 
 ## Use the module
 
 Create a draft with a title, public description and future expiry. Edit the draft, then open it. Share the generated QR or link. In a separate browser profile, request access with a nickname or team label. The organizer approves or declines the request. An approved participant can enter the room; the organizer can remove that access or close the room.
+
+The workspace shows room counts and lets you search titles/descriptions or filter by lifecycle status. Use an owned room as a template for another event: its title and description are prefilled, you choose a fresh deadline, and a new draft is created with a new invitation. Memberships and approvals are never copied. Closed and expired rooms can be reused without reopening the original.
 
 The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process.
 
@@ -36,6 +38,7 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | POST | `/api/session` | Start or reuse a browser session |
 | GET | `/api/rooms` | List the caller's owned/requested rooms |
 | POST | `/api/rooms` | Create a draft |
+| POST | `/api/rooms/:id/duplicate` | Create an owner-only draft from a room template |
 | GET | `/api/rooms/:id` | Read owner or approved-participant room details |
 | PATCH | `/api/rooms/:id` | Replace title, description and expiry |
 | POST | `/api/rooms/:id/open` | Open a draft |
@@ -47,10 +50,12 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 
 Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
+The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `description` override the original values; omitted values are copied. It applies the same deadline/session limits as ordinary room creation.
+
 ## Study order and verification
 
 Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/rooms.ts`, and the frontend components. `server/app.ts` assembles middleware and routes; `server/database.ts` separates database drivers from room logic.
 
-Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers and use `.data/e2e` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
+Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
 
 File upload/download, anonymous membership proofs, browser file encryption, key delivery and secure device pairing are not implemented in this module. These ordinary session permissions are the foundation for those later modules, not a cryptographic privacy claim.

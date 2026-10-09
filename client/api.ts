@@ -1,7 +1,13 @@
 let csrfToken = '';
 
 export class ApiError extends Error {
-  constructor(public status: number, public code: string, message: string) { super(message); }
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
@@ -10,9 +16,9 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
     credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
-      ...(method !== 'GET' ? { 'X-CSRF-Token': csrfToken } : {})
+      ...(method !== 'GET' ? { 'X-CSRF-Token': csrfToken } : {}),
     },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {})
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   const data = await response.json();
   if (!response.ok) throw new ApiError(response.status, data.error.code, data.error.message);

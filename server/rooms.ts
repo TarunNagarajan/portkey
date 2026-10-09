@@ -1,7 +1,16 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { joinCode, memberDecision, roomId, roomInput, type Room, type PublicRoom } from '../shared/rooms.js';
+import {
+  joinCode,
+  memberDecision,
+  roomId,
+  roomInput,
+  roomTemplateInput,
+  type Room,
+  type RoomInput,
+  type PublicRoom,
+} from '../shared/rooms.js';
 import type { Database, Queries } from './database.js';
 import { requireCondition } from './errors.js';
 
@@ -24,11 +33,15 @@ const selection = `SELECT r.*, r.expires_at <= clock_timestamp() AS is_expired,
 
 function roomView(row: RoomRow, sessionId: string): Room {
   return {
-    id: row.id, title: row.title, description: row.description,
+    id: row.id,
+    title: row.title,
+    description: row.description,
     status: row.status === 'closed' ? 'closed' : row.is_expired ? 'expired' : row.status,
-    expiresAt: row.expires_at.toISOString(), createdAt: row.created_at.toISOString(),
-    joinCode: row.join_code, role: row.owner_id === sessionId ? 'owner' : 'participant',
-    membershipStatus: row.membership_status ?? null
+    expiresAt: row.expires_at.toISOString(),
+    createdAt: row.created_at.toISOString(),
+    joinCode: row.join_code,
+    role: row.owner_id === sessionId ? 'owner' : 'participant',
+    membershipStatus: row.membership_status ?? null,
   };
 }
 
@@ -40,16 +53,26 @@ async function clock(queries: Queries) {
 async function lockRoom(queries: Queries, id: string) {
   const [row] = await queries.query<RoomRow>('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [id]);
   requireCondition(row, 404, 'ROOM_NOT_FOUND', 'Room not found.');
-  row.is_expired = row.expires_at <= await clock(queries);
+  row.is_expired = row.expires_at <= (await clock(queries));
   return row;
 }
 
 function requireOwner(row: RoomRow, sessionId: string) {
-  requireCondition(row.owner_id === sessionId, 403, 'OWNER_REQUIRED', 'Only the organizer can do this.');
+  requireCondition(
+    row.owner_id === sessionId,
+    403,
+    'OWNER_REQUIRED',
+    'Only the organizer can do this.',
+  );
 }
 
 function requireActive(row: RoomRow) {
-  requireCondition(row.status !== 'closed' && !row.is_expired, 410, 'ROOM_CLOSED', 'This room has closed.');
+  requireCondition(
+    row.status !== 'closed' && !row.is_expired,
+    410,
+    'ROOM_CLOSED',
+    'This room has closed.',
+  );
 }
 
 function requireOpen(row: RoomRow) {
@@ -60,10 +83,41 @@ function requireOpen(row: RoomRow) {
 function validateExpiry(value: string, now: Date, sessionExpiry: Date) {
   const expiresAt = new Date(value);
   requireCondition(expiresAt > now, 422, 'INVALID_EXPIRY', 'Choose an expiry time in the future.');
-  requireCondition(expiresAt.getTime() - now.getTime() <= 7 * 24 * 60 * 60 * 1000,
-    422, 'INVALID_EXPIRY', 'A room can remain available for up to seven days.');
-  requireCondition(expiresAt < sessionExpiry, 422, 'SESSION_TOO_SHORT', 'Room expiry must be before your browser session expires.');
+  requireCondition(
+    expiresAt.getTime() - now.getTime() <= 7 * 24 * 60 * 60 * 1000,
+    422,
+    'INVALID_EXPIRY',
+    'A room can remain available for up to seven days.',
+  );
+  requireCondition(
+    expiresAt < sessionExpiry,
+    422,
+    'SESSION_TOO_SHORT',
+    'Room expiry must be before your browser session expires.',
+  );
   return expiresAt;
+}
+
+async function insertRoom(
+  queries: Queries,
+  ownerId: string,
+  sessionExpiry: Date,
+  input: RoomInput,
+) {
+  const expiresAt = validateExpiry(input.expiresAt, await clock(queries), sessionExpiry);
+  const [row] = await queries.query<RoomRow>(
+    `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *, false AS is_expired`,
+    [
+      randomUUID(),
+      ownerId,
+      randomBytes(12).toString('base64url'),
+      input.title,
+      input.description,
+      expiresAt,
+    ],
+  );
+  return roomView(row, ownerId);
 }
 
 export function roomRoutes(database: Database) {
@@ -71,54 +125,91 @@ export function roomRoutes(database: Database) {
 
   router.get('/rooms', async (request, response) => {
     const sessionId = request.session!.id;
-    const rows = await database.query<RoomRow>(`${selection}
-      WHERE r.owner_id = $1 OR m.session_id = $1 ORDER BY r.created_at DESC`, [sessionId]);
-    response.json(rows.map(row => roomView(row, sessionId)));
+    const rows = await database.query<RoomRow>(
+      `${selection}
+      WHERE r.owner_id = $1 OR m.session_id = $1 ORDER BY r.created_at DESC`,
+      [sessionId],
+    );
+    response.json(rows.map((row) => roomView(row, sessionId)));
   });
 
   router.post('/rooms', async (request, response) => {
     const input = roomInput.parse(request.body);
-    const expiresAt = validateExpiry(input.expiresAt, await clock(database), request.session!.expiresAt);
-    const [row] = await database.query<RoomRow>(
-      `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *, false AS is_expired`,
-      [randomUUID(), request.session!.id, randomBytes(12).toString('base64url'), input.title, input.description, expiresAt]
-    );
-    response.status(201).json(roomView(row, request.session!.id));
+    response
+      .status(201)
+      .json(await insertRoom(database, request.session!.id, request.session!.expiresAt, input));
+  });
+
+  router.post('/rooms/:id/duplicate', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const input = roomTemplateInput.parse(request.body);
+    const room = await database.transaction(async (transaction) => {
+      const original = await lockRoom(transaction, id);
+      requireOwner(original, request.session!.id);
+      return insertRoom(transaction, request.session!.id, request.session!.expiresAt, {
+        title: input.title ?? original.title,
+        description: input.description ?? original.description,
+        expiresAt: input.expiresAt,
+      });
+    });
+    response.status(201).json(room);
   });
 
   router.get('/join/:code', async (request, response) => {
     const code = joinCode.parse(request.params.code);
-    const [row] = await database.query<RoomRow>(`${selection} WHERE r.join_code = $2`, [request.session!.id, code]);
+    const [row] = await database.query<RoomRow>(`${selection} WHERE r.join_code = $2`, [
+      request.session!.id,
+      code,
+    ]);
     requireCondition(row, 404, 'ROOM_NOT_FOUND', 'Room not found.');
     const view = roomView(row, request.session!.id);
     const publicRoom: PublicRoom = {
-      id: view.id, title: view.title, description: view.description,
-      status: view.status, expiresAt: view.expiresAt,
-      membershipStatus: view.membershipStatus, isOwner: view.role === 'owner'
+      id: view.id,
+      title: view.title,
+      description: view.description,
+      status: view.status,
+      expiresAt: view.expiresAt,
+      membershipStatus: view.membershipStatus,
+      isOwner: view.role === 'owner',
     };
     response.json(publicRoom);
   });
 
   router.post('/join/:code', async (request, response) => {
     const code = joinCode.parse(request.params.code);
-    const { label } = z.object({ label: z.string().trim().min(1).max(50) }).strict().parse(request.body);
-    const membership = await database.transaction(async transaction => {
-      const [found] = await transaction.query<{ id: string }>('SELECT id FROM rooms WHERE join_code = $1', [code]);
+    const { label } = z
+      .object({ label: z.string().trim().min(1).max(50) })
+      .strict()
+      .parse(request.body);
+    const membership = await database.transaction(async (transaction) => {
+      const [found] = await transaction.query<{ id: string }>(
+        'SELECT id FROM rooms WHERE join_code = $1',
+        [code],
+      );
       requireCondition(found, 404, 'ROOM_NOT_FOUND', 'Room not found.');
       const row = await lockRoom(transaction, found.id);
       requireOpen(row);
-      requireCondition(row.owner_id !== request.session!.id, 409, 'ALREADY_OWNER', 'You already organize this room.');
-      const [existing] = await transaction.query<{ status: string }>(
-        'SELECT status FROM memberships WHERE room_id = $1 AND session_id = $2', [row.id, request.session!.id]
+      requireCondition(
+        row.owner_id !== request.session!.id,
+        409,
+        'ALREADY_OWNER',
+        'You already organize this room.',
       );
-      requireCondition(!existing || !['revoked', 'denied'].includes(existing.status),
-        403, 'ADMISSION_DENIED', 'The organizer has declined access for this browser.');
+      const [existing] = await transaction.query<{ status: string }>(
+        'SELECT status FROM memberships WHERE room_id = $1 AND session_id = $2',
+        [row.id, request.session!.id],
+      );
+      requireCondition(
+        !existing || !['revoked', 'denied'].includes(existing.status),
+        403,
+        'ADMISSION_DENIED',
+        'The organizer has declined access for this browser.',
+      );
       const [member] = await transaction.query(
         `INSERT INTO memberships (id, room_id, session_id, label) VALUES ($1, $2, $3, $4)
          ON CONFLICT (room_id, session_id) DO UPDATE SET label = memberships.label
          RETURNING id, label, status, requested_at AS "requestedAt"`,
-        [randomUUID(), row.id, request.session!.id, label]
+        [randomUUID(), row.id, request.session!.id, label],
       );
       return member;
     });
@@ -127,10 +218,18 @@ export function roomRoutes(database: Database) {
 
   router.get('/rooms/:id', async (request, response) => {
     const id = roomId.parse(request.params.id);
-    const [row] = await database.query<RoomRow>(`${selection} WHERE r.id = $2`, [request.session!.id, id]);
+    const [row] = await database.query<RoomRow>(`${selection} WHERE r.id = $2`, [
+      request.session!.id,
+      id,
+    ]);
     requireCondition(row, 404, 'ROOM_NOT_FOUND', 'Room not found.');
     if (row.owner_id !== request.session!.id) {
-      requireCondition(row.membership_status === 'approved', 403, 'ADMISSION_REQUIRED', 'Organizer approval is required.');
+      requireCondition(
+        row.membership_status === 'approved',
+        403,
+        'ADMISSION_REQUIRED',
+        'Organizer approval is required.',
+      );
       requireOpen(row);
     }
     response.json(roomView(row, request.session!.id));
@@ -139,14 +238,19 @@ export function roomRoutes(database: Database) {
   router.patch('/rooms/:id', async (request, response) => {
     const id = roomId.parse(request.params.id);
     const input = roomInput.parse(request.body);
-    const row = await database.transaction(async transaction => {
+    const row = await database.transaction(async (transaction) => {
       const room = await lockRoom(transaction, id);
       requireOwner(room, request.session!.id);
       requireActive(room);
-      const expiresAt = validateExpiry(input.expiresAt, await clock(transaction), request.session!.expiresAt);
+      const expiresAt = validateExpiry(
+        input.expiresAt,
+        await clock(transaction),
+        request.session!.expiresAt,
+      );
       const [updated] = await transaction.query<RoomRow>(
         `UPDATE rooms SET title = $2, description = $3, expires_at = $4
-         WHERE id = $1 RETURNING *, false AS is_expired`, [id, input.title, input.description, expiresAt]
+         WHERE id = $1 RETURNING *, false AS is_expired`,
+        [id, input.title, input.description, expiresAt],
       );
       return updated;
     });
@@ -156,14 +260,21 @@ export function roomRoutes(database: Database) {
   for (const action of ['open', 'close'] as const) {
     router.post(`/rooms/:id/${action}`, async (request, response) => {
       const id = roomId.parse(request.params.id);
-      const row = await database.transaction(async transaction => {
+      const row = await database.transaction(async (transaction) => {
         const room = await lockRoom(transaction, id);
         requireOwner(room, request.session!.id);
         requireActive(room);
-        if (action === 'open') requireCondition(room.status === 'draft', 409, 'INVALID_TRANSITION', 'Only a draft room can be opened.');
+        if (action === 'open')
+          requireCondition(
+            room.status === 'draft',
+            409,
+            'INVALID_TRANSITION',
+            'Only a draft room can be opened.',
+          );
         const [updated] = await transaction.query<RoomRow>(
           `UPDATE rooms SET status = $2::varchar, closed_at = CASE WHEN $2::varchar = 'closed' THEN clock_timestamp() ELSE NULL END
-           WHERE id = $1 RETURNING *, false AS is_expired`, [id, action === 'open' ? 'open' : 'closed']
+           WHERE id = $1 RETURNING *, false AS is_expired`,
+          [id, action === 'open' ? 'open' : 'closed'],
         );
         return updated;
       });
@@ -179,7 +290,8 @@ export function roomRoutes(database: Database) {
     const rows = await database.query(
       `SELECT m.id, m.label, m.status, m.requested_at AS "requestedAt"
        FROM memberships m JOIN sessions s ON s.id = m.session_id
-       WHERE m.room_id = $1 AND s.expires_at > clock_timestamp() ORDER BY m.requested_at`, [id]
+       WHERE m.room_id = $1 AND s.expires_at > clock_timestamp() ORDER BY m.requested_at`,
+      [id],
     );
     response.json(rows);
   });
@@ -188,20 +300,28 @@ export function roomRoutes(database: Database) {
     const id = roomId.parse(request.params.id);
     const memberId = roomId.parse(request.params.memberId);
     const { status } = memberDecision.parse(request.body);
-    const member = await database.transaction(async transaction => {
+    const member = await database.transaction(async (transaction) => {
       const room = await lockRoom(transaction, id);
       requireOwner(room, request.session!.id);
       requireOpen(room);
       const [current] = await transaction.query<{ status: string }>(
         `SELECT m.status FROM memberships m JOIN sessions s ON s.id = m.session_id
-         WHERE m.id = $1 AND m.room_id = $2 AND s.expires_at > clock_timestamp()`, [memberId, id]
+         WHERE m.id = $1 AND m.room_id = $2 AND s.expires_at > clock_timestamp()`,
+        [memberId, id],
       );
       requireCondition(current, 404, 'MEMBER_NOT_FOUND', 'Join request not found.');
-      const allowed = status === 'revoked' ? current.status === 'approved' : current.status === 'pending';
-      requireCondition(allowed, 409, 'INVALID_TRANSITION', 'This membership cannot make that transition.');
+      const allowed =
+        status === 'revoked' ? current.status === 'approved' : current.status === 'pending';
+      requireCondition(
+        allowed,
+        409,
+        'INVALID_TRANSITION',
+        'This membership cannot make that transition.',
+      );
       const [updated] = await transaction.query(
         `UPDATE memberships SET status = $2, decided_at = clock_timestamp()
-         WHERE id = $1 RETURNING id, label, status, requested_at AS "requestedAt"`, [memberId, status]
+         WHERE id = $1 RETURNING id, label, status, requested_at AS "requestedAt"`,
+        [memberId, status],
       );
       return updated;
     });
