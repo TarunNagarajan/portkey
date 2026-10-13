@@ -174,7 +174,21 @@ test('activity supports older pages, recovery from read errors and returning to 
     expect(result.status()).toBe(200);
   }
   await expect(activity.getByRole('button', { name: 'Older activity' })).toBeVisible();
+  const olderEndpoint = `${endpoint}?before=*`;
+  await page.route(olderEndpoint, (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: { code: 'UNAVAILABLE', message: 'Earlier activity unavailable.' },
+      }),
+    }),
+  );
   await activity.getByRole('button', { name: 'Older activity' }).click();
+  await expect(activity.getByRole('alert')).toHaveText('Earlier activity unavailable.');
+  await expect(activity.getByText('Room details updated', { exact: true })).toHaveCount(0);
+  await page.unroute(olderEndpoint);
+  await activity.getByRole('button', { name: 'Retry activity' }).click();
   await expect(activity.getByText('Room created', { exact: true })).toBeVisible();
   await expect(activity.getByRole('button', { name: 'Back to latest' })).toBeVisible();
   await expect(activity.getByRole('button', { name: 'Older activity' })).toHaveCount(0);
@@ -182,4 +196,14 @@ test('activity supports older pages, recovery from read errors and returning to 
   await activity.getByRole('button', { name: 'Back to latest' }).click();
   await expect(activity.getByText('Room opened', { exact: true })).toBeVisible();
   await expect(activity.getByText('Room created', { exact: true })).toHaveCount(0);
+  await page.route(olderEndpoint, () => {});
+  const cancelled = page.waitForEvent('requestfailed', {
+    predicate: (request) => request.url().startsWith(`${endpoint}?before=`),
+  });
+  await activity.getByRole('button', { name: 'Older activity' }).click();
+  await expect(activity.getByRole('status')).toHaveText('Loading activity…');
+  await activity.getByRole('button', { name: 'Back to latest' }).click();
+  await expect(activity.getByText('Room opened', { exact: true })).toBeVisible();
+  expect((await cancelled).failure()?.errorText).toContain('ERR_ABORTED');
+  await page.unroute(olderEndpoint);
 });

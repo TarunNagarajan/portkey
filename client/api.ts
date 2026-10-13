@@ -10,10 +10,16 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+export async function api<T>(
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
+    signal,
     headers: {
       'Content-Type': 'application/json',
       ...(method !== 'GET' ? { 'X-CSRF-Token': csrfToken } : {}),

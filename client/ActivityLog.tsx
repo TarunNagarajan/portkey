@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { ActivityKind, ActivityPage, RoomField } from '../shared/activity.js';
-import { api } from './api.js';
+import { api, ApiError } from './api.js';
 import { Icon } from './ui.js';
 
 const descriptions: Record<ActivityKind, string> = {
@@ -22,34 +22,52 @@ const fields: Record<RoomField, string> = {
 };
 
 export function ActivityLog({ roomId }: { roomId: string }) {
-  const [page, setPage] = useState<ActivityPage | null>(null);
+  const [result, setResult] = useState<{
+    roomId: string;
+    cursor: string | null;
+    page: ActivityPage;
+  } | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const page = result?.roomId === roomId && result.cursor === cursor ? result.page : null;
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     setLoading(true);
+    setError('');
     async function load() {
+      let canPoll = true;
       try {
         const suffix = cursor ? `?before=${encodeURIComponent(cursor)}` : '';
-        const result = await api<ActivityPage>(`/rooms/${roomId}/activity${suffix}`);
+        const page = await api<ActivityPage>(
+          `/rooms/${roomId}/activity${suffix}`,
+          'GET',
+          undefined,
+          controller.signal,
+        );
         if (active) {
-          setPage(result);
+          setResult({ roomId, cursor, page });
           setError('');
         }
       } catch (error) {
+        if (error instanceof ApiError && [401, 403, 404].includes(error.status)) {
+          canPoll = false;
+          if (active) setResult(null);
+        }
         if (active) setError(error instanceof Error ? error.message : 'Unable to load activity.');
       } finally {
         if (active) setLoading(false);
       }
-      if (active && !cursor) timer = setTimeout(() => void load(), 5000);
+      if (active && canPoll && !cursor) timer = setTimeout(() => void load(), 5000);
     }
     void load();
     return () => {
       active = false;
+      controller.abort();
       clearTimeout(timer);
     };
   }, [roomId, cursor, attempt]);
@@ -66,7 +84,7 @@ export function ActivityLog({ roomId }: { roomId: string }) {
           </p>
         </div>
         {cursor && (
-          <button className="secondary" disabled={loading} onClick={() => setCursor(null)}>
+          <button className="secondary" onClick={() => setCursor(null)}>
             Back to latest
           </button>
         )}

@@ -10,6 +10,7 @@ import {
   type Room,
   type RoomInput,
   type PublicRoom,
+  type Member,
 } from '../shared/rooms.js';
 import type { Database, Queries } from './database.js';
 import { requireCondition } from './errors.js';
@@ -28,6 +29,8 @@ interface RoomRow {
   is_expired: boolean;
   membership_status: Room['membershipStatus'];
 }
+
+type MembershipRow = Omit<Member, 'requestedAt'> & { requestedAt: Date };
 
 const selection = `SELECT r.*, r.expires_at <= clock_timestamp() AS is_expired,
   m.status AS membership_status FROM rooms r
@@ -105,7 +108,7 @@ async function insertRoom(
   ownerId: string,
   sessionExpiry: Date,
   input: RoomInput,
-  kind: ActivityKind = 'room_created',
+  kind: Extract<ActivityKind, 'room_created' | 'room_duplicated'> = 'room_created',
 ) {
   const expiresAt = validateExpiry(input.expiresAt, await clock(queries), sessionExpiry);
   const [row] = await queries.query<RoomRow>(
@@ -209,8 +212,8 @@ export function roomRoutes(database: Database) {
         'ALREADY_OWNER',
         'You already organize this room.',
       );
-      const [existing] = await transaction.query<{ status: string }>(
-        'SELECT status FROM memberships WHERE room_id = $1 AND session_id = $2',
+      const [existing] = await transaction.query<MembershipRow>(
+        'SELECT id, label, status, requested_at AS "requestedAt" FROM memberships WHERE room_id = $1 AND session_id = $2',
         [row.id, request.session!.id],
       );
       requireCondition(
@@ -219,13 +222,13 @@ export function roomRoutes(database: Database) {
         'ADMISSION_DENIED',
         'The organizer has declined access for this browser.',
       );
-      const [member] = await transaction.query<{ id: string; label: string; status: string }>(
+      if (existing) return existing;
+      const [member] = await transaction.query<MembershipRow>(
         `INSERT INTO memberships (id, room_id, session_id, label) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (room_id, session_id) DO UPDATE SET label = memberships.label
          RETURNING id, label, status, requested_at AS "requestedAt"`,
         [randomUUID(), row.id, request.session!.id, label],
       );
-      if (!existing) await recordActivity(transaction, row.id, 'join_requested', member.label);
+      await recordActivity(transaction, row.id, 'join_requested', member.label);
       return member;
     });
     response.status(200).json(membership);
