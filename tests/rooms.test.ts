@@ -10,6 +10,8 @@ import { createApp } from '../server/app.js';
 import { openDatabase, type Database } from '../server/database.js';
 import { migrate } from '../server/migrations.js';
 import type { Room } from '../shared/rooms.js';
+import type { ActivityPage } from '../shared/activity.js';
+import { recordActivity, readActivity } from '../server/activity.js';
 
 const origin = 'http://localhost:5173';
 let database: Database;
@@ -290,9 +292,16 @@ test('migrations are idempotent and detect modified history', async () => {
     'SELECT checksum FROM schema_migrations WHERE name = $1',
     ['001_initial.sql'],
   );
-  await database.query('UPDATE schema_migrations SET checksum = $1', ['0'.repeat(64)]);
+  await database.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [
+    '0'.repeat(64),
+    '001_initial.sql',
+  ]);
   await assert.rejects(migrate(database), /Migration changed/);
-  await database.query('UPDATE schema_migrations SET checksum = $1', [row.checksum]);
+  await database.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [
+    row.checksum,
+    '001_initial.sql',
+  ]);
+  await migrate(database);
 });
 
 test('a room template creates a fresh draft without copying membership or invitations', async () => {
@@ -365,6 +374,160 @@ test('terminal rooms can be reused without reopening the original', async () => 
   assert.equal((await owner.get(`/rooms/${copy.body.id}`).expect(200)).body.status, 'expired');
 });
 
+test('activity records successful actions without duplicating repeated requests or unchanged edits', async () => {
+  const owner = await browser();
+  const participant = await browser();
+  const room = await createRoom(owner);
+  await owner
+    .patch(`/rooms/${room.id}`, {
+      title: room.title,
+      description: room.description,
+      expiresAt: room.expiresAt,
+    })
+    .expect(200);
+  await owner.post(`/rooms/${room.id}/open`).expect(200);
+  const member = await requestAdmission(participant, room);
+  await requestAdmission(participant, room);
+  await owner
+    .patch(`/rooms/${room.id}`, {
+      title: 'Revised title',
+      description: room.description,
+      expiresAt: room.expiresAt,
+    })
+    .expect(200);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'approved' }).expect(200);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'revoked' }).expect(200);
+  await owner.post(`/rooms/${room.id}/close`).expect(200);
+  const page = (await owner.get(`/rooms/${room.id}/activity`).expect(200)).body as ActivityPage;
+  assert.deepEqual(
+    page.events.map((event) => event.kind),
+    [
+      'room_closed',
+      'member_revoked',
+      'member_approved',
+      'room_updated',
+      'join_requested',
+      'room_opened',
+      'room_created',
+    ],
+  );
+  assert.deepEqual(page.events.find((event) => event.kind === 'room_updated')!.changedFields, [
+    'title',
+  ]);
+  assert.equal(
+    page.events.find((event) => event.kind === 'join_requested')!.memberLabel,
+    'Team Cedar',
+  );
+  for (const event of page.events) {
+    assert.deepEqual(Object.keys(event).sort(), [
+      'changedFields',
+      'createdAt',
+      'id',
+      'kind',
+      'memberLabel',
+    ]);
+    assert.ok(!Number.isNaN(Date.parse(event.createdAt)));
+  }
+  assert.ok(!JSON.stringify(page).includes(owner.token));
+  assert.ok(!JSON.stringify(page).includes('Revised title'));
+});
+
+test('activity is owner-only, room-isolated and remains readable after expiry', async () => {
+  const owner = await browser();
+  const outsider = await browser();
+  const participant = await browser();
+  const room = await createRoom(owner, true);
+  const member = await requestAdmission(participant, room);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'approved' }).expect(200);
+  await participant.get(`/rooms/${room.id}/activity`).expect(403);
+  await outsider.get(`/rooms/${room.id}/activity`).expect(403);
+  await supertest(app).get(`/api/rooms/${room.id}/activity`).expect(401);
+  const another = await createRoom(owner);
+  assert.equal(
+    (await owner.get(`/rooms/${another.id}/activity`).expect(200)).body.events.length,
+    1,
+  );
+  await database.query(
+    `UPDATE rooms SET created_at = clock_timestamp() - interval '2 days',
+    expires_at = clock_timestamp() - interval '1 second' WHERE id = $1`,
+    [room.id],
+  );
+  assert.equal((await owner.get(`/rooms/${room.id}/activity`).expect(200)).body.events.length, 4);
+});
+
+test('declined requests and template creation have distinct activity', async () => {
+  const owner = await browser();
+  const participant = await browser();
+  const room = await createRoom(owner, true);
+  const member = await requestAdmission(participant, room);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'denied' }).expect(200);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'approved' }).expect(409);
+  const original = (await owner.get(`/rooms/${room.id}/activity`).expect(200)).body as ActivityPage;
+  assert.equal(original.events[0].kind, 'member_denied');
+  const copy = (
+    await owner.post(`/rooms/${room.id}/duplicate`, { expiresAt: input().expiresAt }).expect(201)
+  ).body as Room;
+  const copied = (await owner.get(`/rooms/${copy.id}/activity`).expect(200)).body as ActivityPage;
+  assert.deepEqual(
+    copied.events.map((event) => event.kind),
+    ['room_duplicated'],
+  );
+  assert.equal(
+    (await owner.get(`/rooms/${room.id}/activity`).expect(200)).body.events.length,
+    original.events.length,
+  );
+});
+
+test('keyset activity pages stay stable when newer actions arrive', async () => {
+  const owner = await browser();
+  const room = await createRoom(owner);
+  for (let index = 0; index < 44; index++) await recordActivity(database, room.id, 'room_opened');
+  const first = (await owner.get(`/rooms/${room.id}/activity`).expect(200)).body as ActivityPage;
+  assert.equal(first.events.length, 20);
+  await recordActivity(database, room.id, 'room_closed');
+  const second = (
+    await owner.get(`/rooms/${room.id}/activity?before=${first.nextCursor}`).expect(200)
+  ).body as ActivityPage;
+  const third = (
+    await owner.get(`/rooms/${room.id}/activity?before=${second.nextCursor}`).expect(200)
+  ).body as ActivityPage;
+  const events = [...first.events, ...second.events, ...third.events];
+  assert.equal(new Set(events.map((event) => event.id)).size, 45);
+  assert.ok(events.every((event, index) => index === 0 || BigInt(events[index - 1].id) > BigInt(event.id)));
+  assert.equal(third.nextCursor, null);
+  assert.equal(third.events.at(-1)!.kind, 'room_created');
+  for (const value of ['abc', '0', '-1', '1.5', '9223372036854775808', '99999999999999999999999']) {
+    await owner.get(`/rooms/${room.id}/activity?before=${value}`).expect(422);
+  }
+  await owner.get(`/rooms/${room.id}/activity?limit=1000`).expect(422);
+});
+
+test('room changes roll back if activity cannot be recorded', async (context) => {
+  context.mock.method(console, 'error', () => {});
+  const owner = await browser();
+  const room = await createRoom(owner);
+  await database.exec(
+    "ALTER TABLE room_activity ADD CONSTRAINT test_activity_failure CHECK (kind <> 'room_opened') NOT VALID",
+  );
+  try {
+    await owner.post(`/rooms/${room.id}/open`).expect(500);
+    assert.equal((await owner.get(`/rooms/${room.id}`).expect(200)).body.status, 'draft');
+    assert.equal((await owner.get(`/rooms/${room.id}/activity`).expect(200)).body.events.length, 1);
+  } finally {
+    await database.exec('ALTER TABLE room_activity DROP CONSTRAINT test_activity_failure');
+  }
+  const before = (await owner.get('/rooms').expect(200)).body.length;
+  await database.exec(
+    "ALTER TABLE room_activity ADD CONSTRAINT test_activity_failure CHECK (kind <> 'room_created') NOT VALID",
+  );
+  try {
+    await owner.post('/rooms', input()).expect(500);
+    assert.equal((await owner.get('/rooms').expect(200)).body.length, before);
+  } finally {
+    await database.exec('ALTER TABLE room_activity DROP CONSTRAINT test_activity_failure');
+  }
+});
+
 test('embedded PostgreSQL persists rooms across restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'portkey-test-'));
   let persistent = await openDatabase({ dataDir: join(directory, 'db') });
@@ -378,11 +541,16 @@ test('embedded PostgreSQL persists rooms across restart', async () => {
     await persistent.query(`INSERT INTO rooms (id, owner_id, join_code, title, expires_at)
       VALUES ('00000000-0000-4000-8000-000000000002', '00000000-0000-4000-8000-000000000001',
       'abcdefghijklmnop', 'Saved room', clock_timestamp() + interval '1 hour')`);
+    await recordActivity(persistent, '00000000-0000-4000-8000-000000000002', 'room_created');
     await persistent.close();
     persistent = await openDatabase({ dataDir: join(directory, 'db') });
     await migrate(persistent);
     const [row] = await persistent.query<{ title: string }>('SELECT title FROM rooms');
     assert.equal(row.title, 'Saved room');
+    assert.equal(
+      (await readActivity(persistent, '00000000-0000-4000-8000-000000000002')).events[0].kind,
+      'room_created',
+    );
   } finally {
     await persistent.close();
     await rm(directory, { recursive: true, force: true });

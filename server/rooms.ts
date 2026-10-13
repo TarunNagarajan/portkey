@@ -13,6 +13,8 @@ import {
 } from '../shared/rooms.js';
 import type { Database, Queries } from './database.js';
 import { requireCondition } from './errors.js';
+import { activityQuery, readActivity, recordActivity } from './activity.js';
+import type { ActivityKind, RoomField } from '../shared/activity.js';
 
 interface RoomRow {
   id: string;
@@ -103,6 +105,7 @@ async function insertRoom(
   ownerId: string,
   sessionExpiry: Date,
   input: RoomInput,
+  kind: ActivityKind = 'room_created',
 ) {
   const expiresAt = validateExpiry(input.expiresAt, await clock(queries), sessionExpiry);
   const [row] = await queries.query<RoomRow>(
@@ -117,6 +120,7 @@ async function insertRoom(
       expiresAt,
     ],
   );
+  await recordActivity(queries, row.id, kind);
   return roomView(row, ownerId);
 }
 
@@ -137,7 +141,11 @@ export function roomRoutes(database: Database) {
     const input = roomInput.parse(request.body);
     response
       .status(201)
-      .json(await insertRoom(database, request.session!.id, request.session!.expiresAt, input));
+      .json(
+        await database.transaction((transaction) =>
+          insertRoom(transaction, request.session!.id, request.session!.expiresAt, input),
+        ),
+      );
   });
 
   router.post('/rooms/:id/duplicate', async (request, response) => {
@@ -146,11 +154,17 @@ export function roomRoutes(database: Database) {
     const room = await database.transaction(async (transaction) => {
       const original = await lockRoom(transaction, id);
       requireOwner(original, request.session!.id);
-      return insertRoom(transaction, request.session!.id, request.session!.expiresAt, {
-        title: input.title ?? original.title,
-        description: input.description ?? original.description,
-        expiresAt: input.expiresAt,
-      });
+      return insertRoom(
+        transaction,
+        request.session!.id,
+        request.session!.expiresAt,
+        {
+          title: input.title ?? original.title,
+          description: input.description ?? original.description,
+          expiresAt: input.expiresAt,
+        },
+        'room_duplicated',
+      );
     });
     response.status(201).json(room);
   });
@@ -205,12 +219,13 @@ export function roomRoutes(database: Database) {
         'ADMISSION_DENIED',
         'The organizer has declined access for this browser.',
       );
-      const [member] = await transaction.query(
+      const [member] = await transaction.query<{ id: string; label: string; status: string }>(
         `INSERT INTO memberships (id, room_id, session_id, label) VALUES ($1, $2, $3, $4)
          ON CONFLICT (room_id, session_id) DO UPDATE SET label = memberships.label
          RETURNING id, label, status, requested_at AS "requestedAt"`,
         [randomUUID(), row.id, request.session!.id, label],
       );
+      if (!existing) await recordActivity(transaction, row.id, 'join_requested', member.label);
       return member;
     });
     response.status(200).json(membership);
@@ -252,6 +267,12 @@ export function roomRoutes(database: Database) {
          WHERE id = $1 RETURNING *, false AS is_expired`,
         [id, input.title, input.description, expiresAt],
       );
+      const changedFields: RoomField[] = [];
+      if (room.title !== input.title) changedFields.push('title');
+      if (room.description !== input.description) changedFields.push('description');
+      if (room.expires_at.getTime() !== expiresAt.getTime()) changedFields.push('expiresAt');
+      if (changedFields.length)
+        await recordActivity(transaction, id, 'room_updated', null, changedFields);
       return updated;
     });
     response.json(roomView(row, request.session!.id));
@@ -276,11 +297,21 @@ export function roomRoutes(database: Database) {
            WHERE id = $1 RETURNING *, false AS is_expired`,
           [id, action === 'open' ? 'open' : 'closed'],
         );
+        await recordActivity(transaction, id, action === 'open' ? 'room_opened' : 'room_closed');
         return updated;
       });
       response.json(roomView(row, request.session!.id));
     });
   }
+
+  router.get('/rooms/:id/activity', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const { before } = activityQuery.parse(request.query);
+    const [room] = await database.query<RoomRow>('SELECT * FROM rooms WHERE id = $1', [id]);
+    requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+    requireOwner(room, request.session!.id);
+    response.json(await readActivity(database, id, before));
+  });
 
   router.get('/rooms/:id/members', async (request, response) => {
     const id = roomId.parse(request.params.id);
@@ -318,11 +349,12 @@ export function roomRoutes(database: Database) {
         'INVALID_TRANSITION',
         'This membership cannot make that transition.',
       );
-      const [updated] = await transaction.query(
+      const [updated] = await transaction.query<{ label: string }>(
         `UPDATE memberships SET status = $2, decided_at = clock_timestamp()
          WHERE id = $1 RETURNING id, label, status, requested_at AS "requestedAt"`,
         [memberId, status],
       );
+      await recordActivity(transaction, id, `member_${status}`, updated.label);
       return updated;
     });
     response.json(member);
