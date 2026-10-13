@@ -3,6 +3,7 @@ import type { Member, Room, RoomInput } from '../shared/rooms.js';
 import { api } from './api.js';
 import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
+import { ActivityLog } from './ActivityLog.js';
 import { Icon, StatusBadge, formatDate } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
@@ -254,6 +255,7 @@ export function RoomPage({ id }: { id: string }) {
               </div>
             )}
           </section>
+          <ActivityLog roomId={id} />
         </>
       )}
       {!owner && !error && (

@@ -20,6 +20,16 @@ The organizer's browser holds an HttpOnly session cookie. There is no registrati
 
 Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; it does not delete database records.
 
+## Organizer activity log
+
+Each room overview includes an organizer-only timeline of creation, template reuse, metadata edits, opening, closure, access requests and admission decisions. The latest page refreshes every five seconds. Use Older activity to browse previous pages; Back to latest resumes live updates. Older pages remain stable while new actions occur. History remains readable by the owner after closure or expiry.
+
+Migration `002_room_activity.sql` adds the history table without changing existing rooms. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
+
+Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
+
+`GET /api/rooms/:id/activity` returns `{ events, nextCursor }`, with up to 20 newest-first events. Pass `?before=<nextCursor>` for the next page. Cursors are numeric event IDs represented as strings; all requests independently verify room ownership. Logged timestamps use the database clock.
+
 ## Database and access boundaries
 
 `sessions` contains hashed browser credentials and their expiry. `rooms` belongs to one organizer session and has a unique random join address. `memberships` links one browser session to one room with a pending, approved, denied, or revoked status. `schema_migrations` records applied SQL and checksums. Foreign keys, uniqueness, checks and indexes are defined in `server/migrations/001_initial.sql`.
@@ -46,6 +56,7 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/join/:code` | Read public room details and own admission state |
 | POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` |
 | GET | `/api/rooms/:id/members` | List requests for the owner |
+| GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
 | PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |
 
 Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.

@@ -51,7 +51,21 @@ test('organizer creates and manages a room; a mobile participant requests access
     await participant.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
   ).toBe(true);
   await page.evaluate(() => window.scrollTo(0, 0));
+  const activity = page.getByRole('region', { name: 'Room activity', exact: true });
+  await expect(activity.getByText('Access approved', { exact: true })).toBeVisible();
+  await expect(activity.getByText('Room details updated', { exact: true })).toBeVisible();
+  await expect(
+    participant.getByRole('heading', { name: 'Room activity', exact: true }),
+  ).toHaveCount(0);
   await page.screenshot({ path: '../outputs/Portkey_Room_Management_Desktop.png', fullPage: true });
+  await page.screenshot({ path: '../outputs/Portkey_Activity_Log_Desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  await page.screenshot({ path: '../outputs/Portkey_Activity_Log_Mobile.png', fullPage: true });
+  await page.setViewportSize({ width: 1280, height: 720 });
   await participant.screenshot({
     path: '../outputs/Portkey_Room_Management_Mobile.png',
     fullPage: true,
@@ -63,6 +77,8 @@ test('organizer creates and manages a room; a mobile participant requests access
   page.once('dialog', (dialog) => void dialog.accept());
   await page.getByRole('button', { name: 'Close room', exact: true }).click();
   await expect(page.getByText('This room has closed. New admission is disabled.')).toBeVisible();
+  await expect(activity.getByText('Room closed', { exact: true })).toBeVisible();
+  await expect(activity.getByText('Access removed', { exact: true })).toBeVisible();
   await participant.goto(link!);
   await expect(participant.getByText('This room has closed.', { exact: true })).toBeVisible();
   await page.reload();
@@ -117,4 +133,53 @@ test('rooms can be searched, filtered and reused for another workshop', async ({
     true,
   );
   await page.screenshot({ path: '../outputs/Portkey_Workspace_Mobile.png', fullPage: true });
+});
+
+test('activity supports older pages, recovery from read errors and returning to latest', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByLabel('Room title').fill('Activity workshop');
+  await page.getByRole('button', { name: 'Create draft' }).click();
+  await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
+  const roomPath = new URL(page.url()).pathname;
+  const origin = new URL(page.url()).origin;
+  const activity = page.getByRole('region', { name: 'Room activity', exact: true });
+  await expect(activity.getByText('Room created', { exact: true })).toBeVisible();
+  const endpoint = `${origin}/api${roomPath}/activity`;
+  await page.route(endpoint, (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: { code: 'UNAVAILABLE', message: 'Activity temporarily unavailable.' },
+      }),
+    }),
+  );
+  await expect(activity.getByRole('alert')).toHaveText('Activity temporarily unavailable.');
+  await expect(page.getByRole('button', { name: 'Open room', exact: true })).toBeVisible();
+  await page.unroute(endpoint);
+  await activity.getByRole('button', { name: 'Retry activity' }).click();
+  await expect(activity.getByRole('alert')).toHaveCount(0);
+
+  const session = await page.request.post(`${origin}/api/session`, { headers: { Origin: origin } });
+  const { csrfToken } = await session.json();
+  const headers = { Origin: origin, 'X-CSRF-Token': csrfToken };
+  const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+  for (let index = 1; index <= 22; index++) {
+    const result = await page.request.patch(`${origin}/api${roomPath}`, {
+      headers,
+      data: { title: 'Activity workshop', description: `Revision ${index}`, expiresAt },
+    });
+    expect(result.status()).toBe(200);
+  }
+  await expect(activity.getByRole('button', { name: 'Older activity' })).toBeVisible();
+  await activity.getByRole('button', { name: 'Older activity' }).click();
+  await expect(activity.getByText('Room created', { exact: true })).toBeVisible();
+  await expect(activity.getByRole('button', { name: 'Back to latest' })).toBeVisible();
+  await expect(activity.getByRole('button', { name: 'Older activity' })).toHaveCount(0);
+  await page.request.post(`${origin}/api${roomPath}/open`, { headers });
+  await activity.getByRole('button', { name: 'Back to latest' }).click();
+  await expect(activity.getByText('Room opened', { exact: true })).toBeVisible();
+  await expect(activity.getByText('Room created', { exact: true })).toHaveCount(0);
 });

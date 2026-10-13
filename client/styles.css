@@ -781,6 +781,83 @@ footer {
 .skip-link:focus {
   top: 10px;
 }
+.members table {
+  min-width: 600px;
+}
+.activity-panel {
+  margin-top: 24px;
+}
+.activity-panel .panel-heading {
+  border-bottom: 1px solid #edf0f5;
+}
+.activity-list {
+  margin: 0;
+  padding: 0 22px;
+  list-style: none;
+}
+.activity-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid #edf0f5;
+}
+.activity-list li:last-child {
+  border-bottom: 0;
+}
+.activity-symbol {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: #f0f4fa;
+  border-radius: 50%;
+  color: #647995;
+  flex-shrink: 0;
+}
+.activity-description {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.activity-description strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.activity-description p {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.activity-list time {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.activity-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 22px;
+  border-top: 1px solid #edf0f5;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.activity-pagination button {
+  font-size: 11px;
+  padding: 7px 11px;
+}
+.activity-error {
+  padding: 16px 22px;
+}
+@media (max-width: 480px) {
+  .activity-list li {
+    flex-wrap: wrap;
+  }
+  .activity-list time {
+    margin-left: 42px;
+    flex-basis: calc(100% - 42px);
+  }
+}
 @media (max-width: 1120px) {
   .home-layout {
     grid-template-columns: minmax(0, 1fr);
