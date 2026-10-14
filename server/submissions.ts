@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPublicKey } from 'node:crypto';
 import express from 'express';
 import { Router } from 'express';
 import { z } from 'zod';
@@ -12,6 +12,13 @@ const MAX_CHUNKS = 250;
 const CHUNK_BYTES = 1024 * 1024;
 const b64 = z.string().regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
 const fingerprint = (value: Buffer) => createHash('sha256').update(value).digest('hex');
+const validP256 = (value: Buffer) => {
+  if (value.length !== 65 || value[0] !== 4) return false;
+  try {
+    createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: value.subarray(1, 33).toString('base64url'), y: value.subarray(33, 65).toString('base64url') }, format: 'jwk' });
+    return true;
+  } catch { return false; }
+};
 
 interface RoomPolicy { id: string; owner_id: string; status: string; expires_at: Date; is_expired: boolean }
 
@@ -46,25 +53,40 @@ export function submissionRoutes(database: Database) {
   const router = Router();
   router.use('/rooms/:roomId/submissions/:submissionId/chunks/:index', (request, response, next) => {
     if (request.method !== 'PUT') return next();
-    express.raw({ type: 'application/octet-stream', limit: CHUNK_BYTES + 16 })(request, response, next);
+    void (async () => {
+      const pathRoom = roomId.parse(request.params.roomId);
+      const submissionId = roomId.parse(request.params.submissionId);
+      const [room] = await database.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1', [pathRoom]);
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireSubmitter(database, room, request.session!.id);
+      const [submission] = await database.query<{ submitter_id: string; status: string; encrypted_descriptor: Buffer | null }>(
+        'SELECT submitter_id, status, encrypted_descriptor FROM private_submissions WHERE id = $1 AND room_id = $2', [submissionId, pathRoom]);
+      requireCondition(submission && submission.submitter_id === request.session!.id, 404, 'SUBMISSION_NOT_FOUND', 'Submission not found.');
+      requireCondition(submission.status === 'uploading' && submission.encrypted_descriptor, 409, 'UPLOAD_UNAVAILABLE', 'This upload is no longer accepting chunks.');
+      express.raw({ type: 'application/octet-stream', limit: CHUNK_BYTES + 16 })(request, response, next);
+    })().catch(next);
   });
 
   router.get('/rooms/:id/submissions/keys', async (request, response) => {
     const id = roomId.parse(request.params.id);
-    const room = await roomPolicy(database, id);
-    await requireVisible(database, room, request.session!.id);
+    const [room] = await database.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1', [id]);
+    requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+    if (room.owner_id !== request.session!.id) {
+      requireCondition(room.status === 'open' && !room.is_expired, 410, 'ROOM_CLOSED', 'This room is no longer accepting submissions.');
+      await requireVisible(database, room, request.session!.id);
+    } else requireCondition(room.status !== 'closed' && !room.is_expired, 410, 'ROOM_CLOSED', 'This room has closed.');
     const [ownerKey] = await database.query<{ publicKey: Buffer; fingerprint: string }>(
       'SELECT public_key AS "publicKey", fingerprint FROM room_recipient_keys WHERE room_id = $1', [id]
     );
     requireCondition(ownerKey, 409, 'INBOX_NOT_ENABLED', 'The organizer has not enabled the encrypted inbox.');
     if (room.owner_id === request.session!.id) {
-      response.json({ ownerPublicKey: ownerKey.publicKey.toString('base64'), ownerFingerprint: ownerKey.fingerprint });
+      response.json({ ownerPublicKey: Buffer.from(ownerKey.publicKey).toString('base64'), ownerFingerprint: ownerKey.fingerprint });
       return;
     }
     const [submitterKey] = await database.query<{ fingerprint: string }>(
       'SELECT fingerprint FROM session_recipient_keys WHERE room_id = $1 AND session_id = $2', [id, request.session!.id]
     );
-    response.json({ ownerPublicKey: ownerKey.publicKey.toString('base64'), ownerFingerprint: ownerKey.fingerprint,
+    response.json({ ownerPublicKey: Buffer.from(ownerKey.publicKey).toString('base64'), ownerFingerprint: ownerKey.fingerprint,
       submitterFingerprint: submitterKey?.fingerprint ?? null });
   });
 
@@ -72,7 +94,7 @@ export function submissionRoutes(database: Database) {
     const id = roomId.parse(request.params.id);
     const input = z.object({ publicKey: b64 }).strict().parse(request.body);
     const publicKey = Buffer.from(input.publicKey, 'base64');
-    requireCondition(publicKey.length === 65 && publicKey[0] === 4, 422, 'INVALID_KEY', 'Organizer key is invalid.');
+    requireCondition(validP256(publicKey), 422, 'INVALID_KEY', 'Organizer key is invalid.');
     const room = await database.transaction(async transaction => {
       const [value] = await transaction.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE', [id]);
       requireCondition(value, 404, 'ROOM_NOT_FOUND', 'Room not found.');
@@ -91,23 +113,25 @@ export function submissionRoutes(database: Database) {
     const id = roomId.parse(request.params.id);
     const input = z.object({ publicKey: b64 }).strict().parse(request.body);
     const publicKey = Buffer.from(input.publicKey, 'base64');
-    requireCondition(publicKey.length === 65 && publicKey[0] === 4, 422, 'INVALID_KEY', 'Browser key is invalid.');
-    const room = await roomPolicy(database, id);
-    await requireSubmitter(database, room, request.session!.id);
-    const digest = fingerprint(publicKey);
-    const existing = await database.query<{ fingerprint: string }>(
-      'SELECT fingerprint FROM session_recipient_keys WHERE room_id = $1 AND session_id = $2', [id, request.session!.id]
-    );
-    requireCondition(!existing.length || existing[0].fingerprint === digest, 409, 'KEY_IMMUTABLE', 'This browser key is already registered for the room.');
-    if (!existing.length) await database.query(
-      'INSERT INTO session_recipient_keys (room_id, session_id, public_key, fingerprint) VALUES ($1, $2, $3, $4)', [id, request.session!.id, publicKey, digest]
-    );
+    requireCondition(validP256(publicKey), 422, 'INVALID_KEY', 'Browser key is invalid.');
+    const digest = await database.transaction(async transaction => {
+      const [room] = await transaction.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE', [id]);
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireSubmitter(transaction, room, request.session!.id);
+      const value = fingerprint(publicKey);
+      const existing = await transaction.query<{ fingerprint: string }>('SELECT fingerprint FROM session_recipient_keys WHERE room_id = $1 AND session_id = $2', [id, request.session!.id]);
+      requireCondition(!existing.length || existing[0].fingerprint === value, 409, 'KEY_IMMUTABLE', 'This browser key is already registered for the room.');
+      if (!existing.length) await transaction.query('INSERT INTO session_recipient_keys (room_id, session_id, public_key, fingerprint) VALUES ($1, $2, $3, $4)', [id, request.session!.id, publicKey, value]);
+      return value;
+    });
     response.status(201).json({ fingerprint: digest });
   });
 
   router.post('/rooms/:id/submissions', async (request, response) => {
     const id = roomId.parse(request.params.id);
-    const idValue = randomUUID();
+    const { uploadId: idValue } = z.object({ uploadId: roomId }).strict().parse(request.body);
+    let completed = false;
+    let completionReceipt: unknown;
     await database.transaction(async transaction => {
       const [room] = await transaction.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE', [id]);
       requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
@@ -115,18 +139,27 @@ export function submissionRoutes(database: Database) {
       const [ownerKey] = await transaction.query<{ public_key: Buffer }>('SELECT public_key FROM room_recipient_keys WHERE room_id = $1', [id]);
       const [submitterKey] = await transaction.query<{ public_key: Buffer }>('SELECT public_key FROM session_recipient_keys WHERE room_id = $1 AND session_id = $2', [id, request.session!.id]);
       requireCondition(ownerKey && submitterKey, 409, 'KEYS_REQUIRED', 'Set up the organizer and browser keys before uploading.');
+        const [existing] = await transaction.query<{ submitter_id: string; status: string; room_id: string; receipt: unknown }>('SELECT submitter_id, status, room_id, receipt FROM private_submissions WHERE id = $1 FOR UPDATE', [idValue]);
+      if (existing) {
+        requireCondition(existing.room_id === id && existing.submitter_id === request.session!.id, 409, 'UPLOAD_ID_CONFLICT', 'This upload reference is already in use.');
+          completed = existing.status === 'complete';
+          if (completed) completionReceipt = existing.receipt;
+        return;
+      }
+      await transaction.query("DELETE FROM private_submissions WHERE room_id = $1 AND status = 'uploading' AND created_at < clock_timestamp() - interval '24 hours'", [id]);
       const [usage] = await transaction.query<{ total: string }>(
-        `SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM private_submissions WHERE room_id = $1 AND status = 'complete'`, [id]
+        `SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM private_submissions WHERE room_id = $1`, [id]
       );
       requireCondition(Number(usage.total) < MAX_ROOM_BYTES, 413, 'ROOM_QUOTA', 'The room has reached its encrypted storage limit.');
-      await transaction.query("DELETE FROM private_submissions WHERE room_id = $1 AND status = 'uploading' AND created_at < clock_timestamp() - interval '24 hours'", [id]);
+      const [objectCount] = await transaction.query<{ count: number }>('SELECT count(*)::int AS count FROM private_submissions WHERE room_id = $1', [id]);
+      requireCondition(objectCount.count < 1000, 413, 'OBJECT_LIMIT', 'The room has reached its 1,000-submission limit.');
       const [pending] = await transaction.query<{ count: number }>("SELECT count(*)::int AS count FROM private_submissions WHERE room_id = $1 AND status = 'uploading'", [id]);
       requireCondition(pending.count < 100, 429, 'UPLOADS_PENDING', 'Too many uploads are already in progress for this room.');
       const [mine] = await transaction.query<{ count: number }>("SELECT count(*)::int AS count FROM private_submissions WHERE room_id = $1 AND submitter_id = $2 AND status = 'uploading'", [id, request.session!.id]);
       requireCondition(mine.count < 10, 429, 'UPLOADS_PENDING', 'Finish or retry your existing uploads before starting another.');
       await transaction.query('INSERT INTO private_submissions (id, room_id, submitter_id) VALUES ($1, $2, $3)', [idValue, id, request.session!.id]);
     });
-    response.status(201).json({ id: idValue, chunkBytes: CHUNK_BYTES, maxFileBytes: MAX_FILE_BYTES });
+    response.status(201).json({ id: idValue, complete: completed, ...(completed ? { receipt: completionReceipt } : {}), chunkBytes: CHUNK_BYTES, maxFileBytes: MAX_FILE_BYTES });
   });
 
   router.put('/rooms/:roomId/submissions/:submissionId/metadata', async (request, response) => {
@@ -142,7 +175,18 @@ export function submissionRoutes(database: Database) {
       await requireSubmitter(transaction, room, request.session!.id);
       const [submission] = await transaction.query<{ submitter_id: string; status: string; encrypted_descriptor: Buffer | null }>('SELECT submitter_id, status, encrypted_descriptor FROM private_submissions WHERE id = $1 AND room_id = $2 FOR UPDATE', [submissionId, roomIdValue]);
       requireCondition(submission && submission.submitter_id === request.session!.id, 404, 'SUBMISSION_NOT_FOUND', 'Submission not found.');
-      requireCondition(submission.status === 'uploading' && !submission.encrypted_descriptor, 409, 'METADATA_IMMUTABLE', 'Encrypted metadata is already set.');
+      requireCondition(submission.status === 'uploading', 409, 'UPLOAD_COMPLETE', 'This upload has already completed.');
+      if (submission.encrypted_descriptor) {
+        const stored = await transaction.query<{ recipient_id: string; enc: Buffer; ciphertext: Buffer }>(
+          'SELECT recipient_id, enc, ciphertext FROM submission_envelopes WHERE submission_id = $1', [submissionId]);
+        const owner = stored.find(row => row.recipient_id === room.owner_id);
+        const submitter = stored.find(row => row.recipient_id === request.session!.id);
+        const identical = Buffer.from(submission.encrypted_descriptor).equals(descriptor) && owner && submitter &&
+          Buffer.from(owner.enc).equals(envelopes[0].enc) && Buffer.from(owner.ciphertext).equals(envelopes[0].ciphertext) &&
+          Buffer.from(submitter.enc).equals(envelopes[1].enc) && Buffer.from(submitter.ciphertext).equals(envelopes[1].ciphertext);
+        requireCondition(identical, 409, 'METADATA_CONFLICT', 'A retry must send the original encrypted metadata and envelopes.');
+        return;
+      }
       await transaction.query('UPDATE private_submissions SET encrypted_descriptor = $2 WHERE id = $1', [submissionId, descriptor]);
       await transaction.query('INSERT INTO submission_envelopes (submission_id, recipient_id, enc, ciphertext) VALUES ($1, $2, $3, $4), ($1, $5, $6, $7)',
         [submissionId, room.owner_id, envelopes[0].enc, envelopes[0].ciphertext, request.session!.id, envelopes[1].enc, envelopes[1].ciphertext]);
@@ -198,9 +242,15 @@ export function submissionRoutes(database: Database) {
       if (submission.status === 'complete') return submission.receipt;
       requireCondition(submission.encrypted_descriptor, 409, 'METADATA_REQUIRED', 'Encrypted metadata is missing.');
       requireCondition(submission.chunk_count === chunkCount, 409, 'CHUNKS_MISSING', 'Upload is incomplete. Retry missing chunks before completing.');
-      const rows = await transaction.query<{ chunk_index: number; sha256: string }>('SELECT chunk_index, sha256 FROM submission_chunks WHERE submission_id = $1 ORDER BY chunk_index', [submissionId]);
-      requireCondition(rows.length === chunkCount && rows.every((row, idx) => row.chunk_index === idx), 409, 'CHUNKS_INVALID', 'Upload chunks are incomplete or corrupted.');
-      const manifest = createHash('sha256').update(submission.encrypted_descriptor).update(Buffer.from(rows.map(row => row.sha256).join(''), 'hex')).digest('hex');
+      const manifestHash = createHash('sha256').update(submission.encrypted_descriptor);
+      for (let index = 0; index < chunkCount; index += 1) {
+        const [chunk] = await transaction.query<{ ciphertext: Buffer; sha256: string }>('SELECT ciphertext, sha256 FROM submission_chunks WHERE submission_id = $1 AND chunk_index = $2', [submissionId, index]);
+        requireCondition(chunk && fingerprint(chunk.ciphertext) === chunk.sha256, 409, 'CHUNKS_INVALID', 'Upload chunks are incomplete or corrupted.');
+        manifestHash.update(Buffer.from(chunk.sha256, 'hex'));
+      }
+      const [stillActive] = await transaction.query<{ active: boolean }>('SELECT status = \'open\' AND expires_at > clock_timestamp() AS active FROM rooms WHERE id = $1', [roomIdValue]);
+      requireCondition(stillActive?.active, 410, 'ROOM_CLOSED', 'This room is no longer accepting submissions.');
+      const manifest = manifestHash.digest('hex');
       requireCondition(manifest === manifestSha256, 422, 'MANIFEST_MISMATCH', 'The encrypted upload manifest does not match stored chunks.');
       const value = { id: submissionId, manifestSha256: manifest, acceptedAt: new Date().toISOString(), encryptedBytes: Number(submission.encrypted_bytes) };
       await transaction.query("UPDATE private_submissions SET status = 'complete', manifest_sha256 = $2, receipt = $3, completed_at = clock_timestamp() WHERE id = $1", [submissionId, manifest, JSON.stringify(value)]);
@@ -215,7 +265,8 @@ export function submissionRoutes(database: Database) {
     await database.transaction(async transaction => {
       const [room] = await transaction.query<RoomPolicy>('SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE', [roomIdValue]);
       requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
-      requireCondition(room.owner_id === request.session!.id || room.status === 'open' && !room.is_expired, 410, 'ROOM_CLOSED', 'This room no longer accepts upload changes.');
+      requireCondition(room.status === 'open' && !room.is_expired, 410, 'ROOM_CLOSED', 'This room no longer accepts upload changes.');
+      await requireSubmitter(transaction, room, request.session!.id);
       const [submission] = await transaction.query<{ submitter_id: string; status: string }>('SELECT submitter_id, status FROM private_submissions WHERE id = $1 AND room_id = $2 FOR UPDATE', [submissionId, roomIdValue]);
       requireCondition(submission && submission.submitter_id === request.session!.id && submission.status === 'uploading', 404, 'SUBMISSION_NOT_FOUND', 'Upload not found.');
       await transaction.query('DELETE FROM private_submissions WHERE id = $1', [submissionId]);
@@ -227,14 +278,25 @@ export function submissionRoutes(database: Database) {
     const id = roomId.parse(request.params.roomId);
     const room = await roomPolicy(database, id);
     const role = await requireVisible(database, room, request.session!.id);
-    const rows = await database.query<{ id: string; submitter_id: string; encrypted_descriptor: Buffer; envelope_enc: Buffer; envelope_ciphertext: Buffer; chunk_count: number; encrypted_bytes: string; manifest_sha256: string; receipt: unknown; created_at: Date }>(
+    const beforeValue = z.string().base64url().max(200).optional().parse(request.query.before);
+    let before: { createdAt: string; id: string } | null = null;
+    if (beforeValue) {
+      try {
+        before = z.object({ createdAt: z.iso.datetime(), id: roomId }).strict().parse(JSON.parse(Buffer.from(beforeValue, 'base64url').toString('utf8')));
+      } catch { requireCondition(false, 422, 'INVALID_CURSOR', 'Submission page cursor is invalid.'); }
+    }
+    const rows = await database.query<{ id: string; submitter_id: string; encrypted_descriptor: Buffer; envelope_enc: Buffer; envelope_ciphertext: Buffer; chunk_count: number; encrypted_bytes: string; manifest_sha256: string; receipt: unknown; created_at: Date; created_at_cursor: string }>(
       `SELECT s.id, s.submitter_id, s.encrypted_descriptor, e.enc AS envelope_enc, e.ciphertext AS envelope_ciphertext,
-        s.chunk_count, s.encrypted_bytes::text AS encrypted_bytes, s.manifest_sha256, s.receipt, s.created_at
+        s.chunk_count, s.encrypted_bytes::text AS encrypted_bytes, s.manifest_sha256, s.receipt, s.created_at, s.created_at::text AS created_at_cursor
        FROM private_submissions s JOIN submission_envelopes e ON e.submission_id = s.id AND e.recipient_id = $2
        WHERE s.room_id = $1 AND s.status = 'complete' AND ($3 = 'owner' OR s.submitter_id = $2)
-       ORDER BY s.created_at DESC`, [id, request.session!.id, role]
+         AND ($4::timestamptz IS NULL OR (s.created_at, s.id) < ($4::timestamptz, $5::uuid))
+       ORDER BY s.created_at DESC, s.id DESC LIMIT 51`, [id, request.session!.id, role, before?.createdAt ?? null, before?.id ?? null]
     );
-    response.json(rows.map(row => ({ id: row.id, descriptor: row.encrypted_descriptor.toString('base64'), envelope: { enc: row.envelope_enc.toString('base64'), ciphertext: row.envelope_ciphertext.toString('base64') }, chunkCount: row.chunk_count, encryptedBytes: Number(row.encrypted_bytes), manifestSha256: row.manifest_sha256, receipt: row.receipt, createdAt: row.created_at.toISOString() })));
+    const pageRows = rows.slice(0, 50);
+    const last = pageRows.at(-1);
+    const nextCursor = rows.length > 50 && last ? Buffer.from(JSON.stringify({ createdAt: last.created_at_cursor, id: last.id })).toString('base64url') : null;
+    response.json({ submissions: pageRows.map(row => ({ id: row.id, descriptor: Buffer.from(row.encrypted_descriptor).toString('base64'), envelope: { enc: Buffer.from(row.envelope_enc).toString('base64'), ciphertext: Buffer.from(row.envelope_ciphertext).toString('base64') }, chunkCount: row.chunk_count, encryptedBytes: Number(row.encrypted_bytes), manifestSha256: row.manifest_sha256, receipt: row.receipt, createdAt: row.created_at.toISOString() })), nextCursor });
   });
 
   router.get('/rooms/:roomId/submissions/:submissionId/chunks/:index', async (request, response) => {

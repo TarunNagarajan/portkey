@@ -4,6 +4,7 @@ import { api } from './api.js';
 import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
+import { PrivateInbox } from './PrivateInbox.js';
 import { Icon, StatusBadge, formatDate } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
@@ -12,6 +13,7 @@ export function RoomPage({ id }: { id: string }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [inboxFingerprint, setInboxFingerprint] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     const current = await api<Room>(`/rooms/${id}`);
@@ -139,7 +141,8 @@ export function RoomPage({ id }: { id: string }) {
               />
             </section>
           )}
-          {room.status === 'open' && <ShareRoom code={room.joinCode} />}
+          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} />}
+          <PrivateInbox room={room} onOwnerFingerprint={owner => { if (owner) setInboxFingerprint(owner); }} />
           {room.status === 'draft' && (
             <div className="notice">
               <Icon name="rooms" />
@@ -259,16 +262,14 @@ export function RoomPage({ id }: { id: string }) {
         </>
       )}
       {!owner && !error && (
-        <section className="panel participant-welcome">
-          <span className="empty-symbol">
-            <Icon name="shield" />
-          </span>
-          <h2>You’re in.</h2>
-          <p>
-            You have organizer-approved access to this room. File sharing will be added in the next
-            module.
-          </p>
-        </section>
+        <>
+          <section className="panel participant-welcome">
+            <span className="empty-symbol"><Icon name="shield" /></span>
+            <h2>You’re in.</h2>
+            <p>Your organizer-approved access is active for this browser.</p>
+          </section>
+          <PrivateInbox room={room} />
+        </>
       )}
     </>
   );

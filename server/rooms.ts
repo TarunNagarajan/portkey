@@ -195,7 +195,7 @@ export function roomRoutes(database: Database) {
       'SELECT public_key AS "publicKey", fingerprint FROM room_recipient_keys WHERE room_id = $1', [view.id]
     );
     response.json({ ...publicRoom, organizerKeyFingerprint: recipientKey?.fingerprint ?? null,
-      organizerPublicKey: recipientKey?.publicKey.toString('base64') ?? null });
+      organizerPublicKey: recipientKey ? Buffer.from(recipientKey.publicKey).toString('base64') : null });
   });
 
   router.post('/join/:code', async (request, response) => {

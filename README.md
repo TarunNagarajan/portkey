@@ -28,6 +28,16 @@ Migration `002_room_activity.sql` adds the history table without changing existi
 
 Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
 
+## Encrypted submission inbox
+
+An organizer can enable a private submission inbox from a room overview. The browser creates an HPKE P-256 organizer key and keeps its private half in IndexedDB. Before enabling submissions, download and store an encrypted key backup. The backup uses a passphrase and browser-side encryption; restoring it recovers the decryption key but does not restore lost room access or the browser session.
+
+Organizer invitations include the public-key fingerprint in the URL fragment. Fragments are not sent to the server. Participants should open the invitation received directly through the organizer's trusted channel. A newly copied room link from the API does not prove the organizer's identity. Existing participants without a trusted invitation must compare the shown fingerprint with the organizer through another trusted channel before explicitly pinning it. A changed or mismatched fingerprint blocks uploads.
+
+Files and filenames are encrypted in the participant's browser. The browser encrypts chunks one at a time with AES-256-GCM and wraps a random file key separately for the organizer and original submitter using HPKE P-256/HKDF-SHA256/AES-256-GCM. The server stores immutable ciphertext, encrypted metadata, envelopes and an acceptance receipt. It cannot list filenames or decrypt file contents. Only the room owner and original submitter can list completed submissions or retrieve their ciphertext. Current approval, room state and deadline are checked on every mutation and read. The inbox supports files up to 250 MiB, 250 chunks, 1,000 submissions per room and 5 GiB total encrypted storage; interrupted uploads are retained locally for retry and stale pending uploads are cleaned after 24 hours.
+
+Downloads authenticate each encrypted chunk and the complete manifest before saving the plaintext. Browsers with the Origin Private File System stage verified plaintext locally before final save; browsers without that API are limited to 50 MiB fallback downloads. Browser storage can be cleared by the user or browser policy. Keep the encrypted key backup separately and protect its passphrase. Backups contain decryption keys but do not contain session authorization, room membership, pending upload ciphertext, or a way to recover an expired/removed browser session.
+
 `GET /api/rooms/:id/activity` returns `{ events, nextCursor }`, with up to 20 newest-first events. Pass `?before=<nextCursor>` for the next page. Cursors are numeric event IDs represented as strings; all requests independently verify room ownership. Logged timestamps use the database clock.
 
 ## Database and access boundaries
@@ -58,6 +68,13 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/rooms/:id/members` | List requests for the owner |
 | GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
 | PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |
+| GET/POST | `/api/rooms/:id/submissions/owner-key` | Read or register the immutable organizer public key |
+| GET/POST | `/api/rooms/:id/submissions/submitter-key` | Read or register the current browser's immutable submitter public key |
+| POST/PUT | `/api/rooms/:id/submissions` and `/api/rooms/:id/submissions/:submissionId/metadata` | Start an encrypted upload and set its encrypted descriptor and recipient envelopes |
+| PUT/POST | `/api/rooms/:id/submissions/:submissionId/chunks/:index` and `/complete` | Store immutable encrypted chunks and finalize a verified receipt |
+| GET | `/api/rooms/:id/submissions` | Read a private, paginated list of completed submissions |
+| GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
+| DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
 
 Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
@@ -69,4 +86,4 @@ Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/ro
 
 Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
 
-File upload/download, anonymous membership proofs, browser file encryption, key delivery and secure device pairing are not implemented in this module. These ordinary session permissions are the foundation for those later modules, not a cryptographic privacy claim.
+Anonymous membership proofs and secure device pairing are not implemented. Key verification relies on an organizer-delivered invitation or an explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.

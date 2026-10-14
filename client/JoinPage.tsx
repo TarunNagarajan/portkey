@@ -73,7 +73,7 @@ export function JoinPage({ code }: { code: string }) {
             : 'This room has closed.'}
         </p>
       ) : room.isOwner || room.membershipStatus === 'approved' ? (
-        <a className="button" href={`/rooms/${room.id}`}>
+        <a className="button" href={`/rooms/${room.id}${window.location.hash}`}>
           Enter room
         </a>
       ) : room.membershipStatus === 'pending' ? (
