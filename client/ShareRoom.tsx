@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import { Icon } from './ui.js';
 
-export function ShareRoom({ code }: { code: string }) {
-  const link = `${window.location.origin}/join/${code}`;
+export function ShareRoom({ code, fingerprint }: { code: string; fingerprint?: string | null }) {
+  const link = `${window.location.origin}/join/${code}${fingerprint ? `#key=${fingerprint}` : ''}`;
   const [image, setImage] = useState('');
   const [message, setMessage] = useState('');
 
@@ -40,7 +40,8 @@ export function ShareRoom({ code }: { code: string }) {
       </div>
       <div>
         <h2 id="share-title">Invite participants</h2>
-        <p>Share this address. Each browser still needs your approval.</p>
+        <p>Share this address through a channel participants can trust. Each browser still needs your approval.</p>
+        {fingerprint && <p className="muted">Inbox key fingerprint: <code>{fingerprint}</code></p>}
         <a className="join-link" href={link}>
           {link}
         </a>

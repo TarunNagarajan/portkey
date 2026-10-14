@@ -1,6 +1,6 @@
 # Portkey
 
-Shared setup, database schema, ordinary access controls, and room management. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Source code has no explanatory comments; names and small functions carry the structure.
+Room management, organizer activity, and browser-encrypted private submissions. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
 
 ## Run locally
 
@@ -28,7 +28,27 @@ Migration `002_room_activity.sql` adds the history table without changing existi
 
 Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
 
+## Encrypted submission inbox
+
+An organizer can enable a private submission inbox from a room overview. The browser creates an HPKE P-256 organizer key and keeps its private half in IndexedDB. Before inviting submissions, download and store an encrypted key backup. The backup uses a passphrase and browser-side encryption; restoring it recovers the decryption key but does not restore lost room access or the browser session.
+
+Organizer invitations include the public-key fingerprint in the URL fragment. Browsers omit URL fragments from HTTP requests; Portkey does not transmit the invitation fingerprint fragment. Organizer links use a fingerprint verified against the locally held organizer key. Participants should open the invitation received directly through the organizer's trusted channel. A newly copied room link from the API does not prove the organizer's identity. Existing participants without a trusted invitation must compare the shown fingerprint with the organizer through another trusted channel before explicitly pinning it. A changed or mismatched fingerprint blocks uploads.
+
+Files and filenames are encrypted in the participant's browser. The browser encrypts chunks one at a time with AES-256-GCM and wraps a random file key separately for the organizer and original submitter using HPKE P-256/HKDF-SHA256/AES-256-GCM. The server stores immutable ciphertext, encrypted metadata, envelopes and an acceptance receipt. It cannot list filenames or decrypt file contents. Only the room owner and original submitter can list completed submissions or retrieve their ciphertext. Current approval, room state and deadline are checked on every mutation and read. The inbox supports files up to 250 MiB, 250 chunks, 1,000 submissions per room and 5 GiB total encrypted storage; interrupted uploads are retained locally for retry and starting a fresh upload removes pending uploads older than 24 hours. Limits allocate encrypted chunk bytes under the room lock; capacity for an entire file is not reserved in advance. Metadata and envelope storage is separately bounded by payload and object limits.
+
+Downloads authenticate each encrypted chunk and the complete manifest before saving the plaintext. Browsers with the Origin Private File System stage plaintext locally and verify it before final save. A save-file picker copies verified data to the chosen file and removes staging. Standard browser downloads retain their temporary source until you use Remove local download copies after saving; at most five copies are accepted sequentially. This avoids canceling an active download. Browsers without private file storage are limited to 50 MiB memory downloads. Browser storage can be cleared by the user or browser policy. Keep the encrypted key backup separately and protect its passphrase. Backups contain decryption keys but do not contain session authorization, room membership, pending upload ciphertext, or a way to recover an expired/removed browser session.
+
 `GET /api/rooms/:id/activity` returns `{ events, nextCursor }`, with up to 20 newest-first events. Pass `?before=<nextCursor>` for the next page. Cursors are numeric event IDs represented as strings; all requests independently verify room ownership. Logged timestamps use the database clock.
+
+### Encryption and trust limits
+
+Every upload has a fresh 32-byte secret and 32-byte HKDF salt. Separate HKDF-SHA256 labels derive content and metadata AES-256-GCM keys. Chunk nonces combine a random eight-byte prefix with a four-byte big-endian index; metadata uses a separate random 12-byte nonce and key. IndexedDB reserves each index before encryption and atomically saves its immutable ciphertext. If that ciphertext is lost after reservation, the upload must be discarded and restarted with a fresh key. A retry never encrypts changed data with the old nonce.
+
+HPKE uses RFC 9180 Base mode with P-256/HKDF-SHA256/AES-256-GCM. Envelope info and authenticated data bind protocol version, room, upload, recipient fingerprint and purpose. Metadata binds room/upload/purpose; chunk authenticated data additionally binds index and plaintext length. Completion verifies a SHA-256 manifest of the encrypted descriptor and ordered ciphertext hashes. A receipt records server acceptance and is not an independent signed attestation. The library is checked against the [published RFC test-vector revision](https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/5f503c564da00b0687b3de75f1dfbdfc4079ad31/test-vectors.json).
+
+Key backups use PBKDF2-HMAC-SHA256 with 600,000 iterations, a random 16-byte salt and AES-256-GCM with a random 12-byte nonce. Version 1 fixes the KDF cost rather than accepting attacker-supplied iteration counts. Inputs and decoded byte lengths are bounded before derivation. Restoration checks the room, public fingerprint and private/public key match before retaining a key. Passphrases stay in the browser.
+
+Content encryption assumes the intended browser application executes. A malicious server serving modified JavaScript could steal plaintext or keys. Session relationships, admission labels, room descriptions, sizes, timings and network addresses are not concealed by this feature. Private keys, pending upload keys and decrypted download copies are local browser data; they are not protected against compromise of that browser or device. Closure and expiry block future API access, but do not erase database records or files already saved by a recipient. Data deletion and session/account recovery remain separate work.
 
 ## Database and access boundaries
 
@@ -58,6 +78,14 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/rooms/:id/members` | List requests for the owner |
 | GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
 | PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |
+| GET | `/api/rooms/:id/submissions/keys` | Read public recipient keys for the owner or approved participant |
+| POST | `/api/rooms/:id/submissions/owner-key` | Register the immutable organizer public key |
+| POST | `/api/rooms/:id/submissions/submitter-key` | Register the current browser's immutable submitter public key |
+| POST/PUT | `/api/rooms/:id/submissions` and `/api/rooms/:id/submissions/:submissionId/metadata` | Start an encrypted upload and set its encrypted descriptor and recipient envelopes |
+| PUT/POST | `/api/rooms/:id/submissions/:submissionId/chunks/:index` and `/complete` | Store immutable encrypted chunks and finalize a verified receipt |
+| GET | `/api/rooms/:id/submissions` | Read a private, paginated list of completed submissions |
+| GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
+| DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
 
 Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
@@ -67,6 +95,6 @@ The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `descr
 
 Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/rooms.ts`, and the frontend components. `server/app.ts` assembles middleware and routes; `server/database.ts` separates database drivers from room logic.
 
-Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
+Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e-private-inbox` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
 
-File upload/download, anonymous membership proofs, browser file encryption, key delivery and secure device pairing are not implemented in this module. These ordinary session permissions are the foundation for those later modules, not a cryptographic privacy claim.
+Anonymous membership proofs and secure device pairing are not implemented. Key verification relies on an organizer-delivered invitation or an explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.

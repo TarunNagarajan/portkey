@@ -6,6 +6,7 @@ import type { Database } from './database.js';
 import { HttpError } from './errors.js';
 import { roomRoutes } from './rooms.js';
 import { sessionControls } from './sessions.js';
+import { submissionRoutes } from './submissions.js';
 
 export interface AppOptions { origin: string; secure: boolean; rateLimiting?: boolean }
 
@@ -37,6 +38,7 @@ export function createApp(database: Database, options: AppOptions) {
     sessions.checkOrigin(request, response, () => sessions.checkCsrf(request, response, next));
   });
   app.use('/api', roomRoutes(database));
+  app.use('/api', submissionRoutes(database));
   app.use('/api', (_request, response) => {
     response.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });
   });
@@ -48,7 +50,7 @@ export function createApp(database: Database, options: AppOptions) {
     } else if (error.type === 'entity.parse.failed' || error.type === 'entity.too.large') {
       response.status(error.type === 'entity.too.large' ? 413 : 400).json({ error: { code: 'INVALID_BODY', message: 'Request body is invalid or too large.' } });
     } else {
-      console.error(error);
+      console.error('API request failed', { name: error instanceof Error ? error.name : 'UnknownError' });
       response.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Something went wrong. Please try again.' } });
     }
   };

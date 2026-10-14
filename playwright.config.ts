@@ -17,7 +17,7 @@ export default defineConfig({
       command: 'npx tsx server/index.ts',
       url: 'http://127.0.0.1:3002/api/health',
       env: {
-        DATA_DIR: '.data/e2e',
+        DATA_DIR: '.data/e2e-private-inbox',
         APP_ORIGIN: 'http://localhost:5174',
         NODE_ENV: 'test',
         PORT: '3002',

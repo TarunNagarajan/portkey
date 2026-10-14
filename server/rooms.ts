@@ -188,8 +188,14 @@ export function roomRoutes(database: Database) {
       expiresAt: view.expiresAt,
       membershipStatus: view.membershipStatus,
       isOwner: view.role === 'owner',
+      organizerKeyFingerprint: null,
+      organizerPublicKey: null,
     };
-    response.json(publicRoom);
+    const [recipientKey] = await database.query<{ publicKey: Buffer; fingerprint: string }>(
+      'SELECT public_key AS "publicKey", fingerprint FROM room_recipient_keys WHERE room_id = $1', [view.id]
+    );
+    response.json({ ...publicRoom, organizerKeyFingerprint: recipientKey?.fingerprint ?? null,
+      organizerPublicKey: recipientKey ? Buffer.from(recipientKey.publicKey).toString('base64') : null });
   });
 
   router.post('/join/:code', async (request, response) => {
