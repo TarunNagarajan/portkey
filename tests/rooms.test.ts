@@ -158,6 +158,8 @@ test('the join address reveals public details but never owner or membership reco
     'id',
     'isOwner',
     'membershipStatus',
+    'organizerKeyFingerprint',
+    'organizerPublicKey',
     'status',
     'title',
   ]);

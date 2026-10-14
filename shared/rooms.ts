@@ -45,6 +45,8 @@ export interface PublicRoom {
   expiresAt: string;
   membershipStatus: MembershipStatus | null;
   isOwner: boolean;
+  organizerKeyFingerprint: string | null;
+  organizerPublicKey: string | null;
 }
 
 export interface Member {
