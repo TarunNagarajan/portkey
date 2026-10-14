@@ -50,7 +50,7 @@ export function createApp(database: Database, options: AppOptions) {
     } else if (error.type === 'entity.parse.failed' || error.type === 'entity.too.large') {
       response.status(error.type === 'entity.too.large' ? 413 : 400).json({ error: { code: 'INVALID_BODY', message: 'Request body is invalid or too large.' } });
     } else {
-      console.error(error);
+      console.error('API request failed', { name: error instanceof Error ? error.name : 'UnknownError' });
       response.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Something went wrong. Please try again.' } });
     }
   };

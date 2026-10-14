@@ -29,22 +29,45 @@ export async function api<T>(
   });
   if (response.status === 204) return undefined as T;
   const data = await response.json();
-  if (!response.ok) throw new ApiError(response.status, data.error.code, data.error.message, Number(response.headers.get('Retry-After') ?? 0));
+  if (!response.ok)
+    throw new ApiError(
+      response.status,
+      data.error.code,
+      data.error.message,
+      Number(response.headers.get('Retry-After') ?? 0),
+    );
   return data as T;
 }
 
-export async function apiBytes(path: string, method = 'GET', body?: Uint8Array): Promise<{ bytes: Uint8Array; sha256: string }> {
+export async function apiBytes(
+  path: string,
+  method = 'GET',
+  body?: Uint8Array,
+  signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; sha256: string }> {
   const response = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
-    headers: { ...(body ? { 'Content-Type': 'application/octet-stream' } : {}), ...(method !== 'GET' ? { 'X-CSRF-Token': csrfToken } : {}) },
+    signal,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/octet-stream' } : {}),
+      ...(method !== 'GET' ? { 'X-CSRF-Token': csrfToken } : {}),
+    },
     ...(body ? { body: Uint8Array.from(body).buffer } : {}),
   });
   if (!response.ok) {
     const data = await response.json();
-    throw new ApiError(response.status, data.error.code, data.error.message, Number(response.headers.get('Retry-After') ?? 0));
+    throw new ApiError(
+      response.status,
+      data.error.code,
+      data.error.message,
+      Number(response.headers.get('Retry-After') ?? 0),
+    );
   }
-  return { bytes: new Uint8Array(await response.arrayBuffer()), sha256: response.headers.get('X-Ciphertext-SHA256') ?? '' };
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    sha256: response.headers.get('X-Ciphertext-SHA256') ?? '',
+  };
 }
 
 export async function startSession() {

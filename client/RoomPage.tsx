@@ -142,7 +142,7 @@ export function RoomPage({ id }: { id: string }) {
             </section>
           )}
           {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} />}
-          <PrivateInbox room={room} onOwnerFingerprint={owner => { if (owner) setInboxFingerprint(owner); }} />
+          <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
           {room.status === 'draft' && (
             <div className="notice">
               <Icon name="rooms" />

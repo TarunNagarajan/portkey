@@ -333,6 +333,48 @@ main {
   color: var(--text-muted);
   margin: 3px 0 0;
 }
+.private-inbox {
+  padding: 22px;
+  margin-block: 24px;
+}
+.private-inbox .panel-heading {
+  padding: 0 0 16px;
+}
+.private-inbox code,
+.share-room code {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.private-inbox .backup-controls,
+.private-inbox .upload-controls,
+.private-inbox .submission-list {
+  margin-top: 20px;
+}
+.private-inbox .backup-controls button {
+  margin-bottom: 8px;
+}
+.private-inbox .notice {
+  display: grid;
+  gap: 12px;
+}
+.private-inbox .submission-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+}
+.private-inbox .submission-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-block: 12px;
+  border-top: 1px solid #e0e6ef;
+}
+.private-inbox progress {
+  width: min(100%, 400px);
+  margin-block: 16px;
+}
 .count-label {
   color: var(--text-muted);
   font-size: 12px;
