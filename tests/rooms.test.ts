@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -294,6 +294,14 @@ test('migrations are idempotent and detect modified history', async () => {
     'SELECT checksum FROM schema_migrations WHERE name = $1',
     ['001_initial.sql'],
   );
+  const sql = (await readFile(new URL('../server/migrations/001_initial.sql', import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
+  for (const ending of [sql, sql.replace(/\n/g, '\r\n')]) {
+    const legacyChecksum = createHash('sha256').update(ending).digest('hex');
+    await database.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [legacyChecksum, '001_initial.sql']);
+    await migrate(database);
+    const [retained] = await database.query<{ checksum: string }>('SELECT checksum FROM schema_migrations WHERE name = $1', ['001_initial.sql']);
+    assert.equal(retained.checksum, legacyChecksum);
+  }
   await database.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [
     '0'.repeat(64),
     '001_initial.sql',
