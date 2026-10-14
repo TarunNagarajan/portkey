@@ -295,7 +295,8 @@ test('migrations are idempotent and detect modified history', async () => {
     ['001_initial.sql'],
   );
   const sql = (await readFile(new URL('../server/migrations/001_initial.sql', import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
-  for (const ending of [sql, sql.replace(/\n/g, '\r\n')]) {
+  const windowsSql = sql.replace(/\n/g, '\r\n');
+  for (const ending of [sql, windowsSql, sql.replace(/\n$/, '\r\n'), windowsSql.replace(/\r\n$/, '\n')]) {
     const legacyChecksum = createHash('sha256').update(ending).digest('hex');
     await database.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [legacyChecksum, '001_initial.sql']);
     await migrate(database);

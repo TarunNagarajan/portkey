@@ -19,9 +19,12 @@ export async function migrate(database: Database) {
         '\n',
       );
       const checksum = createHash('sha256').update(sql).digest('hex');
-      const legacyWindowsChecksum = createHash('sha256')
-        .update(sql.replace(/\n/g, '\r\n'))
-        .digest('hex');
+      const windowsSql = sql.replace(/\n/g, '\r\n');
+      const legacyChecksums = [
+        windowsSql,
+        sql.replace(/\n$/, '\r\n'),
+        windowsSql.replace(/\r\n$/, '\n'),
+      ].map((value) => createHash('sha256').update(value).digest('hex'));
       const [applied] = await transaction.query<{ checksum: string }>(
         'SELECT checksum FROM schema_migrations WHERE name = $1',
         [name],
@@ -29,7 +32,7 @@ export async function migrate(database: Database) {
       if (
         applied &&
         applied.checksum !== checksum &&
-        applied.checksum !== legacyWindowsChecksum
+        !legacyChecksums.includes(applied.checksum)
       )
         throw new Error(`Migration changed: ${name}`);
       if (applied) continue;
