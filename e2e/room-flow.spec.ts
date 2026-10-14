@@ -1,5 +1,85 @@
 import { test, expect } from '@playwright/test';
 
+test('encrypted submissions require a pinned organizer key and round-trip privately', async ({ page, browser }) => {
+  await page.goto('/');
+  await page.getByLabel('Room title').fill('Encrypted review');
+  await page.getByRole('button', { name: 'Create draft' }).click();
+  await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
+  const ownerRoomUrl = page.url();
+  const ownerRoomPath = new URL(ownerRoomUrl).pathname;
+  await page.getByRole('button', { name: 'Enable encrypted inbox' }).click();
+  await expect(page.getByText('Encrypted inbox enabled.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Download encrypted key backup' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open room', exact: true }).click();
+  const invite = await page.locator('.join-link').getAttribute('href');
+  expect(invite).toMatch(/#key=[a-f0-9]{64}$/);
+
+  const participantContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const participant = await participantContext.newPage();
+  await participant.goto(invite!);
+  await expect(participant).toHaveURL(/#key=[a-f0-9]{64}$/);
+  await participant.getByLabel('Your label').fill('Private submitter');
+  await participant.getByRole('button', { name: 'Request access' }).click();
+  await expect(participant.getByText('Waiting for organizer approval. This page updates automatically.')).toBeVisible();
+  const memberRow = page.getByRole('row').filter({ hasText: 'Private submitter' });
+  await expect(memberRow).toBeVisible();
+  await memberRow.getByRole('button', { name: 'Approve', exact: true }).click();
+  await participant.getByRole('link', { name: 'Enter room' }).click();
+  await expect(participant.getByRole('heading', { name: 'Encrypted submission inbox' })).toBeVisible();
+  await expect(participant.getByRole('button', { name: 'Submit file privately' })).toBeVisible();
+
+  const fixture = { name: 'draft notes.txt', mimeType: 'text/plain', buffer: Buffer.from('private contents with no server-side filename') };
+  await participant.getByLabel('Choose a file (up to 250 MiB)').setInputFiles(fixture);
+  await participant.getByRole('button', { name: 'Submit file privately' }).click();
+  await expect(participant.getByText(/Submission accepted at/)).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'Refresh inbox' }).click();
+  await expect(page.getByRole('button', { name: 'Decrypt and download' })).toBeVisible();
+
+  await page.getByLabel('Backup passphrase').last().fill('a long browser-only backup passphrase');
+  const backupDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download encrypted key backup' }).click();
+  const backup = await backupDownload;
+  expect(backup.suggestedFilename()).toMatch(/key-backup\.json$/);
+  const backupPath = await backup.path();
+  expect(backupPath).toBeTruthy();
+  const backupText = await (await import('node:fs/promises')).readFile(backupPath!, 'utf8');
+  expect(backupText).not.toContain('privateKey');
+  await page.evaluate(() => new Promise<void>(resolve => {
+    const request = indexedDB.deleteDatabase('portkey-private-keys');
+    request.onsuccess = request.onerror = request.onblocked = () => resolve();
+  }));
+  await page.reload();
+  await expect(page.getByText(/registered private key is not stored/i)).toBeVisible();
+  await page.getByLabel('Backup passphrase').fill('a long browser-only backup passphrase');
+  await page.getByLabel('Encrypted key backup').setInputFiles({ name: 'recovery.json', mimeType: 'application/json', buffer: Buffer.from(backupText) });
+  await expect(page.getByText('The backup key matches the registered room key.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Decrypt and download' })).toBeVisible();
+  await page.screenshot({ path: '../outputs/Portkey_EncryptedInbox_Desktop.png', fullPage: true });
+  await participant.screenshot({ path: '../outputs/Portkey_EncryptedInbox_Mobile.png', fullPage: true });
+  await page.evaluate(() => {
+    const target = window as Window & { __savedFile?: number[]; showSaveFilePicker?: (options: unknown) => Promise<unknown> };
+    Object.defineProperty(target, '__savedFile', { configurable: true, writable: true, value: undefined });
+    Object.defineProperty(target, 'showSaveFilePicker', { configurable: true, value: async () => ({
+      createWritable: async () => new WritableStream({ write: (chunk: Uint8Array) => { target.__savedFile = [...(target.__savedFile ?? []), ...chunk]; } }),
+    }) });
+  });
+
+  await page.route('**/api' + ownerRoomPath + '/submissions/*/chunks/*', async route => {
+    const response = await route.fetch();
+    const body = Buffer.from(await response.body());
+    body[0] ^= 0xff;
+    await route.fulfill({ response, body });
+  });
+  await page.getByRole('button', { name: 'Decrypt and download' }).click();
+  await expect(page.getByRole('alert')).toContainText(/integrity|manifest|authenticate/i);
+  expect(await page.evaluate(() => (window as Window & { __savedFile?: number[] }).__savedFile)).toBeUndefined();
+  await page.unroute('**/api' + ownerRoomPath + '/submissions/*/chunks/*');
+  await page.getByRole('button', { name: 'Decrypt and download' }).click();
+  await expect.poll(() => page.evaluate(() => (window as Window & { __savedFile?: number[] }).__savedFile)).toEqual(Array.from(Buffer.from('private contents with no server-side filename')));
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await participantContext.close();
+});
+
 test('organizer creates and manages a room; a mobile participant requests access', async ({
   page,
   browser,
