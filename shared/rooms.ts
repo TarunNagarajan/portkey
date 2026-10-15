@@ -35,6 +35,8 @@ export interface Room {
   role: 'owner' | 'participant';
   membershipStatus: MembershipStatus | null;
   joinCode: string;
+  submissionCleanupEnabled: boolean;
+  submissionsPurgedAt: string | null;
 }
 
 export interface PublicRoom {
@@ -47,6 +49,8 @@ export interface PublicRoom {
   isOwner: boolean;
   organizerKeyFingerprint: string | null;
   organizerPublicKey: string | null;
+  submissionCleanupEnabled: boolean;
+  submissionsPurgedAt: string | null;
 }
 
 export interface Member {

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { Database, Queries } from './database.js';
 import { requireCondition } from './errors.js';
 import { roomId } from '../shared/rooms.js';
+import { reclaimStaleUploads } from './staleUploads.js';
 
 const MAX_ROOM_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -61,6 +62,14 @@ async function requireSubmitter(
   room: RoomPolicy,
   sessionId: string,
 ) {
+  // Refresh the deadline at the point this policy is checked. Transactional
+  // mutation callers invoke this after acquiring the room lock.
+  const [fresh] = await queries.query<{ expired: boolean; status: string }>(
+    'SELECT expires_at <= clock_timestamp() AS expired, status FROM rooms WHERE id = $1',
+    [room.id],
+  );
+  room.status = fresh.status;
+  room.is_expired = fresh.expired;
   requireCondition(
     room.status === 'open' && !room.is_expired,
     410,
@@ -218,6 +227,11 @@ export function submissionRoutes(database: Database) {
         [id],
       );
       requireCondition(value, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      const [fresh] = await transaction.query<{ expired: boolean }>(
+        'SELECT expires_at <= clock_timestamp() AS expired FROM rooms WHERE id = $1',
+        [id],
+      );
+      value.is_expired = fresh.expired;
       requireCondition(
         value.owner_id === request.session!.id,
         403,
@@ -342,10 +356,7 @@ export function submissionRoutes(database: Database) {
         if (completed) completionReceipt = existing.receipt;
         return;
       }
-      await transaction.query(
-        "DELETE FROM private_submissions WHERE room_id = $1 AND status = 'uploading' AND created_at < clock_timestamp() - interval '24 hours'",
-        [id],
-      );
+      await reclaimStaleUploads(transaction, id, 1000);
       const [usage] = await transaction.query<{ total: string }>(
         `SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM private_submissions WHERE room_id = $1`,
         [id],

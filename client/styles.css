@@ -321,6 +321,10 @@ main {
   border-radius: 9px;
   overflow: hidden;
 }
+.storage-panel {
+  padding: 22px;
+  margin-bottom: 24px;
+}
 .panel-heading {
   padding: 22px 22px 18px;
   display: flex;

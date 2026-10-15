@@ -85,6 +85,36 @@ export function RoomPage({ id }: { id: string }) {
           Organizer approval required
         </span>
       </div>
+      <section className="panel storage-panel">
+        <h2>Submission storage</h2>
+        <p>
+          {room.submissionsPurgedAt
+            ? 'The server removed this room’s encrypted submissions after its deadline.'
+            : room.submissionCleanupEnabled
+              ? 'Completed encrypted submissions are scheduled for removal after the room deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
+              : 'Automatic room deadline cleanup is disabled. Incomplete uploads are still removed after 24 hours.'}
+        </p>
+        {room.submissionsPurgedAt && <p>Completed {formatDate(room.submissionsPurgedAt)}.</p>}
+        {owner && !room.submissionCleanupEnabled && (
+          <button
+            disabled={busy}
+            onClick={() => {
+              const alreadyExpired = Date.parse(room.expiresAt) <= Date.now();
+              const timing = alreadyExpired
+                ? 'This room is already past its deadline, so submissions become eligible on the next cleanup pass.'
+                : 'Submissions will be removed after the room deadline.';
+              if (window.confirm('Enable automatic submission deletion? This cannot be undone. ' + timing + ' Local copies, browser keys, backups, room history and membership metadata are not erased.'))
+                void act(() => api('/rooms/' + id + '/submission-cleanup', 'POST', {}));
+            }}
+          >
+            Enable automatic deletion
+          </button>
+        )}
+        <p className="muted">
+          Room records, activity, memberships and public recipient keys remain. Database backups,
+          browser keys and copies already downloaded follow their own retention.
+        </p>
+      </section>
       {error && (
         <p role="alert" className="error">
           {error}
@@ -131,6 +161,7 @@ export function RoomPage({ id }: { id: string }) {
             <section className="panel edit-panel">
               <h2>Edit room details</h2>
               <RoomForm
+                isCreate={false}
                 initial={{
                   title: room.title,
                   description: room.description,

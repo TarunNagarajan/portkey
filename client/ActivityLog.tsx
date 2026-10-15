@@ -13,6 +13,8 @@ const descriptions: Record<ActivityKind, string> = {
   member_approved: 'Access approved',
   member_denied: 'Access declined',
   member_revoked: 'Access removed',
+  submission_cleanup_enabled: 'Automatic submission cleanup enabled',
+  submissions_purged: 'Room submissions removed after deadline',
 };
 
 const fields: Record<RoomField, string> = {
