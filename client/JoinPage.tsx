@@ -61,6 +61,13 @@ export function JoinPage({ code }: { code: string }) {
         <Icon name="clock" />
         Access ends {formatDate(room.expiresAt)}
       </p>
+      <p className="muted">
+        {room.submissionCleanupEnabled
+          ? room.submissionsPurgedAt
+            ? 'The server has removed encrypted submissions for this room.'
+            : 'Completed encrypted submissions are scheduled for removal after this deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
+          : 'Automatic room deadline cleanup is disabled. Incomplete uploads are still removed after 24 hours.'}
+      </p>
       {error && (
         <p role="alert" className="error">
           {error}

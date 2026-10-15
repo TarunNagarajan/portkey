@@ -28,6 +28,8 @@ interface RoomRow {
   created_at: Date;
   is_expired: boolean;
   membership_status: Room['membershipStatus'];
+  submission_cleanup_enabled: boolean;
+  submissions_purged_at: Date | null;
 }
 
 type MembershipRow = Omit<Member, 'requestedAt'> & { requestedAt: Date };
@@ -45,6 +47,8 @@ function roomView(row: RoomRow, sessionId: string): Room {
     expiresAt: row.expires_at.toISOString(),
     createdAt: row.created_at.toISOString(),
     joinCode: row.join_code,
+    submissionCleanupEnabled: row.submission_cleanup_enabled,
+    submissionsPurgedAt: row.submissions_purged_at?.toISOString() ?? null,
     role: row.owner_id === sessionId ? 'owner' : 'participant',
     membershipStatus: row.membership_status ?? null,
   };
@@ -186,6 +190,8 @@ export function roomRoutes(database: Database) {
       description: view.description,
       status: view.status,
       expiresAt: view.expiresAt,
+      submissionCleanupEnabled: view.submissionCleanupEnabled,
+      submissionsPurgedAt: view.submissionsPurgedAt,
       membershipStatus: view.membershipStatus,
       isOwner: view.role === 'owner',
       organizerKeyFingerprint: null,
@@ -283,6 +289,25 @@ export function roomRoutes(database: Database) {
       if (changedFields.length)
         await recordActivity(transaction, id, 'room_updated', null, changedFields);
       return updated;
+    });
+    response.json(roomView(row, request.session!.id));
+  });
+
+  router.post('/rooms/:id/submission-cleanup', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    z.object({}).strict().parse(request.body);
+    const row = await database.transaction(async (transaction) => {
+      const room = await lockRoom(transaction, id);
+      requireOwner(room, request.session!.id);
+      if (!room.submission_cleanup_enabled) {
+        const [updated] = await transaction.query<RoomRow>(
+          'UPDATE rooms SET submission_cleanup_enabled = TRUE WHERE id = $1 RETURNING *, expires_at <= clock_timestamp() AS is_expired',
+          [id],
+        );
+        await recordActivity(transaction, id, 'submission_cleanup_enabled');
+        return updated;
+      }
+      return room;
     });
     response.json(roomView(row, request.session!.id));
   });

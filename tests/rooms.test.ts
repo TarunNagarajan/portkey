@@ -161,6 +161,8 @@ test('the join address reveals public details but never owner or membership reco
     'organizerKeyFingerprint',
     'organizerPublicKey',
     'status',
+    'submissionCleanupEnabled',
+    'submissionsPurgedAt',
     'title',
   ]);
   await visitor.get(`/rooms/${room.id}/members`).expect(403);

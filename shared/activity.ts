@@ -7,7 +7,9 @@ export type ActivityKind =
   | 'join_requested'
   | 'member_approved'
   | 'member_denied'
-  | 'member_revoked';
+  | 'member_revoked'
+  | 'submission_cleanup_enabled'
+  | 'submissions_purged';
 
 export type RoomField = 'title' | 'description' | 'expiresAt';
 

@@ -8,10 +8,12 @@ function localDate(value: Date) {
 export function RoomForm({
   initial,
   submitLabel,
+  isCreate = true,
   onSubmit,
 }: {
   initial?: RoomInput;
   submitLabel: string;
+  isCreate?: boolean;
   onSubmit: (input: RoomInput) => Promise<void>;
 }) {
   const [title, setTitle] = useState(initial?.title ?? '');
@@ -69,6 +71,14 @@ export function RoomForm({
       <p className="muted">
         Times use your device’s local time zone. Rooms can stay available for up to seven days.
       </p>
+      {isCreate && (
+        <p className="muted">
+          Encrypted submissions are automatically removed after this deadline, usually within a
+          minute while running and longer with a backlog or downtime. Room activity, membership and
+          public keys remain. Unfinished uploads are removed after 24 hours; backups and copies
+          saved by recipients are not erased.
+        </p>
+      )}
       {error && (
         <p role="alert" className="error">
           {error}

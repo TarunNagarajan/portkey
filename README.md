@@ -18,7 +18,9 @@ The workspace shows room counts and lets you search titles/descriptions or filte
 
 The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process.
 
-Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; it does not delete database records.
+Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; room expiry separately triggers submission cleanup for rooms whose cleanup policy is enabled.
+
+New rooms automatically remove their encrypted submission records after the room deadline. A server cleanup pass runs at startup and about every 60 seconds while running; removal usually happens within a minute, subject to a bounded backlog, and passes resume after downtime. Closing a room early does not trigger deletion; an allowed deadline edit while active changes the cleanup deadline. Historical rooms keep cleanup disabled until the owner explicitly enables it. Incomplete uploads are removed after 24 hours regardless of room policy. This is logical deletion from the active database: room history, membership, public keys and room metadata remain, while backups, browser keys and already downloaded copies follow their own retention.
 
 ## Organizer activity log
 
@@ -48,7 +50,7 @@ HPKE uses RFC 9180 Base mode with P-256/HKDF-SHA256/AES-256-GCM. Envelope info a
 
 Key backups use PBKDF2-HMAC-SHA256 with 600,000 iterations, a random 16-byte salt and AES-256-GCM with a random 12-byte nonce. Version 1 fixes the KDF cost rather than accepting attacker-supplied iteration counts. Inputs and decoded byte lengths are bounded before derivation. Restoration checks the room, public fingerprint and private/public key match before retaining a key. Passphrases stay in the browser.
 
-Content encryption assumes the intended browser application executes. A malicious server serving modified JavaScript could steal plaintext or keys. Session relationships, admission labels, room descriptions, sizes, timings and network addresses are not concealed by this feature. Private keys, pending upload keys and decrypted download copies are local browser data; they are not protected against compromise of that browser or device. Closure and expiry block future API access, but do not erase database records or files already saved by a recipient. Data deletion and session/account recovery remain separate work.
+Content encryption assumes the intended browser application executes. A malicious server serving modified JavaScript could steal plaintext or keys. Session relationships, admission labels, room descriptions, sizes, timings and network addresses are not concealed by this feature. Private keys, pending upload keys and decrypted download copies are local browser data; they are not protected against compromise of that browser or device. Closure and expiry block future API access. Submission cleanup logically deletes encrypted submission rows from the active database, but does not erase backups, browser keys or files already saved by a recipient.
 
 ## Database and access boundaries
 
@@ -73,6 +75,7 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | PATCH | `/api/rooms/:id` | Replace title, description and expiry |
 | POST | `/api/rooms/:id/open` | Open a draft |
 | POST | `/api/rooms/:id/close` | Close a draft or open room |
+| POST | `/api/rooms/:id/submission-cleanup` | Owner enables irreversible automatic cleanup with an empty JSON object |
 | GET | `/api/join/:code` | Read public room details and own admission state |
 | POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` |
 | GET | `/api/rooms/:id/members` | List requests for the owner |
