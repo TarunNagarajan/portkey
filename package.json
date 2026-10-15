@@ -10,7 +10,7 @@
     "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx server/migrate.ts"
