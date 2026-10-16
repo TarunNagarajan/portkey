@@ -155,9 +155,12 @@ test('the join address reveals public details but never owner or membership reco
   assert.deepEqual(Object.keys(response.body).sort(), [
     'description',
     'expiresAt',
+    'geo',
+    'geoLabel',
     'id',
     'isOwner',
     'membershipStatus',
+    'needsLocation',
     'organizerKeyFingerprint',
     'organizerPublicKey',
     'status',

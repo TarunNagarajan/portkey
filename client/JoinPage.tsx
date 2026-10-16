@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
-import { api } from './api.js';
-import { Icon, StatusBadge, formatDate } from './ui.js';
+import { api, requestFix } from './api.js';
+import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
@@ -35,7 +35,9 @@ export function JoinPage({ code }: { code: string }) {
     event.preventDefault();
     setBusy(true);
     try {
-      await api(`/join/${code}`, 'POST', { label });
+      const body: Record<string, unknown> = { label };
+      if (room?.geo) Object.assign(body, await requestFix());
+      await api(`/join/${code}`, 'POST', body);
       setRoom(await api<PublicRoom>(`/join/${code}`));
       setError('');
     } catch (error) {
@@ -99,11 +101,25 @@ export function JoinPage({ code }: { code: string }) {
               placeholder="A nickname or team label"
             />
           </label>
-          <p className="muted">
-            Use a label the organizer can recognize. No email, roll number, or external ID is
-            required.
-          </p>
-          <button disabled={busy}>{busy ? 'Requesting…' : 'Request access'}</button>
+          {room.geo ? (
+            <p className="muted">
+              <Icon name="shield" /> This room is restricted to{' '}
+              {formatDistance(room.geo.radiusM)} around {room.geoLabel ?? 'a set area'}. Your device
+              location is required and checked on every visit; you cannot request access without it.
+            </p>
+          ) : (
+            <p className="muted">
+              Use a label the organizer can recognize. No email, roll number, or external ID is
+              required.
+            </p>
+          )}
+          <button disabled={busy}>
+            {busy
+              ? 'Requesting…'
+              : room.geo
+                ? 'Share location & request access'
+                : 'Request access'}
+          </button>
         </form>
       )}
     </section>

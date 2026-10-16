@@ -4,11 +4,18 @@ import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import { ZodError } from 'zod';
 import type { Database } from './database.js';
 import { HttpError } from './errors.js';
+import { createGeocoder } from './geocoding.js';
 import { roomRoutes } from './rooms.js';
 import { sessionControls } from './sessions.js';
 import { submissionRoutes } from './submissions.js';
 
-export interface AppOptions { origin: string; secure: boolean; rateLimiting?: boolean }
+export interface AppOptions {
+  origin: string;
+  secure: boolean;
+  rateLimiting?: boolean;
+  geocoding?: boolean;
+  nominatimUrl?: string;
+}
 
 export function createApp(database: Database, options: AppOptions) {
   const app = express();
@@ -37,7 +44,7 @@ export function createApp(database: Database, options: AppOptions) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return next();
     sessions.checkOrigin(request, response, () => sessions.checkCsrf(request, response, next));
   });
-  app.use('/api', roomRoutes(database));
+  app.use('/api', roomRoutes(database, createGeocoder(options.geocoding !== false, options.nominatimUrl)));
   app.use('/api', submissionRoutes(database));
   app.use('/api', (_request, response) => {
     response.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });

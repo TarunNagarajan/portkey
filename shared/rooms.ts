@@ -25,6 +25,58 @@ export type RoomInput = z.infer<typeof roomInput>;
 export type RoomStatus = 'draft' | 'open' | 'closed' | 'expired';
 export type MembershipStatus = 'pending' | 'approved' | 'denied' | 'revoked';
 
+export const minRadiusM = 50;
+export const maxRadiusM = 50000;
+
+export const geoRule = z
+  .object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+    radiusM: z.number().int().min(minRadiusM).max(maxRadiusM),
+  })
+  .strict();
+
+export const geoSource = z.enum(['search', 'device']);
+
+export const geoAreaInput = z
+  .object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+    radiusM: z.number().int().min(minRadiusM).max(maxRadiusM),
+    label: z.string().trim().min(1).max(120).optional(),
+    source: geoSource.optional(),
+  })
+  .strict();
+
+export const placeQuery = z
+  .object({
+    q: z.string().trim().min(2).max(120),
+  })
+  .strict();
+
+export const positionReport = z
+  .object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+    accuracyM: z.number().min(0).max(1000),
+    timestamp: z.iso.datetime({ offset: true }),
+  })
+  .strict();
+
+export const joinRequest = z
+  .object({
+    label: z.string().trim().min(1).max(50),
+    lat: z.number().min(-90).max(90).optional(),
+    lng: z.number().min(-180).max(180).optional(),
+    accuracyM: z.number().min(0).max(1000).optional(),
+    timestamp: z.iso.datetime({ offset: true }).optional(),
+  })
+  .strict();
+
+export type GeoRule = z.infer<typeof geoRule>;
+export type GeoSource = z.infer<typeof geoSource>;
+export type GeoAreaInput = z.infer<typeof geoAreaInput>;
+
 export interface Room {
   id: string;
   title: string;
@@ -37,6 +89,8 @@ export interface Room {
   joinCode: string;
   submissionCleanupEnabled: boolean;
   submissionsPurgedAt: string | null;
+  geo: GeoRule | null;
+  geoLabel: string | null;
 }
 
 export interface PublicRoom {
@@ -51,6 +105,9 @@ export interface PublicRoom {
   organizerPublicKey: string | null;
   submissionCleanupEnabled: boolean;
   submissionsPurgedAt: string | null;
+  geo: GeoRule | null;
+  geoLabel: string | null;
+  needsLocation: boolean;
 }
 
 export interface Member {
@@ -58,4 +115,15 @@ export interface Member {
   label: string;
   status: MembershipStatus;
   requestedAt: string;
+  inside: boolean | null;
+  distanceM: number | null;
+  accuracyM: number | null;
+  checkedAt: string | null;
+}
+
+export interface PlaceSuggestion {
+  label: string;
+  lat: number;
+  lng: number;
+  radiusM: number;
 }

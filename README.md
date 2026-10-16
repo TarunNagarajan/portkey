@@ -8,7 +8,7 @@ Use Node.js 22.12 or newer. From this directory, run `npm ci`, then `npm run dev
 
 Local development uses PGlite, an embedded PostgreSQL engine, with persistent data under `.data/portkey`. Set `DATABASE_URL` to use a PostgreSQL server through the `pg` connection pool instead. Migrations run at startup; `npm run db:migrate` applies them separately. Migration checksums prevent silently changing an already-applied schema. Add a new numbered SQL file for future changes.
 
-The Vite development proxy targets port 3001; set `API_ORIGIN` when using another API address. `APP_ORIGIN` must match the browser address exactly; localhost and 127.0.0.1 are different origins. For production, run `npm run build`, set `NODE_ENV=production` and an HTTPS `APP_ORIGIN`, and run `npm start` behind an HTTPS reverse proxy. The API then serves the built frontend. The included rate limiter is process-local; a multi-instance deployment needs a shared store.
+The Vite development proxy targets port 3001; set `API_ORIGIN` when using another API address. `APP_ORIGIN` must match the browser address exactly; localhost and 127.0.0.1 are different origins. Place search for room areas uses OpenStreetMap Nominatim and needs outbound network access; set `GEOCODING=false` to disable it. For production, run `npm run build`, set `NODE_ENV=production` and an HTTPS `APP_ORIGIN`, and run `npm start` behind an HTTPS reverse proxy. The API then serves the built frontend. The included rate limiter is process-local; a multi-instance deployment needs a shared store.
 
 ## Use the module
 
@@ -52,6 +52,14 @@ Key backups use PBKDF2-HMAC-SHA256 with 600,000 iterations, a random 16-byte sal
 
 Content encryption assumes the intended browser application executes. A malicious server serving modified JavaScript could steal plaintext or keys. Session relationships, admission labels, room descriptions, sizes, timings and network addresses are not concealed by this feature. Private keys, pending upload keys and decrypted download copies are local browser data; they are not protected against compromise of that browser or device. Closure and expiry block future API access. Submission cleanup logically deletes encrypted submission rows from the active database, but does not erase backups, browser keys or files already saved by a recipient.
 
+## Location-restricted rooms
+
+An organizer can restrict a draft room to a circular area so that only devices physically inside it can request access or enter. Set the area from a room overview: search for a place (for example a city or campus) or use your current location, then adjust the radius from 50 metres to 50 kilometres. Place search uses OpenStreetMap Nominatim and only supplies a centre, a suggested radius and a display label. Disable it with `GEOCODING=false`, or point `NOMINATIM_URL` at another geocoder.
+
+A participant must send a fresh, accurate location fix with a join request. The server computes the great-circle distance and rejects requests outside the area with `403 GEO_OUTSIDE`, missing or denied location with `403 GEO_REQUIRED`, a stale reading with `403 GEO_STALE`, and a low-accuracy reading with `422 GEO_INACCURATE`. Approved participants re-share a fix on entry: the last reading must be inside the area and no more than five minutes old, otherwise entry is refused with `403 GEO_STALE` or `403 GEO_OUTSIDE`. Without a location, a participant cannot join or enter. The area is fixed once the room opens and can be cleared while it is still a draft.
+
+Coordinates and accuracy are stored on the membership so the organizer can see whether a participant was inside and how far away they were. The browser requests a location only when joining, entering, or refreshing an expired reading. This is presence at the moment of the request, not proof of residence. Because the server must evaluate the distance, the participant's approximate coordinates reach the server; unlike submission contents, they are not end-to-end encrypted.
+
 ## Database and access boundaries
 
 `sessions` contains hashed browser credentials and their expiry. `rooms` belongs to one organizer session and has a unique random join address. `memberships` links one browser session to one room with a pending, approved, denied, or revoked status. `schema_migrations` records applied SQL and checksums. Foreign keys, uniqueness, checks and indexes are defined in `server/migrations/001_initial.sql`.
@@ -77,7 +85,10 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | POST | `/api/rooms/:id/close` | Close a draft or open room |
 | POST | `/api/rooms/:id/submission-cleanup` | Owner enables irreversible automatic cleanup with an empty JSON object |
 | GET | `/api/join/:code` | Read public room details and own admission state |
-| POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` |
+| POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` and, for a restricted room, `{ lat, lng, accuracyM, timestamp }` |
+| GET | `/api/geo/search` | Search places for a room area with `?q=Warangal` |
+| POST | `/api/rooms/:id/geo` | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }` |
+| DELETE | `/api/rooms/:id/geo` | Owner clears a draft room's area |
 | GET | `/api/rooms/:id/members` | List requests for the owner |
 | GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
 | PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |

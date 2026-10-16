@@ -6,7 +6,9 @@ const environment = z.object({
   APP_ORIGIN: z.url().default('http://localhost:5173'),
   DATABASE_URL: z.string().min(1).optional(),
   DATA_DIR: z.string().min(1).default('.data/portkey'),
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development')
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  GEOCODING: z.enum(['true', 'false']).default('true').transform(value => value === 'true'),
+  NOMINATIM_URL: z.url().default('https://nominatim.openstreetmap.org')
 }).parse(process.env);
 
 export const config = {
@@ -14,7 +16,9 @@ export const config = {
   origin: new URL(environment.APP_ORIGIN).origin,
   databaseUrl: environment.DATABASE_URL,
   dataDir: environment.DATA_DIR,
-  production: environment.NODE_ENV === 'production'
+  production: environment.NODE_ENV === 'production',
+  geocoding: environment.GEOCODING,
+  nominatimUrl: environment.NOMINATIM_URL
 };
 
 if (config.production && !config.origin.startsWith('https://')) {

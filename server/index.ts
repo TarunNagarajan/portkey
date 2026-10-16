@@ -8,7 +8,12 @@ import { runSubmissionCleanupPass, startCleanupScheduler } from './cleanup.js';
 
 const database = await openDatabase({ url: config.databaseUrl, dataDir: config.dataDir });
 await migrate(database);
-const app = createApp(database, { origin: config.origin, secure: config.production });
+const app = createApp(database, {
+  origin: config.origin,
+  secure: config.production,
+  geocoding: config.geocoding,
+  nominatimUrl: config.nominatimUrl,
+});
 const cleanup = startCleanupScheduler(() => runSubmissionCleanupPass(database));
 if (config.production) {
   app.use(express.static(resolve('dist/client')));
