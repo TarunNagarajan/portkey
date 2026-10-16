@@ -72,7 +72,7 @@ test('readiness failure and startup cancellation stop owned processes', async ()
   await assert.rejects(runPhoneDemo({ port: 3003, built: true, portAvailable: async () => true, readinessTimeoutMs: 5,
     spawnProcess: (() => { const value = child(); failedChildren.push(value); if (failedChildren.length === 1) setImmediate(() => value.stderr.write('https://calm-otter.trycloudflare.com')); return value; }) as never,
     fetcher: async () => new Response('{}', { status: 503 }), wait: ms => new Promise(resolve => setTimeout(resolve, Math.min(ms, 2))), log: () => {},
-  }), /did not become ready/);
+  }), /public demo did not become reachable/);
   assert.ok(failedChildren.every(value => value.exitCode === 0));
 
   const controller = new AbortController();

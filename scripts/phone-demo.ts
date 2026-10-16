@@ -141,7 +141,7 @@ export async function runPhoneDemo(options: DemoOptions = {}): Promise<() => Pro
     serverChild = server;
     children.push(server);
     watchChild(server, 'Demo server');
-    const deadline = Date.now() + (options.readinessTimeoutMs ?? 45_000);
+    const deadline = Date.now() + (options.readinessTimeoutMs ?? 180_000);
     while (Date.now() < deadline) {
       if (failureState) throw failureState;
       if (server.exitCode !== null || server.signalCode !== null) throw new Error('The demo server exited during startup.');
@@ -161,7 +161,7 @@ export async function runPhoneDemo(options: DemoOptions = {}): Promise<() => Pro
       } catch {}
       await wait(500);
     }
-    if (!ready) throw new Error('The demo server did not become ready before the startup timeout.');
+    if (!ready) throw new Error('The public demo did not become reachable within three minutes. Check DNS resolution and HTTPS access for the temporary Cloudflare address, then restart the demo.');
     log(`Phone demo: ${publicOrigin}`);
     log('This address is temporary. Keep this computer and this terminal running while participants use it.');
     return cleanup;
