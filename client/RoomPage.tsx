@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Member, Room, RoomInput } from '../shared/rooms.js';
-import { api } from './api.js';
+import { ApiError, api, requestFix } from './api.js';
+import { RoomArea } from './RoomArea.js';
 import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
 import { PrivateInbox } from './PrivateInbox.js';
-import { Icon, StatusBadge, formatDate } from './ui.js';
+import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
   const [room, setRoom] = useState<Room | null>(null);
@@ -16,10 +17,27 @@ export function RoomPage({ id }: { id: string }) {
   const [inboxFingerprint, setInboxFingerprint] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
-    const current = await api<Room>(`/rooms/${id}`);
-    setRoom(current);
-    if (current.role === 'owner') setMembers(await api<Member[]>(`/rooms/${id}/members`));
-    setError('');
+    try {
+      const current = await api<Room>(`/rooms/${id}`);
+      setRoom(current);
+      if (current.role === 'owner') setMembers(await api<Member[]>(`/rooms/${id}/members`));
+      setError('');
+    } catch (error) {
+      // A stale location reading is refreshed on demand instead of on every poll.
+      if (error instanceof ApiError && error.code === 'GEO_STALE') {
+        try {
+          await api(`/rooms/${id}/position`, 'POST', await requestFix());
+          const current = await api<Room>(`/rooms/${id}`);
+          setRoom(current);
+          setError('');
+          return;
+        } catch (retry) {
+          setError(retry instanceof Error ? retry.message : 'Unable to load room.');
+          return;
+        }
+      }
+      throw error;
+    }
   }, [id]);
 
   useEffect(() => {
@@ -120,6 +138,14 @@ export function RoomPage({ id }: { id: string }) {
           {error}
         </p>
       )}
+      {!owner && room.geo && (
+        <p className="area-summary">
+          <Icon name="shield" />
+          Restricted to {formatDistance(room.geo.radiusM)} around{' '}
+          {room.geoLabel ?? 'the organizer’s area'}. Your device must be inside the area to enter.
+        </p>
+      )}
+      {owner && <RoomArea room={room} onChanged={reload} onError={setError} />}
       {owner && (
         <>
           <div className="actions">
@@ -212,6 +238,7 @@ export function RoomPage({ id }: { id: string }) {
                     <tr>
                       <th>Participant</th>
                       <th>Requested</th>
+                      <th>Nearby</th>
                       <th>Status</th>
                       <th>Action</th>
                     </tr>
@@ -230,6 +257,13 @@ export function RoomPage({ id }: { id: string }) {
                             hour: 'numeric',
                             minute: '2-digit',
                           })}
+                        </td>
+                        <td>
+                          {member.inside == null
+                            ? '—'
+                            : member.inside
+                              ? `Inside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`
+                              : `Outside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`}
                         </td>
                         <td>
                           <StatusBadge status={member.status} />
