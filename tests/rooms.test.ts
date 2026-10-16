@@ -65,6 +65,9 @@ async function requestAdmission(participant: Browser, room: Room) {
 
 test('health checks the database and API requires a session', async () => {
   await supertest(app).get('/api/health').expect(200);
+  const config = await supertest(app).get('/api/config').set('Host', 'attacker.example').set('X-Forwarded-Host', 'attacker.example').expect(200);
+  assert.deepEqual(config.body, { publicOrigin: origin });
+  assert.equal(config.headers['cache-control'], 'no-store');
   await supertest(app).get('/api/rooms').expect(401);
 });
 

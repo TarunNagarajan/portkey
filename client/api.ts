@@ -1,6 +1,56 @@
 import type { PlaceSuggestion } from '../shared/rooms.js';
 
 let csrfToken = '';
+let publicOrigin = '';
+
+export function buildInvitationUrl(origin: string, code: string, fingerprint?: string | null): string {
+  let base: URL;
+  try { base = new URL(origin); } catch { throw new Error('Invitation origin is invalid.'); }
+  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.pathname !== '/' || base.search || base.hash)
+    throw new Error('Invitation origin is invalid.');
+  if (!/^[A-Za-z0-9_-]{16}$/.test(code)) throw new Error('Room invitation code is invalid.');
+  if (fingerprint && !/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('Inbox key fingerprint is invalid.');
+  const url = new URL(`/join/${encodeURIComponent(code)}`, base.origin);
+  if (fingerprint) url.hash = `key=${encodeURIComponent(fingerprint)}`;
+  return url.toString();
+}
+
+export function setPublicOrigin(origin: string) { publicOrigin = origin; }
+export function getPublicOrigin() { return publicOrigin; }
+
+export function configuredPageUrl(origin: string, pathname: string, search = '', hash = ''): string {
+  const target = new URL(origin);
+  target.pathname = pathname;
+  target.search = search;
+  target.hash = hash;
+  return target.toString();
+}
+
+export function isLocalOrigin(origin: string): boolean {
+  const hostname = new URL(origin).hostname.toLowerCase();
+  return hostname === 'localhost' || hostname.endsWith('.localhost') || hostname === '::1' || hostname === '[::1]' || hostname.startsWith('127.') || hostname === '0.0.0.0';
+}
+
+export async function loadPublicConfig(): Promise<{ publicOrigin: string }> {
+  let response: Response;
+  try {
+    response = await fetch('/api/config', { credentials: 'same-origin', cache: 'no-store' });
+  } catch {
+    throw new Error('Could not load the invitation address. Check your connection and retry.');
+  }
+  if (!response.ok) throw new Error('Could not load the invitation address. Check your connection and retry.');
+  let value: { publicOrigin?: unknown } | null;
+  try { value = await response.json() as { publicOrigin?: unknown } | null; }
+  catch { throw new Error('The server returned an invalid invitation address. Contact the site administrator.'); }
+  if (!value || typeof value !== 'object' || typeof value.publicOrigin !== 'string')
+    throw new Error('The server did not provide a valid invitation address. Contact the site administrator.');
+  let url: URL;
+  try { url = new URL(value.publicOrigin); } catch { throw new Error('The server invitation address is invalid. Contact the site administrator.'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash || url.origin !== value.publicOrigin)
+    throw new Error('The server invitation address is invalid. Contact the site administrator.');
+  if (window.location.protocol === 'https:' && url.protocol !== 'https:') throw new Error('The server invitation address must use HTTPS. Contact the site administrator.');
+  return { publicOrigin: url.origin };
+}
 
 export class ApiError extends Error {
   constructor(

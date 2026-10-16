@@ -12,6 +12,7 @@ import { submissionRoutes } from './submissions.js';
 export interface AppOptions {
   origin: string;
   secure: boolean;
+  trustProxyHops?: number;
   rateLimiting?: boolean;
   geocoding?: boolean;
   nominatimUrl?: string;
@@ -22,6 +23,7 @@ export function createApp(database: Database, options: AppOptions) {
   const sessions = sessionControls(database, options);
   app.disable('x-powered-by');
   app.use(helmet());
+  app.set('trust proxy', options.trustProxyHops ?? 0);
   app.use(express.json({ limit: '8kb' }));
   app.use('/api', (_request, response, next) => {
     response.setHeader('Cache-Control', 'no-store');
@@ -38,6 +40,7 @@ export function createApp(database: Database, options: AppOptions) {
       standardHeaders: 'draft-8', legacyHeaders: false,
       message: { error: { code: 'RATE_LIMITED', message: 'Too many requests. Please wait a minute.' } } }));
   }
+  app.get('/api/config', (_request, response) => response.json({ publicOrigin: options.origin }));
   app.post('/api/session', sessions.checkOrigin, sessions.start);
   app.use('/api', sessions.authenticate);
   app.use('/api', (request, response, next) => {
