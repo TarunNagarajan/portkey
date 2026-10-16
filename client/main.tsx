@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { startSession } from './api.js';
+import { configuredPageUrl, loadPublicConfig, setPublicOrigin, startSession } from './api.js';
 import { Home } from './Home.js';
 import { JoinPage } from './JoinPage.js';
 import { RoomPage } from './RoomPage.js';
@@ -10,9 +10,17 @@ import './styles.css';
 function App() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
+  const [originMismatch, setOriginMismatch] = useState('');
   useEffect(() => {
-    void startSession()
-      .then(() => setReady(true))
+    void loadPublicConfig()
+      .then(({ publicOrigin }) => {
+        setPublicOrigin(publicOrigin);
+        if (window.location.origin !== publicOrigin) {
+          setOriginMismatch(configuredPageUrl(publicOrigin, window.location.pathname, window.location.search, window.location.hash));
+          return;
+        }
+        return startSession().then(() => setReady(true));
+      })
       .catch((error) => setError(error.message));
   }, []);
   const path = window.location.pathname;
@@ -58,7 +66,13 @@ function App() {
           )}
         </div>
         <main id="main">
-          {error ? (
+          {originMismatch ? (
+            <section role="alert" className="error">
+              <h1>Open Portkey at its configured address</h1>
+              <p>This page’s address does not match the site address. Continue at the configured address before creating or sharing rooms.</p>
+              <a href={originMismatch}>Open the configured Portkey address</a>
+            </section>
+          ) : error ? (
             <p role="alert" className="error">
               {error} <button onClick={() => window.location.reload()}>Retry</button>
             </p>

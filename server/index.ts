@@ -11,6 +11,7 @@ await migrate(database);
 const app = createApp(database, {
   origin: config.origin,
   secure: config.production,
+  trustProxyHops: config.trustProxyHops,
   geocoding: config.geocoding,
   nominatimUrl: config.nominatimUrl,
 });
@@ -19,15 +20,20 @@ if (config.production) {
   app.use(express.static(resolve('dist/client')));
   app.get('/{*path}', (_request, response) => response.sendFile(resolve('dist/client/index.html')));
 }
-const server = app.listen(config.port, '127.0.0.1', () => console.log(`Portkey API: http://127.0.0.1:${config.port}`));
+const server = app.listen(config.port, config.host, () => console.log(`Portkey API listening on ${config.host}:${config.port}`));
 let stopping = false;
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    if (stopping) return;
-    stopping = true;
-    const cleanupDrain = cleanup.stop();
-    server.close(() => {
-      void cleanupDrain.then(() => database.close()).then(() => process.exit(0));
-    });
+function stopServer() {
+  if (stopping) return;
+  stopping = true;
+  const cleanupDrain = cleanup.stop();
+  server.close(() => {
+    void cleanupDrain.then(() => database.close()).then(() => process.exit(0));
   });
+}
+process.on('message', (message: unknown) => {
+  if (message && typeof message === 'object' && !Array.isArray(message) &&
+      Object.keys(message).length === 1 && 'type' in message && message.type === 'phone-demo:shutdown') stopServer();
+});
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, stopServer);
 }

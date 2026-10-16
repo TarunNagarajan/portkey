@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { Room, RoomInput } from '../shared/rooms.js';
-import { api } from './api.js';
+import { api, getPublicOrigin, isLocalOrigin } from './api.js';
 import { RoomForm } from './RoomForm.js';
 import { Icon, StatusBadge, formatDate } from './ui.js';
 
@@ -12,6 +12,7 @@ export function Home() {
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('all');
   const templateId = new URLSearchParams(window.location.search).get('template');
+  const localOnly = isLocalOrigin(getPublicOrigin());
 
   useEffect(() => {
     let active = true;
@@ -81,6 +82,7 @@ export function Home() {
           </div>
         ))}
       </dl>
+      {localOnly && <p className="muted">This local address is for this computer. Phone sharing needs a public HTTPS address.</p>}
       {error && (
         <p role="alert" className="error">
           {error}

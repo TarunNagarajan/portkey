@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import { Icon } from './ui.js';
+import { buildInvitationUrl, getPublicOrigin, isLocalOrigin } from './api.js';
 
 export function ShareRoom({ code, fingerprint }: { code: string; fingerprint?: string | null }) {
-  const link = `${window.location.origin}/join/${code}${fingerprint ? `#key=${fingerprint}` : ''}`;
+  const link = buildInvitationUrl(getPublicOrigin(), code, fingerprint);
   const [image, setImage] = useState('');
   const [message, setMessage] = useState('');
 
@@ -41,6 +42,7 @@ export function ShareRoom({ code, fingerprint }: { code: string; fingerprint?: s
       <div>
         <h2 id="share-title">Invite participants</h2>
         <p>Share this address through a channel participants can trust. Each browser still needs your approval.</p>
+        {isLocalOrigin(getPublicOrigin()) && <p className="muted">This local address is for this computer. Phone sharing needs a public HTTPS address.</p>}
         {fingerprint && <p className="muted">Inbox key fingerprint: <code>{fingerprint}</code></p>}
         <a className="join-link" href={link}>
           {link}
