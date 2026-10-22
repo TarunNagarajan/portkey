@@ -366,6 +366,18 @@ main {
 .passes-empty { color: var(--text-muted); padding: 4px 22px; }
 .passes-panel .table-scroll { margin-inline: 22px; }
 .passes-panel .table-scroll table { min-width: 510px; }
+.proof-enrollments { padding: 22px; margin-block: 24px; }
+.proof-enrollments > p { color: var(--text-muted); font-size: 12px; }
+.enrollment-issue { display: flex; align-items: end; gap: 12px; margin: 18px 0; }
+.enrollment-issue label { width: min(220px, 55%); margin: 0; }
+.enrollment-batch { margin: 18px 0; padding: 16px; background: #f7f9fc; border: 1px solid #e0e6ef; border-radius: 7px; }
+.enrollment-batch > label { max-width: 260px; }
+.enrollment-qr { display: block; width: 180px; height: 180px; padding: 8px; margin: 14px 0; background: #fff; border: 1px solid #e0e6ef; border-radius: 6px; }
+.proof-enrollments .table-scroll { margin-top: 16px; }
+.proof-enrollments table { min-width: 530px; }
+.workshop-admission > p { color: var(--text-muted); }
+.workshop-admission form { margin-block: 18px; }
+.workshop-admission input { max-width: 320px; }
 .private-inbox .panel-heading {
   padding: 0 0 16px;
 }

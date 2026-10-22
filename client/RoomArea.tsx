@@ -112,7 +112,9 @@ export function RoomArea({
         <div>
           <h2>Location restriction</h2>
           <p>
-            {room.admissionPolicy === 'pass'
+            {room.admissionPolicy === 'proof'
+              ? 'Only devices physically inside the chosen area can prove workshop membership and enter.'
+              : room.admissionPolicy === 'pass'
               ? 'Only devices physically inside the chosen area can redeem a pass or enter.'
               : 'Only devices physically inside the chosen area can request access or enter.'}
           </p>
@@ -126,7 +128,9 @@ export function RoomArea({
         </p>
       ) : (
         <p className="muted">
-          {room.admissionPolicy === 'pass'
+          {room.admissionPolicy === 'proof'
+            ? 'No area restriction. A valid workshop membership proof is still required.'
+            : room.admissionPolicy === 'pass'
             ? 'No area restriction. A valid admission pass is still required.'
             : 'No area restriction. Anyone with the link can request access.'}
         </p>

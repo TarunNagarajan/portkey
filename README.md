@@ -1,6 +1,6 @@
 # Portkey
 
-Room management, organizer activity, browser-encrypted private submissions, and single-use workshop admission passes. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
+Room management, organizer activity, browser-encrypted private submissions, single-use workshop admission passes, and workshop proof admission. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
 
 ## Run locally
 
@@ -24,7 +24,7 @@ Install the official `cloudflared` executable separately, then run `npm run phon
 
 ## Use the module
 
-Create a draft with a title, public description, admission policy and future expiry. The default policy asks the organizer to approve each browser's request. A single-use pass room admits a browser that redeems a pass supplied by the organizer. Open the room when it is ready, then share its QR or link. In approval rooms, participants request access with a nickname or team label. The organizer approves or declines the request. The organizer can remove approved access or close either kind of room.
+Create a draft with a title, public description, admission policy and future expiry. The default approval policy asks the organizer to approve each browser's request. A single-use pass room admits a browser that redeems a pass supplied by the organizer. A workshop proof room admits a browser only after it saves a credential from an organizer-issued enrollment link and proves membership. Open the room when it is ready, then share its QR or link. In approval rooms, participants request access with a nickname or team label. The organizer approves or declines the request. The organizer can remove approved access or close any room.
 
 In pass rooms, the organizer generates one to 20 passes per batch, up to 1,000 over the room's lifetime. The QR, copy link and CSV controls show each token only in the issuance response and the current browser page; save the batch before dismissing it. Portkey cannot recover a lost token. An unused pass can be revoked, but a used pass cannot be reused or revoked; remove the admitted browser from Participant access instead. The ordinary room link shows a preview and does not grant access. Templates copy the admission policy, but not passes or redemption history. Policy changes are available only while the room is a draft.
 
@@ -42,7 +42,7 @@ New rooms automatically remove their encrypted submission records after the room
 
 Each room overview includes an organizer-only timeline of creation, template reuse, metadata edits, opening, closure, access requests and admission decisions. The latest page refreshes every five seconds. Use Older activity to browse previous pages; Back to latest resumes live updates. Older pages remain stable while new actions occur. History remains readable by the owner after closure or expiry.
 
-Migration `002_room_activity.sql` adds the history table without changing existing rooms. Migration `007_admission_passes.sql` adds the room policy and pass records; existing rooms retain approval. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests, pass redemption retries, and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
+Migration `002_room_activity.sql` adds the history table without changing existing rooms. Migrations `007_admission_passes.sql` and `008_workshop_proof_admission.sql` add the pass and proof policies; existing rooms retain approval. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests, pass redemption retries, and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
 
 Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
 
@@ -108,6 +108,11 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/rooms/:id/passes` | Owner reads pass number, status and timestamps; tokens are never returned |
 | POST | `/api/rooms/:id/passes` | Owner issues `{ "count": 1 }` through `{ "count": 20 }`; raw tokens appear only in this response |
 | PATCH | `/api/rooms/:id/passes/:passId` | Owner revokes an unused pass with `{ "status": "revoked" }` |
+| GET/POST | `/api/rooms/:id/enrollments` | Owner reads enrollment-link status/counts or issues `{ "count": 1 }` through `{ "count": 20 }` one-use links |
+| PATCH | `/api/rooms/:id/enrollments/:inviteId` | Owner revokes an unused enrollment link with `{ "status": "revoked" }` |
+| POST | `/api/join/:code/enroll` | Save `{ "token", "commitment" }` for a proof-policy room; this does not grant access |
+| POST | `/api/join/:code/proof-challenge` | Get the short-lived proof challenge and pinned commitment snapshot |
+| POST | `/api/join/:code/prove` | Verify `{ "challengeId", "proof" }` and atomically admit the browser session |
 | GET | `/api/geo/search` | Search places for a room area with `?q=Warangal` |
 | POST | `/api/rooms/:id/geo` | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }` |
 | DELETE | `/api/rooms/:id/geo` | Owner clears a draft room's area |
@@ -123,7 +128,7 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
 | DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
 
-Creation and metadata edits accept `title`, `description`, an ISO timestamp `expiresAt` with an offset, and optional `admissionPolicy` (`approval` or `pass`). Omitted policy defaults to approval on creation and preserves the current value on edits. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
+Creation and metadata edits accept `title`, `description`, an ISO timestamp `expiresAt` with an offset, and optional `admissionPolicy` (`approval`, `pass`, or `proof`). Omitted policy defaults to approval on creation and preserves the current value on edits. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
 The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `description` override the original values; omitted values are copied. It applies the same deadline/session limits as ordinary room creation.
 
@@ -133,4 +138,14 @@ Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/ro
 
 Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e-private-inbox` rather than your development database. Set `PORTKEY_E2E_DATA_DIR` to choose another isolated test directory. The API test server ignores `.env` and inherited `DATABASE_URL`. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
 
-Anonymous membership proofs and secure device pairing are not implemented. Key verification relies on an organizer-delivered invitation or an explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.
+## Workshop proof admission
+
+Proof admission is an optional room policy. The organizer selects **Workshop proof**, opens the room, then uses **Issue enrollment links**. Participants scan a one-use enrollment QR or open its link and select **Save workshop credential**. That saves a room-specific credential on their device but does not grant access. They then select **Prove membership and enter**; the ordinary room QR works later for browsers that have saved credentials.
+
+The implementation uses a fixed Semaphore V4.14.5 adapter and depth-10 circuit, not custom uploaded circuits or keys. The browser makes a real proof in a worker. The server verifies against the pinned published verification key and admits the browser session atomically. Challenges pin a room-specific commitment-group root for two minutes, so enrollment growth after challenge creation does not invalidate a proof based on its snapshot. Proof soundness relies on the circuit and verification key being correct and on the Groth16 trusted setup assumptions. Workshop circuit files are downloaded from the official PSE 4.13.0 artifact release and verified against `scripts/zk-artifacts.json`; binaries are ignored by Git. `npm ci` prepares them automatically, or run `npm run prepare` explicitly. Preparation uses cached files only after checksum verification, and otherwise allows bounded HTTPS downloads with checksum verification.
+
+This proves membership of an enrolled browser credential, not a person's identity, uniqueness, or attendance. A participant can share a credential or enroll multiple credentials; enrollment links are bearer links until redeemed. The enrollment service receives each commitment alongside its invitation token and can link enrollment to that credential. The proof hides which enrolled commitment was used, while admission servers still observe browser sessions and network activity. Proofs do not prevent traffic or session correlation. Groups smaller than three offer little privacy; do not promise anonymity, especially in small workshops. Credentials stay in one browser profile and cannot be recovered or transferred; clearing site data loses them. Removing an admitted browser blocks that session; the server retains the spent nullifier to prevent the same credential being reused after a fresh session. Templates preserve the policy but copy no invitations, commitments, or credentials.
+
+To verify browser proof generation against the development server, run `npm run test:e2e -- e2e/workshop-proof-admission.spec.ts`. To verify the built client under the production Helmet policy using the isolated in-memory smoke server, run `npm run build` and `npm run test:e2e:built`. Both paths use the real pinned circuit and verifier. Production still requires a public HTTPS `APP_ORIGIN`; the smoke server does not weaken that check.
+
+Secure device pairing and independent identity verification are not implemented. Key verification for encrypted submissions relies on an organizer-delivered invitation or explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.

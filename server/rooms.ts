@@ -40,7 +40,7 @@ interface RoomRow {
   membership_status: Room['membershipStatus'];
   submission_cleanup_enabled: boolean;
   submissions_purged_at: Date | null;
-  admission_policy: 'approval' | 'pass';
+  admission_policy: 'approval' | 'pass' | 'proof';
 }
 
 interface MemberRow {
@@ -391,10 +391,12 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       const row = await lockRoom(transaction, found.id);
       requireOpen(row);
       requireCondition(
-        row.admission_policy !== 'pass',
+        row.admission_policy === 'approval',
         409,
-        'PASS_REQUIRED',
-        'This room requires an admission pass from the organizer.',
+        row.admission_policy === 'proof' ? 'PROOF_REQUIRED' : 'PASS_REQUIRED',
+        row.admission_policy === 'proof'
+          ? 'This room requires a saved workshop credential and a valid membership proof.'
+          : 'This room requires an admission pass from the organizer.',
       );
       requireCondition(
         row.owner_id !== request.session!.id,

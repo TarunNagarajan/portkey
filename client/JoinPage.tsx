@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
 import { api, ApiError, requestFix } from './api.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
+import { WorkshopAdmission } from './WorkshopAdmission.js';
 
 function readPassFragment(): { token: string | null; invalid: boolean } {
   const values = new URLSearchParams(window.location.hash.slice(1)).getAll('pass');
@@ -40,7 +41,8 @@ export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
   const [label, setLabel] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [passToken, setPassToken] = useState(() => readPassFragment().token);
   const [invalidPass, setInvalidPass] = useState(() => readPassFragment().invalid);
 
@@ -49,7 +51,7 @@ export function JoinPage({ code }: { code: string }) {
       const pass = readPassFragment();
       setPassToken(pass.token);
       setInvalidPass(pass.invalid);
-      if (pass.token) setError('');
+      if (pass.token) setActionError('');
     }
     window.addEventListener('hashchange', updatePassFromFragment);
     return () => window.removeEventListener('hashchange', updatePassFromFragment);
@@ -63,10 +65,10 @@ export function JoinPage({ code }: { code: string }) {
         const value = await api<PublicRoom>(`/join/${code}`);
         if (active) {
           setRoom(value);
-          setError('');
+          setLoadError('');
         }
       } catch (error) {
-        if (active) setError(error instanceof Error ? error.message : 'Unable to load room.');
+        if (active) setLoadError(error instanceof Error ? error.message : 'Unable to load room.');
       }
       if (active) timer = setTimeout(() => void poll(), 5000);
     }
@@ -87,6 +89,7 @@ export function JoinPage({ code }: { code: string }) {
   async function join(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
+    setActionError('');
     try {
       const body: Record<string, unknown> = { label };
       if (room?.geo) Object.assign(body, await requestFix());
@@ -108,20 +111,19 @@ export function JoinPage({ code }: { code: string }) {
         await api(`/join/${code}`, 'POST', body);
       }
       setRoom(await api<PublicRoom>(`/join/${code}`));
-      setError('');
     } catch (error) {
       if (error instanceof ApiError && error.code === 'ADMISSION_PASS_INVALID') {
         removePassFragment();
         setPassToken(null);
         setInvalidPass(true);
       }
-      setError(error instanceof Error ? error.message : 'Unable to request access.');
+      setActionError(error instanceof Error ? error.message : 'Unable to request access.');
     } finally {
       setBusy(false);
     }
   }
 
-  if (!room) return <p role={error ? 'alert' : 'status'}>{error || 'Finding room…'}</p>;
+  if (!room) return <p role={loadError || actionError ? 'alert' : 'status'}>{actionError || loadError || 'Finding room…'}</p>;
   return (
     <section className="panel join-page">
       <div className="join-heading">
@@ -144,9 +146,14 @@ export function JoinPage({ code }: { code: string }) {
             : 'Completed encrypted submissions are scheduled for removal after this deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
           : 'Automatic room deadline cleanup is disabled. Incomplete uploads are still removed after 24 hours.'}
       </p>
-      {error && (
+      {loadError && (
         <p role="alert" className="error">
-          {error}
+          {loadError}
+        </p>
+      )}
+      {actionError && (
+        <p role="alert" className="error">
+          {actionError}
         </p>
       )}
       {room.status !== 'open' ? (
@@ -163,6 +170,14 @@ export function JoinPage({ code }: { code: string }) {
         <p role="status">Waiting for organizer approval. This page updates automatically.</p>
       ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
         <p>The organizer has declined access for this browser.</p>
+      ) : room.admissionPolicy === 'proof' ? (
+        <WorkshopAdmission
+          room={room}
+          code={code}
+          onAdmitted={() => {
+            window.location.assign(`/rooms/${room.id}${inboxKeyFragment()}`);
+          }}
+        />
       ) : room.admissionPolicy === 'pass' && !passToken ? (
         <p>
           {invalidPass

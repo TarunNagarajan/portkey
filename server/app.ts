@@ -9,6 +9,7 @@ import { roomRoutes } from './rooms.js';
 import { sessionControls } from './sessions.js';
 import { submissionRoutes } from './submissions.js';
 import { passRoutes } from './passes.js';
+import { proofAdmissionRoutes } from './proofAdmission.js';
 
 export interface AppOptions {
   origin: string;
@@ -23,7 +24,14 @@ export function createApp(database: Database, options: AppOptions) {
   const app = express();
   const sessions = sessionControls(database, options);
   app.disable('x-powered-by');
-  app.use(helmet());
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        'script-src': ["'self'", "'wasm-unsafe-eval'"],
+        'worker-src': ["'self'", 'blob:'],
+      },
+    },
+  }));
   app.set('trust proxy', options.trustProxyHops ?? 0);
   app.use(express.json({ limit: '8kb' }));
   app.use('/api', (_request, response, next) => {
@@ -50,6 +58,7 @@ export function createApp(database: Database, options: AppOptions) {
   });
   app.use('/api', roomRoutes(database, createGeocoder(options.geocoding !== false, options.nominatimUrl)));
   app.use('/api', passRoutes(database));
+  app.use('/api', proofAdmissionRoutes(database));
   app.use('/api', submissionRoutes(database));
   app.use('/api', (_request, response) => {
     response.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });

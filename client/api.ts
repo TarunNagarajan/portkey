@@ -31,6 +31,22 @@ export function buildInvitationUrl(origin: string, code: string, fingerprint?: s
   return url.toString();
 }
 
+export function buildWorkshopEnrollmentUrl(origin: string, code: string, fingerprint: string | null, token: string) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('Workshop enrollment link is invalid.');
+  try {
+    const decoded = atob(token.replaceAll('-', '+').replaceAll('_', '/') + '=');
+    const canonical = btoa(decoded).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    if (decoded.length !== 32 || canonical !== token) throw new Error('invalid token');
+  } catch {
+    throw new Error('Workshop enrollment link is invalid.');
+  }
+  const url = new URL(buildInvitationUrl(origin, code, fingerprint));
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  fragment.set('enroll', token);
+  url.hash = fragment.toString();
+  return url.toString();
+}
+
 export function setPublicOrigin(origin: string) { publicOrigin = origin; }
 export function getPublicOrigin() { return publicOrigin; }
 

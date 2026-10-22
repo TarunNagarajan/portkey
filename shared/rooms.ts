@@ -5,7 +5,7 @@ export const roomInput = z
     title: z.string().trim().min(1).max(100),
     description: z.string().trim().max(500).default(''),
     expiresAt: z.iso.datetime({ offset: true }),
-    admissionPolicy: z.enum(['approval', 'pass']).optional(),
+    admissionPolicy: z.enum(['approval', 'pass', 'proof']).optional(),
   })
   .strict();
 
@@ -92,7 +92,7 @@ export interface Room {
   submissionsPurgedAt: string | null;
   geo: GeoRule | null;
   geoLabel: string | null;
-  admissionPolicy: 'approval' | 'pass';
+  admissionPolicy: 'approval' | 'pass' | 'proof';
 }
 
 export interface PublicRoom {
@@ -110,7 +110,7 @@ export interface PublicRoom {
   geo: GeoRule | null;
   geoLabel: string | null;
   needsLocation: boolean;
-  admissionPolicy: 'approval' | 'pass';
+  admissionPolicy: 'approval' | 'pass' | 'proof';
 }
 
 export interface Member {

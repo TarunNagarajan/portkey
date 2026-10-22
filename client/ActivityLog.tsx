@@ -18,6 +18,9 @@ const descriptions: Record<ActivityKind, string> = {
   admission_passes_issued: 'Admission passes issued',
   pass_revoked: 'Admission pass revoked',
   pass_redeemed: 'Admission pass redeemed',
+  proof_enrollments_issued: 'Workshop enrollment links issued',
+  proof_enrollment_revoked: 'Workshop enrollment link revoked',
+  proof_admitted: 'Workshop proof accepted',
 };
 
 const fields: Record<RoomField, string> = {
