@@ -40,6 +40,7 @@ interface RoomRow {
   membership_status: Room['membershipStatus'];
   submission_cleanup_enabled: boolean;
   submissions_purged_at: Date | null;
+  admission_policy: 'approval' | 'pass';
 }
 
 interface MemberRow {
@@ -59,7 +60,7 @@ const selection = `SELECT r.*, r.expires_at <= clock_timestamp() AS is_expired,
   m.status AS membership_status FROM rooms r
   LEFT JOIN memberships m ON m.room_id = r.id AND m.session_id = $1`;
 
-function geoOf(row: RoomRow): GeoRule | null {
+export function geoOf(row: RoomRow): GeoRule | null {
   if (row.geo_lat == null || row.geo_lng == null || row.geo_radius_m == null) return null;
   return { lat: row.geo_lat, lng: row.geo_lng, radiusM: row.geo_radius_m };
 }
@@ -79,6 +80,7 @@ function roomView(row: RoomRow, sessionId: string): Room {
     membershipStatus: row.membership_status ?? null,
     geo: geoOf(row),
     geoLabel: row.geo_label,
+    admissionPolicy: row.admission_policy ?? 'approval',
   };
 }
 
@@ -104,6 +106,7 @@ function publicView(
     geoLabel: view.geoLabel,
     needsLocation:
       view.geo != null && view.role !== 'owner' && view.membershipStatus !== 'approved',
+    admissionPolicy: view.admissionPolicy,
   };
 }
 
@@ -126,7 +129,7 @@ const ENTRY_FRESH_MS = 5 * 60 * 1000;
 const FIX_FRESH_MS = 60 * 1000;
 const ACCURACY_CAP_M = 75;
 
-function validateFix(input: { lat: number; lng: number; accuracyM: number; timestamp: string }) {
+export function validateFix(input: { lat: number; lng: number; accuracyM: number; timestamp: string }) {
   requireCondition(
     input.accuracyM <= ACCURACY_CAP_M,
     422,
@@ -142,19 +145,19 @@ function validateFix(input: { lat: number; lng: number; accuracyM: number; times
   );
 }
 
-async function clock(queries: Queries) {
+export async function clock(queries: Queries) {
   const [row] = await queries.query<{ now: Date }>('SELECT clock_timestamp() AS now');
   return row.now;
 }
 
-async function lockRoom(queries: Queries, id: string) {
+export async function lockRoom(queries: Queries, id: string) {
   const [row] = await queries.query<RoomRow>('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [id]);
   requireCondition(row, 404, 'ROOM_NOT_FOUND', 'Room not found.');
   row.is_expired = row.expires_at <= (await clock(queries));
   return row;
 }
 
-function requireOwner(row: RoomRow, sessionId: string) {
+export function requireOwner(row: { owner_id: string }, sessionId: string) {
   requireCondition(
     row.owner_id === sessionId,
     403,
@@ -163,7 +166,7 @@ function requireOwner(row: RoomRow, sessionId: string) {
   );
 }
 
-function requireActive(row: RoomRow) {
+export function requireActive(row: { status: string; is_expired: boolean }) {
   requireCondition(
     row.status !== 'closed' && !row.is_expired,
     410,
@@ -172,9 +175,38 @@ function requireActive(row: RoomRow) {
   );
 }
 
-function requireOpen(row: RoomRow) {
+export function requireOpen(row: { status: string; is_expired: boolean }) {
   requireActive(row);
   requireCondition(row.status === 'open', 409, 'ROOM_NOT_OPEN', 'This room is not open yet.');
+}
+
+export function admissionFix(
+  input: { lat?: number; lng?: number; accuracyM?: number; timestamp?: string },
+  geo: GeoRule | null,
+) {
+  if (!geo) return null;
+  requireCondition(
+    input.lat != null && input.lng != null && input.accuracyM != null && input.timestamp != null,
+    403,
+    'GEO_REQUIRED',
+    'This room requires your location. Share your location to request access.',
+  );
+  const report = positionReport.parse({
+    lat: input.lat,
+    lng: input.lng,
+    accuracyM: input.accuracyM,
+    timestamp: input.timestamp,
+  });
+  validateFix(report);
+  const distanceM = haversineMeters(report, geo);
+  const inside = distanceM <= geo.radiusM;
+  requireCondition(
+    inside,
+    403,
+    'GEO_OUTSIDE',
+    `You are about ${Math.round(distanceM)} m away, outside this room's area (~${geo.radiusM} m).`,
+  );
+  return { ...report, distanceM, inside };
 }
 
 function validateExpiry(value: string, now: Date, sessionExpiry: Date) {
@@ -204,8 +236,8 @@ async function insertRoom(
 ) {
   const expiresAt = validateExpiry(input.expiresAt, await clock(queries), sessionExpiry);
   const [row] = await queries.query<RoomRow>(
-    `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *, false AS is_expired`,
+    `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at, admission_policy)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *, false AS is_expired`,
     [
       randomUUID(),
       ownerId,
@@ -213,6 +245,7 @@ async function insertRoom(
       input.title,
       input.description,
       expiresAt,
+      input.admissionPolicy ?? 'approval',
     ],
   );
   await recordActivity(queries, row.id, kind);
@@ -257,6 +290,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
           title: input.title ?? original.title,
           description: input.description ?? original.description,
           expiresAt: input.expiresAt,
+          admissionPolicy: input.admissionPolicy ?? original.admission_policy,
         },
         'room_duplicated',
       );
@@ -357,6 +391,12 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       const row = await lockRoom(transaction, found.id);
       requireOpen(row);
       requireCondition(
+        row.admission_policy !== 'pass',
+        409,
+        'PASS_REQUIRED',
+        'This room requires an admission pass from the organizer.',
+      );
+      requireCondition(
         row.owner_id !== request.session!.id,
         409,
         'ALREADY_OWNER',
@@ -374,32 +414,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         'ADMISSION_DENIED',
         'The organizer has declined access for this browser.',
       );
-      const geo = geoOf(row);
-      let fix: { lat: number; lng: number; accuracyM: number; distanceM: number; inside: boolean } | null = null;
-      if (geo) {
-        requireCondition(
-          input.lat != null && input.lng != null && input.accuracyM != null && input.timestamp != null,
-          403,
-          'GEO_REQUIRED',
-          'This room requires your location. Share your location to request access.',
-        );
-        const report = positionReport.parse({
-          lat: input.lat,
-          lng: input.lng,
-          accuracyM: input.accuracyM,
-          timestamp: input.timestamp,
-        });
-        validateFix(report);
-        const distanceM = haversineMeters(report, geo);
-        const inside = distanceM <= geo.radiusM;
-        requireCondition(
-          inside,
-          403,
-          'GEO_OUTSIDE',
-          `You are about ${Math.round(distanceM)} m away, outside this room's area (~${geo.radiusM} m).`,
-        );
-        fix = { ...report, distanceM, inside };
-      }
+      const fix = admissionFix(input, geoOf(row));
       if (existing && !fix) return memberView(existing);
       const [member] = await transaction.query<MemberRow>(
         `INSERT INTO memberships (id, room_id, session_id, label, last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at)
@@ -511,14 +526,23 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         request.session!.expiresAt,
       );
       const [updated] = await transaction.query<RoomRow>(
-        `UPDATE rooms SET title = $2, description = $3, expires_at = $4
+        `UPDATE rooms SET title = $2, description = $3, expires_at = $4, admission_policy = $5
          WHERE id = $1 RETURNING *, false AS is_expired`,
-        [id, input.title, input.description, expiresAt],
+        [id, input.title, input.description, expiresAt, input.admissionPolicy ?? room.admission_policy],
       );
       const changedFields: RoomField[] = [];
       if (room.title !== input.title) changedFields.push('title');
       if (room.description !== input.description) changedFields.push('description');
       if (room.expires_at.getTime() !== expiresAt.getTime()) changedFields.push('expiresAt');
+      if (input.admissionPolicy && room.admission_policy !== input.admissionPolicy) {
+        requireCondition(
+          room.status === 'draft',
+          409,
+          'POLICY_LOCKED',
+          'Admission policy can only change while the room is a draft.',
+        );
+        changedFields.push('admissionPolicy');
+      }
       if (changedFields.length)
         await recordActivity(transaction, id, 'room_updated', null, changedFields);
       return updated;

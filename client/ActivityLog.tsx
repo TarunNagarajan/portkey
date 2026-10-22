@@ -15,12 +15,16 @@ const descriptions: Record<ActivityKind, string> = {
   member_revoked: 'Access removed',
   submission_cleanup_enabled: 'Automatic submission cleanup enabled',
   submissions_purged: 'Room submissions removed after deadline',
+  admission_passes_issued: 'Admission passes issued',
+  pass_revoked: 'Admission pass revoked',
+  pass_redeemed: 'Admission pass redeemed',
 };
 
 const fields: Record<RoomField, string> = {
   title: 'Title',
   description: 'Description',
   expiresAt: 'Access deadline',
+  admissionPolicy: 'Admission policy',
 };
 
 export function ActivityLog({ roomId }: { roomId: string }) {

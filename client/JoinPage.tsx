@@ -1,13 +1,59 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
-import { api, requestFix } from './api.js';
+import { api, ApiError, requestFix } from './api.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
+
+function readPassFragment(): { token: string | null; invalid: boolean } {
+  const values = new URLSearchParams(window.location.hash.slice(1)).getAll('pass');
+  if (values.length === 0) return { token: null, invalid: false };
+  const token = values[0];
+  if (values.length !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(token))
+    return { token: null, invalid: true };
+  try {
+    const decoded = atob(token.replaceAll('-', '+').replaceAll('_', '/') + '=');
+    const canonical = btoa(decoded).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    return canonical === token && decoded.length === 32
+      ? { token, invalid: false }
+      : { token: null, invalid: true };
+  } catch {
+    return { token: null, invalid: true };
+  }
+}
+
+function removePassFragment() {
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  fragment.delete('pass');
+  const hash = fragment.size ? `#${fragment.toString()}` : '';
+  window.history.replaceState(
+    null,
+    '',
+    `${window.location.pathname}${window.location.search}${hash}`,
+  );
+}
+
+function inboxKeyFragment() {
+  const key = new URLSearchParams(window.location.hash.slice(1)).get('key');
+  return key && /^[a-f0-9]{64}$/.test(key) ? `#key=${encodeURIComponent(key)}` : '';
+}
 
 export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
   const [label, setLabel] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [passToken, setPassToken] = useState(() => readPassFragment().token);
+  const [invalidPass, setInvalidPass] = useState(() => readPassFragment().invalid);
+
+  useEffect(() => {
+    function updatePassFromFragment() {
+      const pass = readPassFragment();
+      setPassToken(pass.token);
+      setInvalidPass(pass.invalid);
+      if (pass.token) setError('');
+    }
+    window.addEventListener('hashchange', updatePassFromFragment);
+    return () => window.removeEventListener('hashchange', updatePassFromFragment);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -31,16 +77,44 @@ export function JoinPage({ code }: { code: string }) {
     };
   }, [code]);
 
+  useEffect(() => {
+    if (room && (room.isOwner || room.membershipStatus === 'approved') && passToken) {
+      removePassFragment();
+      setPassToken(null);
+    }
+  }, [room, passToken]);
+
   async function join(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
     try {
       const body: Record<string, unknown> = { label };
       if (room?.geo) Object.assign(body, await requestFix());
-      await api(`/join/${code}`, 'POST', body);
+      if (room?.admissionPolicy === 'pass') {
+        if (!passToken)
+          throw new Error(
+            'Ask the organizer for a pass link. This room does not accept ordinary access requests.',
+          );
+        const member = await api<{ status: string }>(`/join/${code}/redeem`, 'POST', {
+          ...body,
+          token: passToken,
+        });
+        if (member.status === 'approved') {
+          removePassFragment();
+          setPassToken(null);
+          setInvalidPass(false);
+        }
+      } else {
+        await api(`/join/${code}`, 'POST', body);
+      }
       setRoom(await api<PublicRoom>(`/join/${code}`));
       setError('');
     } catch (error) {
+      if (error instanceof ApiError && error.code === 'ADMISSION_PASS_INVALID') {
+        removePassFragment();
+        setPassToken(null);
+        setInvalidPass(true);
+      }
       setError(error instanceof Error ? error.message : 'Unable to request access.');
     } finally {
       setBusy(false);
@@ -82,13 +156,19 @@ export function JoinPage({ code }: { code: string }) {
             : 'This room has closed.'}
         </p>
       ) : room.isOwner || room.membershipStatus === 'approved' ? (
-        <a className="button" href={`/rooms/${room.id}${window.location.hash}`}>
+        <a className="button" href={`/rooms/${room.id}${inboxKeyFragment()}`}>
           Enter room
         </a>
-      ) : room.membershipStatus === 'pending' ? (
+      ) : room.membershipStatus === 'pending' && room.admissionPolicy === 'approval' ? (
         <p role="status">Waiting for organizer approval. This page updates automatically.</p>
       ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
         <p>The organizer has declined access for this browser.</p>
+      ) : room.admissionPolicy === 'pass' && !passToken ? (
+        <p>
+          {invalidPass
+            ? 'This pass could not be used. Ask the organizer for a new pass.'
+            : 'Ask the organizer for a single use admission pass. This public room link does not grant access.'}
+        </p>
       ) : (
         <form onSubmit={join}>
           <label>
@@ -113,12 +193,22 @@ export function JoinPage({ code }: { code: string }) {
               required.
             </p>
           )}
+          {room.admissionPolicy === 'pass' && (
+            <p className="muted">
+              A pass is used once and binds access to this browser. Anyone holding the link can
+              redeem it before you do.
+            </p>
+          )}
           <button disabled={busy}>
             {busy
-              ? 'Requesting…'
+              ? room.admissionPolicy === 'pass' ? 'Redeeming…' : 'Requesting…'
               : room.geo
-                ? 'Share location & request access'
-                : 'Request access'}
+                ? room.admissionPolicy === 'pass'
+                  ? 'Share location & redeem pass'
+                  : 'Share location & request access'
+                : room.admissionPolicy === 'pass'
+                  ? 'Redeem pass'
+                  : 'Request access'}
           </button>
         </form>
       )}

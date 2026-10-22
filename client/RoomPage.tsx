@@ -6,6 +6,7 @@ import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
 import { PrivateInbox } from './PrivateInbox.js';
+import { PassesPanel } from './PassesPanel.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
@@ -100,7 +101,7 @@ export function RoomPage({ id }: { id: string }) {
         </span>
         <span>
           <Icon name="shield" />
-          Organizer approval required
+          {room.admissionPolicy === 'pass' ? 'Single use admission pass' : 'Organizer approval required'}
         </span>
       </div>
       <section className="panel storage-panel">
@@ -192,18 +193,21 @@ export function RoomPage({ id }: { id: string }) {
                   title: room.title,
                   description: room.description,
                   expiresAt: room.expiresAt,
+                  admissionPolicy: room.admissionPolicy,
                 }}
+                admissionPolicyLocked={room.status !== 'draft'}
                 submitLabel="Save details"
                 onSubmit={save}
               />
             </section>
           )}
-          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} />}
+          {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} />}
+          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} passMode={room.admissionPolicy === 'pass'} />}
           <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
           {room.status === 'draft' && (
             <div className="notice">
               <Icon name="rooms" />
-              <p>Open the room when you are ready to receive join requests.</p>
+                <p>{room.admissionPolicy === 'pass' ? 'Open the room when you are ready to admit pass holders.' : 'Open the room when you are ready to receive join requests.'}</p>
             </div>
           )}
           {!active && (
@@ -216,11 +220,17 @@ export function RoomPage({ id }: { id: string }) {
             <div className="panel-heading">
               <div>
                 <h2>Participant access</h2>
-                <p>Match the participant’s label before approving.</p>
+                <p>
+                  {room.admissionPolicy === 'pass'
+                    ? 'Pass holders appear here after redemption. You can remove their access at any time.'
+                    : 'Match the participant’s label before approving.'}
+                </p>
               </div>
               <span className="count-label">
-                {members.filter((member) => member.status === 'pending').length} pending ·{' '}
-                {members.filter((member) => member.status === 'approved').length} approved
+                {room.admissionPolicy === 'pass'
+                  ? `${members.filter((member) => member.status === 'approved').length} admitted`
+                  : <>{members.filter((member) => member.status === 'pending').length} pending ·{' '}
+                    {members.filter((member) => member.status === 'approved').length} approved</>}
               </span>
             </div>
             {members.length === 0 ? (
@@ -228,8 +238,12 @@ export function RoomPage({ id }: { id: string }) {
                 <span className="empty-symbol">
                   <Icon name="shield" />
                 </span>
-                <h3>No requests yet</h3>
-                <p>Join requests will appear here after you share the room.</p>
+                <h3>{room.admissionPolicy === 'pass' ? 'No participants yet' : 'No requests yet'}</h3>
+                <p>
+                  {room.admissionPolicy === 'pass'
+                    ? 'People will appear here after redeeming a pass.'
+                    : 'Join requests will appear here after you share the room.'}
+                </p>
               </div>
             ) : (
               <div className="table-scroll">
@@ -331,7 +345,7 @@ export function RoomPage({ id }: { id: string }) {
           <section className="panel participant-welcome">
             <span className="empty-symbol"><Icon name="shield" /></span>
             <h2>You’re in.</h2>
-            <p>Your organizer-approved access is active for this browser.</p>
+            <p>{room.admissionPolicy === 'pass' ? 'Your one use pass admitted this browser. You can return from this browser until the room closes or your access is removed.' : 'Your organizer-approved access is active for this browser.'}</p>
           </section>
           <PrivateInbox room={room} />
         </>

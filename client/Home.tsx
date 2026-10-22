@@ -206,7 +206,7 @@ export function Home() {
               <Icon name="copy" />
               <div>
                 <strong>{template.title}</strong>
-                <p>Participants and approvals won’t be copied.</p>
+                <p>Participants, passes, and redemption history won’t be copied.</p>
                 <a href="/#new-room">Start from scratch</a>
               </div>
             </div>
@@ -220,6 +220,7 @@ export function Home() {
                       title: template.title,
                       description: template.description,
                       expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+                      admissionPolicy: template.admissionPolicy,
                     }
                   : undefined
               }

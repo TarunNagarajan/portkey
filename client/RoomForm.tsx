@@ -9,15 +9,18 @@ export function RoomForm({
   initial,
   submitLabel,
   isCreate = true,
+  admissionPolicyLocked = false,
   onSubmit,
 }: {
   initial?: RoomInput;
   submitLabel: string;
   isCreate?: boolean;
+  admissionPolicyLocked?: boolean;
   onSubmit: (input: RoomInput) => Promise<void>;
 }) {
   const [title, setTitle] = useState(initial?.title ?? '');
   const [description, setDescription] = useState(initial?.description ?? '');
+  const [admissionPolicy, setAdmissionPolicy] = useState<'approval' | 'pass'>(initial?.admissionPolicy ?? 'approval');
   const [expiresAt, setExpiresAt] = useState(
     localDate(initial ? new Date(initial.expiresAt) : new Date(Date.now() + 24 * 60 * 60 * 1000)),
   );
@@ -29,7 +32,7 @@ export function RoomForm({
     setBusy(true);
     setError('');
     try {
-      await onSubmit({ title, description, expiresAt: new Date(expiresAt).toISOString() });
+      await onSubmit({ title, description, expiresAt: new Date(expiresAt).toISOString(), admissionPolicy });
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Unable to save the room.');
     } finally {
@@ -49,6 +52,19 @@ export function RoomForm({
           placeholder="Design workshop"
         />
       </label>
+      <label>
+        Admission
+        <select value={admissionPolicy} disabled={admissionPolicyLocked} onChange={(event) => setAdmissionPolicy(event.target.value as 'approval' | 'pass')}>
+          <option value="approval">Organizer approval</option>
+          <option value="pass">Single use pass</option>
+        </select>
+      </label>
+      <p className="muted">
+        {admissionPolicy === 'pass'
+          ? 'Each intended attendee needs a pass from you. A pass can be used once and binds access to that browser; anyone who receives it before use can redeem it.'
+          : 'Participants request access and you approve each browser.'}
+        {admissionPolicyLocked && ' Admission policy is fixed after opening.'}
+      </p>
       <label>
         Public description
         <textarea
