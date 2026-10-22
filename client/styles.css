@@ -321,6 +321,12 @@ main {
   border-radius: 9px;
   overflow: hidden;
 }
+.credential-panel {
+  padding: 22px;
+  margin-bottom: 18px;
+}
+.credential-panel > :first-child { margin-top: 0; }
+.credential-panel > :last-child { margin-bottom: 0; }
 .storage-panel {
   padding: 22px;
   margin-bottom: 24px;
@@ -378,6 +384,13 @@ main {
 .workshop-admission > p { color: var(--text-muted); }
 .workshop-admission form { margin-block: 18px; }
 .workshop-admission input { max-width: 320px; }
+.group-choice-list { display: grid; gap: 8px; margin-block: 14px; }
+.group-choice-list label,
+.proof-rule-sources label { display: flex; align-items: center; gap: 9px; margin: 0; font-size: 14px; }
+.group-choice-list input,
+fieldset input[type='radio'] { width: auto; margin: 0; padding: 0; accent-color: #315ba7; }
+.proof-rule-sources { display: grid; gap: 10px; padding: 14px; border: 1px solid #d7dfe9; border-radius: 6px; }
+.proof-rule-sources legend { padding-inline: 5px; font-weight: 600; }
 .private-inbox .panel-heading {
   padding: 0 0 16px;
 }
@@ -974,13 +987,26 @@ footer {
   }
   .nav-label,
   .sidebar-note,
-  .sidebar nav a:last-child {
+  .nav-create-room {
     display: none;
   }
+  .sidebar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .sidebar nav {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
   .nav-item {
+    flex: 0 0 auto;
     margin: 0;
-    padding: 8px 10px;
-    font-size: 11px;
+    padding: 7px 9px;
+    font-size: 12px;
+    white-space: nowrap;
   }
   .workspace {
     width: 100%;
@@ -1083,6 +1109,7 @@ footer {
     margin: 0;
     padding: 24px;
   }
+  .credential-panel { padding: 16px; }
   .join-page h1 {
     font-size: 30px;
   }

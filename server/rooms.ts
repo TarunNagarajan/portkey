@@ -282,7 +282,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
     const room = await database.transaction(async (transaction) => {
       const original = await lockRoom(transaction, id);
       requireOwner(original, request.session!.id);
-      return insertRoom(
+      const duplicate = await insertRoom(
         transaction,
         request.session!.id,
         request.session!.expiresAt,
@@ -294,6 +294,19 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         },
         'room_duplicated',
       );
+      const resultantPolicy = input.admissionPolicy ?? original.admission_policy;
+      if (resultantPolicy === 'proof' && original.admission_policy === 'proof') {
+        const [bound] = await transaction.query<{ total: number }>('SELECT count(*)::int AS total FROM room_proof_groups WHERE room_id = $1', [original.id]);
+        const copied = await transaction.query<{ group_id: string }>(
+          `INSERT INTO room_proof_groups (room_id, group_id)
+           SELECT $1, rg.group_id FROM room_proof_groups rg
+           JOIN credential_groups g ON g.id = rg.group_id AND g.owner_session_id = $3
+           JOIN sessions s ON s.id = g.owner_session_id AND s.expires_at > clock_timestamp()
+           WHERE rg.room_id = $2 RETURNING group_id`, [duplicate.id, original.id, request.session!.id],
+        );
+        requireCondition(copied.length === bound.total, 409, 'PROOF_RULE_UNAVAILABLE', 'The template’s credential rule is unavailable and could not be copied.');
+      }
+      return duplicate;
     });
     response.status(201).json(room);
   });
@@ -532,6 +545,9 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
          WHERE id = $1 RETURNING *, false AS is_expired`,
         [id, input.title, input.description, expiresAt, input.admissionPolicy ?? room.admission_policy],
       );
+      if (input.admissionPolicy && input.admissionPolicy !== 'proof' && room.admission_policy === 'proof') {
+        await transaction.query('DELETE FROM room_proof_groups WHERE room_id = $1', [id]);
+      }
       const changedFields: RoomField[] = [];
       if (room.title !== input.title) changedFields.push('title');
       if (room.description !== input.description) changedFields.push('description');

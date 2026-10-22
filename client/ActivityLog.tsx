@@ -21,6 +21,8 @@ const descriptions: Record<ActivityKind, string> = {
   proof_enrollments_issued: 'Workshop enrollment links issued',
   proof_enrollment_revoked: 'Workshop enrollment link revoked',
   proof_admitted: 'Workshop proof accepted',
+  proof_rule_updated: 'Reusable credential rule updated',
+  proof_rule_cleared: 'Reusable credential rule cleared',
 };
 
 const fields: Record<RoomField, string> = {

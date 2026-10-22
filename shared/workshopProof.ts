@@ -19,7 +19,21 @@ export function workshopMessage(input: {
   roomId: string;
   sessionId: string;
   root: string;
+  policyDigest?: string | null;
 }) {
+  if (input.policyDigest) {
+    return protocolValue([
+      'portkey:reusable-proof-challenge:v1',
+      input.policyDigest,
+      input.challengeId,
+      input.nonce,
+      input.roomId,
+      input.sessionId,
+      input.root,
+      WORKSHOP_PROOF_VERSION,
+      WORKSHOP_PROOF_DEPTH,
+    ].join(':'));
+  }
   return protocolValue([
     'portkey:workshop-proof-challenge:v1',
     input.challengeId,
@@ -30,4 +44,18 @@ export function workshopMessage(input: {
     WORKSHOP_PROOF_VERSION,
     WORKSHOP_PROOF_DEPTH,
   ].join(':'));
+}
+
+export function workshopPolicyDigest(groupIds: string[]) {
+  const ids = groupIds.map(id => id.toLowerCase()).sort();
+  if (ids.length < 1 || ids.length > 4 || new Set(ids).size !== ids.length)
+    throw new Error('A proof rule requires one to four distinct credential groups.');
+  return keccak256(toUtf8Bytes([
+    'portkey:proof-policy:v1',
+    'any',
+    'semaphore-fixed-adapter',
+    WORKSHOP_PROOF_VERSION,
+    WORKSHOP_PROOF_DEPTH,
+    ...ids,
+  ].join(':'))).slice(2);
 }

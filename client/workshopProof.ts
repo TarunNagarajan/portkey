@@ -1,4 +1,7 @@
 import type { SemaphoreProof } from '@semaphore-protocol/proof';
+import { ApiError, api } from './api.js';
+
+export interface ProofRule { mode: 'any'; version: string; depth: number; digest: string; groups: Array<{ id: string; name: string }> }
 
 export interface WorkshopChallenge {
   challengeId: string;
@@ -9,6 +12,26 @@ export interface WorkshopChallenge {
   message: string;
   commitments: string[];
   expiresAt: string;
+  proofRule?: ProofRule;
+}
+
+export async function submitProofWithBusyRetry(code: string, body: Record<string, unknown>, signal: AbortSignal, expiresAt: number) {
+  for (let attempt = 0; ; attempt += 1) {
+    if (expiresAt <= Date.now()) throw new Error('This proof challenge expired while checking membership. Start a new proof.');
+    try { return await api(`/join/${code}/prove`, 'POST', body, signal); }
+    catch (error) {
+      if (!(error instanceof ApiError) || error.code !== 'PROOF_BUSY' || attempt >= 3) throw error;
+      const delay = 250 * (attempt + 1);
+      if (expiresAt <= Date.now() + delay) throw new Error('This proof challenge is about to expire while the verifier is busy. Start a new proof.');
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(done, delay);
+        function done() { signal.removeEventListener('abort', aborted); resolve(); }
+        function aborted() { window.clearTimeout(timer); signal.removeEventListener('abort', aborted); reject(new DOMException('Proof request cancelled.', 'AbortError')); }
+        signal.addEventListener('abort', aborted, { once: true });
+        if (signal.aborted) aborted();
+      });
+    }
+  }
 }
 
 export function generateWorkshopProof(identity: string, challenge: WorkshopChallenge, signal?: AbortSignal): Promise<SemaphoreProof> {
