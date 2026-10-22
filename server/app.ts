@@ -10,6 +10,7 @@ import { sessionControls } from './sessions.js';
 import { submissionRoutes } from './submissions.js';
 import { passRoutes } from './passes.js';
 import { proofAdmissionRoutes } from './proofAdmission.js';
+import { credentialGroupRoutes } from './credentialGroups.js';
 
 export interface AppOptions {
   origin: string;
@@ -59,6 +60,7 @@ export function createApp(database: Database, options: AppOptions) {
   app.use('/api', roomRoutes(database, createGeocoder(options.geocoding !== false, options.nominatimUrl)));
   app.use('/api', passRoutes(database));
   app.use('/api', proofAdmissionRoutes(database));
+  app.use('/api', credentialGroupRoutes(database));
   app.use('/api', submissionRoutes(database));
   app.use('/api', (_request, response) => {
     response.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });

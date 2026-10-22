@@ -15,7 +15,9 @@ export type ActivityKind =
   | 'pass_redeemed'
   | 'proof_enrollments_issued'
   | 'proof_enrollment_revoked'
-  | 'proof_admitted';
+  | 'proof_admitted'
+  | 'proof_rule_updated'
+  | 'proof_rule_cleared';
 
 export type RoomField = 'title' | 'description' | 'expiresAt' | 'admissionPolicy';
 

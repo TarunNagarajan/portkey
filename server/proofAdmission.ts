@@ -15,6 +15,7 @@ import {
 import type { Database, Queries } from './database.js';
 import { HttpError, requireCondition } from './errors.js';
 import { recordActivity } from './activity.js';
+import { currentProofRule } from './credentialGroups.js';
 import {
   admissionFix,
   clock,
@@ -108,13 +109,22 @@ function validInviteToken(token: string) {
   }
 }
 
-async function currentGroup(queries: Queries, roomIdValue: string) {
-  const rows = await queries.query<{ commitment: string }>(
-    'SELECT commitment FROM room_proof_commitments WHERE room_id = $1 ORDER BY created_at, commitment LIMIT 1000',
-    [roomIdValue],
-  );
+async function currentGroup(queries: Queries, roomIdValue: string, rule: Awaited<ReturnType<typeof currentProofRule>>) {
+  const rows = rule
+    ? await queries.query<{ commitment: string }>(
+      `SELECT DISTINCT c.commitment FROM credential_group_commitments c
+       JOIN room_proof_groups rg ON rg.group_id = c.group_id
+       WHERE rg.room_id = $1 ORDER BY c.commitment LIMIT 1001`, [roomIdValue],
+    )
+    : await queries.query<{ commitment: string }>(
+      'SELECT commitment FROM room_proof_commitments WHERE room_id = $1 ORDER BY created_at, commitment LIMIT 1001', [roomIdValue],
+    );
+  requireCondition(rows.length <= 1000, 409, 'PROOF_GROUP_LIMIT', 'This proof rule exceeds its 1,000 credential limit.');
   const commitments = rows.map((row) => row.commitment);
-  return { commitments, group: new Group(commitments.map(BigInt)) };
+  const selected = rule
+    ? [...new Set(commitments)].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0)
+    : commitments;
+  return { commitments: selected, group: new Group(selected.map(BigInt)) };
 }
 
 export function proofAdmissionRoutes(database: Database) {
@@ -150,6 +160,7 @@ export function proofAdmissionRoutes(database: Database) {
       requireOwner(room, request.session!.id);
       requireActive(room);
       requireCondition(room.admission_policy === 'proof', 409, 'PROOF_POLICY_REQUIRED', 'This room does not use workshop proof admission.');
+      requireCondition(!(await currentProofRule(transaction, id)), 409, 'REUSABLE_GROUPS_CONFIGURED', 'This room uses reusable credential groups; room-specific links are unavailable.');
       const [used] = await transaction.query<{ total: number; next: number }>(
         `SELECT count(*)::int AS total, (COALESCE(max(invite_number), 0) + 1)::int AS next
          FROM room_proof_invites WHERE room_id = $1`, [id],
@@ -181,6 +192,7 @@ export function proofAdmissionRoutes(database: Database) {
       requireOwner(room, request.session!.id);
       requireActive(room);
       requireCondition(room.admission_policy === 'proof', 409, 'PROOF_POLICY_REQUIRED', 'This room does not use workshop proof admission.');
+      requireCondition(!(await currentProofRule(transaction, id)), 409, 'REUSABLE_GROUPS_CONFIGURED', 'This room uses reusable credential groups; room-specific links are unavailable.');
       const [current] = await transaction.query<InviteRow>(
         `SELECT id, invite_number, created_at, revoked_at, enrolled_commitment
          FROM room_proof_invites WHERE id = $1 AND room_id = $2 FOR UPDATE`, [inviteId, id],
@@ -208,6 +220,7 @@ export function proofAdmissionRoutes(database: Database) {
       const room = await lockRoomByCode(transaction, code);
       requireOpen(room);
       requireCondition(room.admission_policy === 'proof', 409, 'PROOF_POLICY_REQUIRED', 'This room does not use workshop proof admission.');
+      requireCondition(!(await currentProofRule(transaction, room.id)), 409, 'REUSABLE_GROUPS_CONFIGURED', 'This room uses reusable credential groups; room-specific links are unavailable.');
       requireCondition(room.owner_id !== request.session!.id, 409, 'ALREADY_OWNER', 'You already organize this room.');
       const [invite] = await transaction.query<InviteRow>(
         `SELECT id, invite_number, created_at, revoked_at, enrolled_commitment
@@ -249,7 +262,8 @@ export function proofAdmissionRoutes(database: Database) {
       );
       requireCondition(!existing || !['revoked', 'denied'].includes(existing.status), 403, 'ADMISSION_DENIED', 'The organizer has declined access for this browser.');
       requireCondition(existing?.status !== 'approved', 409, 'ALREADY_ADMITTED', 'This browser already has workshop access.');
-      const { commitments, group } = await currentGroup(transaction, room.id);
+      const proofRule = await currentProofRule(transaction, room.id);
+      const { commitments, group } = await currentGroup(transaction, room.id, proofRule);
       const [previous] = await transaction.query<{ id: string }>(
         'SELECT id FROM room_proof_challenges WHERE room_id = $1 AND session_id = $2 FOR UPDATE',
         [room.id, request.session!.id],
@@ -263,15 +277,17 @@ export function proofAdmissionRoutes(database: Database) {
         roomId: room.id,
         sessionId: request.session!.id,
         root: group.root.toString(),
+        policyDigest: proofRule?.digest,
       });
       const [stored] = await transaction.query<{ id: string; expires_at: Date }>(
-        `INSERT INTO room_proof_challenges (id, room_id, session_id, accepted_root, scope, message, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, LEAST(clock_timestamp() + interval '2 minutes', $7::timestamptz))
+        `INSERT INTO room_proof_challenges (id, room_id, session_id, accepted_root, scope, message, expires_at, policy_digest)
+         VALUES ($1, $2, $3, $4, $5, $6, LEAST(clock_timestamp() + interval '2 minutes', $7::timestamptz), $8)
          ON CONFLICT (room_id, session_id) DO UPDATE SET
            accepted_root = EXCLUDED.accepted_root, scope = EXCLUDED.scope,
-           message = EXCLUDED.message, expires_at = EXCLUDED.expires_at, consumed_at = NULL
+           message = EXCLUDED.message, expires_at = EXCLUDED.expires_at, consumed_at = NULL,
+           policy_digest = EXCLUDED.policy_digest
          RETURNING id, expires_at`,
-        [id, room.id, request.session!.id, group.root.toString(), scope, message, request.session!.expiresAt],
+        [id, room.id, request.session!.id, group.root.toString(), scope, message, request.session!.expiresAt, proofRule?.digest ?? null],
       );
       return {
         challengeId: stored.id,
@@ -281,6 +297,7 @@ export function proofAdmissionRoutes(database: Database) {
         scope,
         message,
         commitments,
+        ...(proofRule ? { proofRule } : {}),
         expiresAt: stored.expires_at.toISOString(),
       };
     });
@@ -307,10 +324,10 @@ export function proofAdmissionRoutes(database: Database) {
     const label = input.label ?? 'Workshop attendee';
     const [challenge] = await database.query<{
       id: string; room_id: string; session_id: string; accepted_root: string; scope: string;
-      message: string; expires_at: Date; consumed_at: Date | null;
+      message: string; expires_at: Date; consumed_at: Date | null; policy_digest: string | null;
     }>(
       `SELECT c.id, c.room_id, c.session_id, c.accepted_root, c.scope, c.message,
-         c.expires_at, c.consumed_at
+         c.expires_at, c.consumed_at, c.policy_digest
        FROM room_proof_challenges c JOIN rooms r ON r.id = c.room_id
        WHERE c.id = $1 AND r.join_code = $2`, [input.challengeId, code],
     );
@@ -320,6 +337,8 @@ export function proofAdmissionRoutes(database: Database) {
     );
     const state = roomState[0];
     if (!state || state.owner_id === request.session!.id || state.status !== 'open' || state.expires_at <= (await clock(database)) || state.admission_policy !== 'proof') proofError();
+    const proofRule = await currentProofRule(database, challenge.room_id);
+    if ((proofRule?.digest ?? null) !== challenge.policy_digest) proofError();
     const [membership] = await database.query<{ status: string }>(
       'SELECT status FROM memberships WHERE room_id = $1 AND session_id = $2', [challenge.room_id, request.session!.id],
     );
@@ -346,14 +365,17 @@ export function proofAdmissionRoutes(database: Database) {
       const room = await lockRoom(transaction, challenge.room_id);
       requireOpen(room);
       requireCondition(room.join_code === code && room.admission_policy === 'proof', 403, 'WORKSHOP_PROOF_INVALID', 'This membership proof is invalid or no longer available. Refresh and try again.');
+      const currentRule = await currentProofRule(transaction, room.id);
+      requireCondition((currentRule?.digest ?? null) === challenge.policy_digest, 403, 'WORKSHOP_PROOF_INVALID', 'This membership proof is invalid or no longer available. Refresh and try again.');
       requireCondition(room.owner_id !== request.session!.id, 409, 'ALREADY_OWNER', 'You already organize this room.');
       const [current] = await transaction.query<typeof challenge>(
-        `SELECT id, room_id, session_id, accepted_root, scope, message, expires_at, consumed_at
+        `SELECT id, room_id, session_id, accepted_root, scope, message, expires_at, consumed_at, policy_digest
          FROM room_proof_challenges WHERE id = $1 AND room_id = $2 FOR UPDATE`,
         [input.challengeId, room.id],
       );
       if (!current || current.session_id !== request.session!.id || current.expires_at <= (await clock(transaction)) ||
-          current.accepted_root !== proof.merkleTreeRoot || current.scope !== proof.scope || current.message !== proof.message)
+          current.accepted_root !== proof.merkleTreeRoot || current.scope !== proof.scope || current.message !== proof.message ||
+          current.policy_digest !== challenge.policy_digest)
         proofError();
       const [existing] = await transaction.query<{ id: string; label: string; status: string }>(
         'SELECT id, label, status FROM memberships WHERE room_id = $1 AND session_id = $2 FOR UPDATE',
