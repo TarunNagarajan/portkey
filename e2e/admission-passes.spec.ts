@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 
 test('pass admission is one use, preserves the inbox fingerprint, and supports encrypted files', async ({ page, browser }) => {
   test.setTimeout(120_000);
@@ -34,9 +35,37 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   expect(csv).toContain(firstLink!);
   expect(csv).toContain('number,url');
   expect(csv).toContain(`${origin}/join/`);
-  await page.getByRole('img', { name: /QR code for admission pass/ }).screenshot({
-    path: '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR.png',
+  const nativeQr = page.getByRole('img', { name: /QR code for admission pass/ });
+  await expect(nativeQr).toHaveAttribute('src', /^data:image\/png;base64,/);
+  const nativeQrSource = await nativeQr.getAttribute('src');
+  await writeFile(
+    '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR.png',
+    Buffer.from(nativeQrSource!.split(',')[1], 'base64'),
+  );
+  const desktopViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(await page.locator('.passes-panel').evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await page.locator('.pass-selected').evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const passUrl = page.locator('.pass-selected .join-link');
+  expect(await passUrl.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const passUrlBounds = await passUrl.boundingBox();
+  expect(passUrlBounds!.x + passUrlBounds!.width).toBeLessThanOrEqual(390);
+  const renderedQr = page.getByRole('img', { name: /QR code for admission pass/ });
+  await expect(renderedQr).toBeVisible();
+  const qrBounds = await renderedQr.boundingBox();
+  expect(qrBounds?.width).toBeGreaterThan(120);
+  expect(qrBounds?.width).toBeLessThanOrEqual(156);
+  await renderedQr.screenshot({
+    path: '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR_rendered_mobile.png',
   });
+  const expectedUrlHash = createHash('sha256').update(firstLink!).digest('hex');
+  await writeFile(
+    '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR_expected_url.sha256',
+    `${expectedUrlHash}\n`,
+    'utf8',
+  );
+  if (desktopViewport) await page.setViewportSize(desktopViewport);
 
   const metadataResponse = await page.request.get(`${origin}/api${roomPath}/passes`);
   expect(metadataResponse.ok()).toBe(true);
@@ -70,7 +99,7 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   await attendee.getByRole('button', { name: 'Submit file privately' }).click();
   await expect(attendee.getByText(/Submission accepted at/)).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'Refresh inbox' }).click();
-  await attendee.evaluate(() => Object.defineProperty(window, 'showSaveFilePicker', {
+  await page.evaluate(() => Object.defineProperty(window, 'showSaveFilePicker', {
     configurable: true,
     value: undefined,
   }));
