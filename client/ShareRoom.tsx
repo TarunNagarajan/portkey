@@ -3,7 +3,7 @@ import QRCode from 'qrcode';
 import { Icon } from './ui.js';
 import { buildInvitationUrl, getPublicOrigin, isLocalOrigin } from './api.js';
 
-export function ShareRoom({ code, fingerprint, passMode = false }: { code: string; fingerprint?: string | null; passMode?: boolean }) {
+export function ShareRoom({ code, fingerprint, passMode = false, proofMode = false }: { code: string; fingerprint?: string | null; passMode?: boolean; proofMode?: boolean }) {
   const link = buildInvitationUrl(getPublicOrigin(), code, fingerprint);
   const [image, setImage] = useState('');
   const [message, setMessage] = useState('');
@@ -37,11 +37,11 @@ export function ShareRoom({ code, fingerprint, passMode = false }: { code: strin
         {image && (
           <img src={image} alt="QR code for this room’s join link" width="156" height="156" />
         )}
-        <span>{passMode ? 'SCAN FOR ROOM PREVIEW' : 'SCAN TO REQUEST ACCESS'}</span>
+        <span>{passMode ? 'SCAN FOR ROOM PREVIEW' : proofMode ? 'SCAN TO PROVE MEMBERSHIP' : 'SCAN TO REQUEST ACCESS'}</span>
       </div>
       <div>
-        <h2 id="share-title">{passMode ? 'Room preview link' : 'Invite participants'}</h2>
-        <p>{passMode ? 'This room address shows a public preview. Admission requires a separate one use pass from you.' : 'Share this address through a channel participants can trust. Each browser still needs your approval.'}</p>
+        <h2 id="share-title">{passMode ? 'Room preview link' : proofMode ? 'Room access link' : 'Invite participants'}</h2>
+        <p>{passMode ? 'This room address shows a public preview. Admission requires a separate one use pass from you.' : proofMode ? 'Share this room link with enrolled attendees. They need their saved credential to prove membership.' : 'Share this address through a channel participants can trust. Each browser still needs your approval.'}</p>
         {isLocalOrigin(getPublicOrigin()) && <p className="muted">This local address is for this computer. Phone sharing needs a public HTTPS address.</p>}
         {fingerprint && <p className="muted">Inbox key fingerprint: <code>{fingerprint}</code></p>}
         <a className="join-link" href={link}>

@@ -30,7 +30,7 @@ export default defineConfig({
       timeout: 60_000,
     },
     {
-      command: 'npx vite --host 127.0.0.1 --port 5174',
+      command: 'npx vite --force --host 127.0.0.1 --port 5174',
       url: 'http://localhost:5174',
       env: { API_ORIGIN: 'http://127.0.0.1:3002' },
       reuseExistingServer: false,

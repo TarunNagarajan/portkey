@@ -13,5 +13,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["server", "client", "shared", "tests", "e2e", "vite.config.ts", "playwright.config.ts"]
+  "include": ["server", "client", "shared", "tests", "e2e", "scripts/built-assets-smoke-server.ts", "vite.config.ts", "playwright.config.ts", "playwright.built-assets.config.ts"]
 }

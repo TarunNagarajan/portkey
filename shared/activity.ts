@@ -12,7 +12,10 @@ export type ActivityKind =
   | 'submissions_purged'
   | 'admission_passes_issued'
   | 'pass_revoked'
-  | 'pass_redeemed';
+  | 'pass_redeemed'
+  | 'proof_enrollments_issued'
+  | 'proof_enrollment_revoked'
+  | 'proof_admitted';
 
 export type RoomField = 'title' | 'description' | 'expiresAt' | 'admissionPolicy';
 

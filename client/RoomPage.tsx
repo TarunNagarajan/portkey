@@ -7,6 +7,7 @@ import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
 import { PrivateInbox } from './PrivateInbox.js';
 import { PassesPanel } from './PassesPanel.js';
+import { ProofEnrollmentsPanel } from './ProofEnrollmentsPanel.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
@@ -101,7 +102,7 @@ export function RoomPage({ id }: { id: string }) {
         </span>
         <span>
           <Icon name="shield" />
-          {room.admissionPolicy === 'pass' ? 'Single use admission pass' : 'Organizer approval required'}
+          {room.admissionPolicy === 'proof' ? 'Workshop credential proof' : room.admissionPolicy === 'pass' ? 'Single use admission pass' : 'Organizer approval required'}
         </span>
       </div>
       <section className="panel storage-panel">
@@ -202,12 +203,13 @@ export function RoomPage({ id }: { id: string }) {
             </section>
           )}
           {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} />}
-          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} passMode={room.admissionPolicy === 'pass'} />}
+          {room.admissionPolicy === 'proof' && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} />}
+          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} passMode={room.admissionPolicy === 'pass'} proofMode={room.admissionPolicy === 'proof'} />}
           <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
           {room.status === 'draft' && (
             <div className="notice">
               <Icon name="rooms" />
-                <p>{room.admissionPolicy === 'pass' ? 'Open the room when you are ready to admit pass holders.' : 'Open the room when you are ready to receive join requests.'}</p>
+                <p>{room.admissionPolicy === 'proof' ? 'Open the room when you are ready to enroll credentials and admit proofs.' : room.admissionPolicy === 'pass' ? 'Open the room when you are ready to admit pass holders.' : 'Open the room when you are ready to receive join requests.'}</p>
             </div>
           )}
           {!active && (
@@ -223,11 +225,13 @@ export function RoomPage({ id }: { id: string }) {
                 <p>
                   {room.admissionPolicy === 'pass'
                     ? 'Pass holders appear here after redemption. You can remove their access at any time.'
-                    : 'Match the participant’s label before approving.'}
+                    : room.admissionPolicy === 'proof'
+                      ? 'Attendees appear here after a valid membership proof. Remove access for a browser from this list.'
+                      : 'Match the participant’s label before approving.'}
                 </p>
               </div>
               <span className="count-label">
-                {room.admissionPolicy === 'pass'
+                {room.admissionPolicy === 'pass' || room.admissionPolicy === 'proof'
                   ? `${members.filter((member) => member.status === 'approved').length} admitted`
                   : <>{members.filter((member) => member.status === 'pending').length} pending ·{' '}
                     {members.filter((member) => member.status === 'approved').length} approved</>}
@@ -238,9 +242,11 @@ export function RoomPage({ id }: { id: string }) {
                 <span className="empty-symbol">
                   <Icon name="shield" />
                 </span>
-                <h3>{room.admissionPolicy === 'pass' ? 'No participants yet' : 'No requests yet'}</h3>
+                <h3>{room.admissionPolicy === 'pass' || room.admissionPolicy === 'proof' ? 'No participants yet' : 'No requests yet'}</h3>
                 <p>
-                  {room.admissionPolicy === 'pass'
+                  {room.admissionPolicy === 'proof'
+                    ? 'People will appear here after proving workshop membership.'
+                    : room.admissionPolicy === 'pass'
                     ? 'People will appear here after redeeming a pass.'
                     : 'Join requests will appear here after you share the room.'}
                 </p>
@@ -345,7 +351,7 @@ export function RoomPage({ id }: { id: string }) {
           <section className="panel participant-welcome">
             <span className="empty-symbol"><Icon name="shield" /></span>
             <h2>You’re in.</h2>
-            <p>{room.admissionPolicy === 'pass' ? 'Your one use pass admitted this browser. You can return from this browser until the room closes or your access is removed.' : 'Your organizer-approved access is active for this browser.'}</p>
+            <p>{room.admissionPolicy === 'proof' ? 'A valid membership proof admitted this browser. Your workshop credential remains in browser storage; clearing site data loses it. The server can still observe browser and network activity.' : room.admissionPolicy === 'pass' ? 'Your one use pass admitted this browser. You can return from this browser until the room closes or your access is removed.' : 'Your organizer-approved access is active for this browser.'}</p>
           </section>
           <PrivateInbox room={room} />
         </>

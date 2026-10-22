@@ -20,7 +20,7 @@ export function RoomForm({
 }) {
   const [title, setTitle] = useState(initial?.title ?? '');
   const [description, setDescription] = useState(initial?.description ?? '');
-  const [admissionPolicy, setAdmissionPolicy] = useState<'approval' | 'pass'>(initial?.admissionPolicy ?? 'approval');
+  const [admissionPolicy, setAdmissionPolicy] = useState<'approval' | 'pass' | 'proof'>(initial?.admissionPolicy ?? 'approval');
   const [expiresAt, setExpiresAt] = useState(
     localDate(initial ? new Date(initial.expiresAt) : new Date(Date.now() + 24 * 60 * 60 * 1000)),
   );
@@ -54,13 +54,16 @@ export function RoomForm({
       </label>
       <label>
         Admission
-        <select value={admissionPolicy} disabled={admissionPolicyLocked} onChange={(event) => setAdmissionPolicy(event.target.value as 'approval' | 'pass')}>
+        <select value={admissionPolicy} disabled={admissionPolicyLocked} onChange={(event) => setAdmissionPolicy(event.target.value as 'approval' | 'pass' | 'proof')}>
           <option value="approval">Organizer approval</option>
           <option value="pass">Single use pass</option>
+          <option value="proof">Workshop credential + proof</option>
         </select>
       </label>
       <p className="muted">
-        {admissionPolicy === 'pass'
+        {admissionPolicy === 'proof'
+          ? 'Attendees save a workshop credential on their own device, then prove membership to enter. Enrollment records a public commitment. Small groups provide little cover; browser network activity can still be linked. Clearing browser data loses the credential, with no recovery or transfer.'
+          : admissionPolicy === 'pass'
           ? 'Each intended attendee needs a pass from you. A pass can be used once and binds access to that browser; anyone who receives it before use can redeem it.'
           : 'Participants request access and you approve each browser.'}
         {admissionPolicyLocked && ' Admission policy is fixed after opening.'}
