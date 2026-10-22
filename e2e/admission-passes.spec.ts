@@ -1,9 +1,12 @@
 import { expect, test } from '@playwright/test';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 
 test('pass admission is one use, preserves the inbox fingerprint, and supports encrypted files', async ({ page, browser }) => {
   test.setTimeout(120_000);
+  const evidenceDirectory = resolve('..', 'outputs');
+  await mkdir(evidenceDirectory, { recursive: true });
   const pageErrors: string[] = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await page.goto('/');
@@ -39,7 +42,7 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   await expect(nativeQr).toHaveAttribute('src', /^data:image\/png;base64,/);
   const nativeQrSource = await nativeQr.getAttribute('src');
   await writeFile(
-    '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR.png',
+    join(evidenceDirectory, 'Portkey_AdmissionPass_QR.png'),
     Buffer.from(nativeQrSource!.split(',')[1], 'base64'),
   );
   const desktopViewport = page.viewportSize();
@@ -57,11 +60,11 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   expect(qrBounds?.width).toBeGreaterThan(120);
   expect(qrBounds?.width).toBeLessThanOrEqual(156);
   await renderedQr.screenshot({
-    path: '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR_rendered_mobile.png',
+    path: join(evidenceDirectory, 'Portkey_AdmissionPass_QR_rendered_mobile.png'),
   });
   const expectedUrlHash = createHash('sha256').update(firstLink!).digest('hex');
   await writeFile(
-    '../2026-09-25/i/outputs/Portkey_AdmissionPass_QR_expected_url.sha256',
+    join(evidenceDirectory, 'Portkey_AdmissionPass_QR_expected_url.sha256'),
     `${expectedUrlHash}\n`,
     'utf8',
   );
