@@ -220,11 +220,17 @@ export function RoomPage({ id }: { id: string }) {
             <div className="panel-heading">
               <div>
                 <h2>Participant access</h2>
-                <p>Match the participant’s label before approving.</p>
+                <p>
+                  {room.admissionPolicy === 'pass'
+                    ? 'Pass holders appear here after redemption. You can remove their access at any time.'
+                    : 'Match the participant’s label before approving.'}
+                </p>
               </div>
               <span className="count-label">
-                {members.filter((member) => member.status === 'pending').length} pending ·{' '}
-                {members.filter((member) => member.status === 'approved').length} approved
+                {room.admissionPolicy === 'pass'
+                  ? `${members.filter((member) => member.status === 'approved').length} admitted`
+                  : <>{members.filter((member) => member.status === 'pending').length} pending ·{' '}
+                    {members.filter((member) => member.status === 'approved').length} approved</>}
               </span>
             </div>
             {members.length === 0 ? (
@@ -232,8 +238,12 @@ export function RoomPage({ id }: { id: string }) {
                 <span className="empty-symbol">
                   <Icon name="shield" />
                 </span>
-                <h3>No requests yet</h3>
-                <p>Join requests will appear here after you share the room.</p>
+                <h3>{room.admissionPolicy === 'pass' ? 'No participants yet' : 'No requests yet'}</h3>
+                <p>
+                  {room.admissionPolicy === 'pass'
+                    ? 'People will appear here after redeeming a pass.'
+                    : 'Join requests will appear here after you share the room.'}
+                </p>
               </div>
             ) : (
               <div className="table-scroll">

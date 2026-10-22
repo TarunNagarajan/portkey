@@ -111,7 +111,11 @@ export function RoomArea({
       <div className="panel-heading">
         <div>
           <h2>Location restriction</h2>
-          <p>Only devices physically inside the chosen area can request access or enter.</p>
+          <p>
+            {room.admissionPolicy === 'pass'
+              ? 'Only devices physically inside the chosen area can redeem a pass or enter.'
+              : 'Only devices physically inside the chosen area can request access or enter.'}
+          </p>
         </div>
       </div>
       {room.geo ? (
@@ -121,7 +125,11 @@ export function RoomArea({
           {room.geoLabel ?? `${room.geo.lat.toFixed(3)}, ${room.geo.lng.toFixed(3)}`}.
         </p>
       ) : (
-        <p className="muted">No area restriction. Anyone with the link can request access.</p>
+        <p className="muted">
+          {room.admissionPolicy === 'pass'
+            ? 'No area restriction. A valid admission pass is still required.'
+            : 'No area restriction. Anyone with the link can request access.'}
+        </p>
       )}
       {editable && !open && (
         <div className="actions">
