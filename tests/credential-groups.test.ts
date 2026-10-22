@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 import supertest from 'supertest';
 import type { Express } from 'express';
 import { Identity } from '@semaphore-protocol/identity';
+import { Group } from '@semaphore-protocol/group';
+import { generateProof } from '@semaphore-protocol/proof';
+import { resolve } from 'node:path';
 import { createApp } from '../server/app.js';
 import { openDatabase, type Database } from '../server/database.js';
 import { migrate } from '../server/migrations.js';
@@ -23,7 +26,11 @@ before(async () => {
   app = createApp(database, { origin, secure: false, rateLimiting: false });
 });
 
-after(async () => { await database.close(); });
+after(async () => {
+  const curve = (globalThis as typeof globalThis & { curve_bn128?: { terminate: () => Promise<void> } }).curve_bn128;
+  if (curve) await curve.terminate();
+  await database.close();
+});
 
 async function browser() {
   const agent = supertest.agent(app);
@@ -59,14 +66,20 @@ async function proofRoom(owner: Browser): Promise<Room> {
 test('reusable groups enforce ownership, one use enrollment, safe metadata and bounded draft rules', async () => {
   const owner = await browser();
   const outsider = await browser();
+  const secondOwner = await browser();
   const attendee = await browser();
   const created = await owner.post('/credential-groups', { name: 'Workshop attendees', description: 'Autumn cohort' }).expect(201);
   const groupId = created.body.id as string;
   assert.equal(created.body.available, true);
+  const foreignGroup = (await secondOwner.post('/credential-groups', { name: 'Foreign group' }).expect(201)).body as { id: string };
   await owner.post('/credential-groups', { name: 'Invalid', description: 'x', ownerSessionId: owner.sessionId }).expect(422);
   await outsider.get(`/credential-groups/${groupId}`).expect(404);
   await outsider.post(`/credential-groups/${groupId}/enrollments`, { count: 1 }).expect(404);
+  await owner.agent.post('/api/credential-groups').set('Origin', origin).send({ name: 'Missing CSRF' }).expect(403);
+  await owner.agent.post('/api/credential-groups').set('Origin', 'https://attacker.invalid').set('X-CSRF-Token', 'invalid').send({ name: 'Wrong origin' }).expect(403);
 
+  await owner.post(`/credential-groups/${groupId}/enrollments`, { count: 21 }).expect(422);
+  await owner.post(`/credential-groups/${groupId}/enrollments`, { count: 251 }).expect(422);
   const issue = await owner.post(`/credential-groups/${groupId}/enrollments`, { count: 2 }).expect(201);
   const [invite, revoked] = issue.body.enrollments as Array<{ id: string; token: string }>;
   await owner.patch(`/credential-groups/${groupId}/enrollments/${revoked.id}`, { status: 'revoked' }).expect(200);
@@ -99,10 +112,20 @@ test('reusable groups enforce ownership, one use enrollment, safe metadata and b
       assert.equal(body.proofRule.digest, workshopPolicyDigest([groupId]));
       assert.deepEqual(body.proofRule.groups.map((group: { id: string }) => group.id), [groupId]);
     });
+  await owner.put(`/rooms/${room.id}/proof-rule`, { groupIds: [groupId] }).expect(200);
+  await owner.put(`/rooms/${room.id}/proof-rule`, { groupIds: [foreignGroup.id] }).expect(403);
   await owner.put(`/rooms/${room.id}/proof-rule`, { groupIds: [groupId, groupId.toUpperCase()] }).expect(422);
   await outsider.put(`/rooms/${room.id}/proof-rule`, { groupIds: [groupId] }).expect(403);
+  const [auditsBeforeClear] = await database.query<{ count: number }>("SELECT count(*)::int AS count FROM room_activity WHERE room_id = $1 AND kind IN ('proof_rule_updated', 'proof_rule_cleared')", [room.id]);
+  const [lastAudit] = await database.query<{ kind: string; member_label: string | null; changed_fields: string[] }>("SELECT kind, member_label, changed_fields FROM room_activity WHERE room_id = $1 ORDER BY id DESC LIMIT 1", [room.id]);
+  assert.equal(lastAudit.kind, 'proof_rule_updated');
+  assert.equal(lastAudit.member_label, null);
+  assert.deepEqual(lastAudit.changed_fields, []);
+  assert.equal(auditsBeforeClear.count, 1);
   await owner.post(`/rooms/${room.id}/enrollments`, { count: 1 }).expect(409);
   await owner.delete(`/rooms/${room.id}/proof-rule`).expect(200);
+  const [auditsAfterClear] = await database.query<{ count: number }>("SELECT count(*)::int AS count FROM room_activity WHERE room_id = $1 AND kind IN ('proof_rule_updated', 'proof_rule_cleared')", [room.id]);
+  assert.equal(auditsAfterClear.count, 2);
   await owner.post(`/rooms/${room.id}/enrollments`, { count: 1 }).expect(201);
   await owner.put(`/rooms/${room.id}/proof-rule`, { groupIds: [groupId] }).expect(409);
   await owner.patch(`/rooms/${room.id}`, { title: room.title, description: room.description, expiresAt: room.expiresAt });
@@ -169,4 +192,128 @@ test('migration 009 preserves populated legacy proof and room data', async () =>
     const [column] = await legacy.query<{ count: number }>("SELECT count(*)::int AS count FROM information_schema.columns WHERE table_name = 'room_proof_challenges' AND column_name = 'policy_digest'");
     assert.equal(column.count, 1);
   } finally { await legacy.close(); }
+});
+
+test('group and invitation lifetime bounds are enforced and issuer expiry is authoritative', async () => {
+  const owner = await browser();
+  const attendee = await browser();
+  const groups: Array<{ id: string }> = [];
+  for (let index = 0; index < 32; index += 1) {
+    groups.push((await owner.post('/credential-groups', { name: `Group ${index + 1}` }).expect(201)).body as { id: string });
+  }
+  await owner.post('/credential-groups', { name: 'Over the group cap' }).expect(409);
+
+  const cappedGroup = groups[0];
+  for (let remaining = 250; remaining > 0; remaining -= 20) {
+    await owner.post(`/credential-groups/${cappedGroup.id}/enrollments`, { count: Math.min(20, remaining) }).expect(201);
+  }
+  await owner.post(`/credential-groups/${cappedGroup.id}/enrollments`, { count: 1 }).expect(409);
+  const [invite] = await database.query<{ id: string }>('SELECT id FROM credential_group_invites WHERE group_id = $1 ORDER BY invite_number LIMIT 1', [cappedGroup.id]);
+  assert.ok(invite.id);
+
+  const expiringGroup = groups[1];
+  const token = (await owner.post(`/credential-groups/${expiringGroup.id}/enrollments`, { count: 1 }).expect(201)).body.enrollments[0].token as string;
+  await database.query("UPDATE sessions SET created_at = clock_timestamp() - interval '2 days', expires_at = clock_timestamp() - interval '1 second' WHERE id = $1", [owner.sessionId]);
+  await attendee.get(`/credentials/${expiringGroup.id}`).expect(200).expect(({ body }) => assert.equal(body.credential.available, false));
+  const identity = new Identity();
+  await attendee.post(`/credentials/${expiringGroup.id}/enroll`, { token, commitment: identity.commitment.toString() }).expect(403);
+});
+
+test('explicit room and owner-session cleanup removes bound group references without fallback', async () => {
+  const owner = await browser();
+  const group = (await owner.post('/credential-groups', { name: 'Cleanup group' }).expect(201)).body as { id: string };
+  const room = await proofRoom(owner);
+  await owner.put(`/rooms/${room.id}/proof-rule`, { groupIds: [group.id] }).expect(200);
+  await owner.post(`/credential-groups/${group.id}/enrollments`, { count: 1 }).expect(201);
+
+  await database.transaction(async transaction => {
+    await transaction.query('DELETE FROM rooms WHERE id = $1', [room.id]);
+    await transaction.query('DELETE FROM sessions WHERE id = $1', [owner.sessionId]);
+  });
+  const [counts] = await database.query<{ rooms: number; groups: number; bindings: number }>(
+    `SELECT
+       (SELECT count(*)::int FROM rooms WHERE id = $1) AS rooms,
+       (SELECT count(*)::int FROM credential_groups WHERE id = $2) AS groups,
+       (SELECT count(*)::int FROM room_proof_groups WHERE room_id = $1) AS bindings`,
+    [room.id, group.id],
+  );
+  assert.deepEqual(counts, { rooms: 0, groups: 0, bindings: 0 });
+});
+
+test('real union proofs admit members from either group across rooms while snapshot, scope and nullifier rules hold', async () => {
+  const owner = await browser();
+  const attendeeA = await browser();
+  const attendeeB = await browser();
+  const attendeeGrowth = await browser();
+  const nonmember = await browser();
+  const groupA = (await owner.post('/credential-groups', { name: 'Group A' }).expect(201)).body as { id: string };
+  const groupB = (await owner.post('/credential-groups', { name: 'Group B' }).expect(201)).body as { id: string };
+  const identityA = new Identity();
+  const identityB = new Identity();
+  async function enroll(groupId: string, participant: Browser, identity: Identity) {
+    const { token } = (await owner.post(`/credential-groups/${groupId}/enrollments`, { count: 1 }).expect(201)).body.enrollments[0] as { token: string };
+    await participant.post(`/credentials/${groupId}/enroll`, { token, commitment: identity.commitment.toString() }).expect(200);
+  }
+  await enroll(groupA.id, attendeeA, identityA);
+  await enroll(groupB.id, attendeeB, identityB);
+  const room1 = await proofRoom(owner);
+  await owner.put(`/rooms/${room1.id}/proof-rule`, { groupIds: [groupA.id, groupB.id] }).expect(200);
+  await owner.post(`/rooms/${room1.id}/open`).expect(200);
+  type Challenge = { challengeId: string; root: string; scope: string; message: string; depth: number; commitments: string[]; expiresAt: string; proofRule: { digest: string } };
+  async function challenge(participant: Browser, room: Room) {
+    return (await participant.post(`/join/${room.joinCode}/proof-challenge`, {}).expect(200)).body as Challenge;
+  }
+  async function proof(identity: Identity, value: Challenge) {
+    const group = new Group(value.commitments.map(BigInt));
+    assert.equal(group.root.toString(), value.root);
+    assert.notEqual(group.indexOf(identity.commitment), -1);
+    return generateProof(identity, group, value.message, value.scope, value.depth, {
+      wasm: resolve('public/zk/semaphore-10.wasm'),
+      zkey: resolve('public/zk/semaphore-10.zkey'),
+    });
+  }
+  const snapshotA = await challenge(attendeeA, room1);
+  const growthIdentity = new Identity();
+  await enroll(groupB.id, attendeeGrowth, growthIdentity);
+  const proofA = await proof(identityA, snapshotA);
+  await attendeeA.post(`/join/${room1.joinCode}/prove`, { challengeId: snapshotA.challengeId, proof: proofA }).expect(200);
+  const challengeB = await challenge(attendeeB, room1);
+  assert.equal(challengeB.commitments.length, 3);
+  const proofB = await proof(identityB, challengeB);
+  await attendeeB.post(`/join/${room1.joinCode}/prove`, { challengeId: challengeB.challengeId, proof: proofB }).expect(200);
+  const [room1Nullifier] = await database.query<{ nullifier: string }>('SELECT nullifier FROM room_proof_nullifiers WHERE room_id = $1 AND session_id = $2', [room1.id, attendeeA.sessionId]);
+  assert.ok(room1Nullifier);
+
+  const room2 = await proofRoom(owner);
+  await owner.put(`/rooms/${room2.id}/proof-rule`, { groupIds: [groupB.id, groupA.id] }).expect(200);
+  await owner.post(`/rooms/${room2.id}/open`).expect(200);
+  const challengeRoom2 = await challenge(attendeeA, room2);
+  const proofRoom2 = await proof(identityA, challengeRoom2);
+  assert.notEqual(challengeRoom2.scope, snapshotA.scope);
+  await attendeeA.post(`/join/${room2.joinCode}/prove`, { challengeId: challengeRoom2.challengeId, proof: proofRoom2 }).expect(200);
+  const [room2Nullifier] = await database.query<{ nullifier: string }>('SELECT nullifier FROM room_proof_nullifiers WHERE room_id = $1 AND session_id = $2', [room2.id, attendeeA.sessionId]);
+  assert.ok(room2Nullifier);
+  assert.notEqual(room2Nullifier.nullifier, room1Nullifier.nullifier);
+
+  await attendeeA.post(`/join/${room2.joinCode}/prove`, { challengeId: snapshotA.challengeId, proof: proofA }).expect(403);
+  const outsideChallenge = await challenge(nonmember, room2);
+  await nonmember.post(`/join/${room2.joinCode}/prove`, { challengeId: outsideChallenge.challengeId, proof: proofA }).expect(403);
+  const tampered = await challenge(attendeeGrowth, room2);
+  const memberProofForOutsiderChallenge = await proof(identityA, tampered);
+  await database.query('UPDATE room_proof_challenges SET policy_digest = $2 WHERE id = $1', [tampered.challengeId, 'f'.repeat(64)]);
+  await attendeeGrowth.post(`/join/${room2.joinCode}/prove`, { challengeId: tampered.challengeId, proof: memberProofForOutsiderChallenge }).expect(403);
+
+  const [member] = await database.query<{ id: string }>('SELECT id FROM memberships WHERE room_id = $1 AND session_id = $2', [room1.id, attendeeA.sessionId]);
+  await owner.patch(`/rooms/${room1.id}/members/${member.id}`, { status: 'revoked' }).expect(200);
+  await attendeeA.post(`/join/${room1.joinCode}/prove`, { challengeId: snapshotA.challengeId, proof: proofA }).expect(403);
+  await database.query('DELETE FROM memberships WHERE session_id = $1', [attendeeA.sessionId]);
+  await database.query('DELETE FROM sessions WHERE id = $1', [attendeeA.sessionId]);
+  const [permanent] = await database.query<{ count: number }>('SELECT count(*)::int AS count FROM room_proof_nullifiers WHERE room_id = $1 AND nullifier = $2', [room1.id, room1Nullifier.nullifier]);
+  assert.equal(permanent.count, 1);
+  const replayBrowser = await browser();
+  const replayChallenge = await challenge(replayBrowser, room1);
+  const replayProof = await proof(identityA, replayChallenge);
+  await replayBrowser.post(`/join/${room1.joinCode}/prove`, { challengeId: replayChallenge.challengeId, proof: replayProof }).expect(403);
+  const [afterReplay] = await database.query<{ count: number }>('SELECT count(*)::int AS count FROM room_proof_nullifiers WHERE room_id = $1 AND nullifier = $2', [room1.id, room1Nullifier.nullifier]);
+  assert.equal(afterReplay.count, 1);
 });

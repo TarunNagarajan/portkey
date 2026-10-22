@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
 import { WORKSHOP_PROOF_VERSION } from '../shared/workshopProof.js';
 import { api, ApiError, requestFix } from './api.js';
-import { generateWorkshopProof, type WorkshopChallenge } from './workshopProof.js';
+import { generateWorkshopProof, submitProofWithBusyRetry, type WorkshopChallenge } from './workshopProof.js';
 import { getOrCreateWorkshopIdentity, loadWorkshopIdentity, resetWorkshopIdentity, type WorkshopIdentity } from './workshopIdentity.js';
 
 function readEnrollmentFragment(): { token: string | null; invalid: boolean } {
@@ -24,26 +24,6 @@ function removeEnrollmentFragment() {
   fragment.delete('enroll');
   const hash = fragment.size ? `#${fragment.toString()}` : '';
   window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${hash}`);
-}
-
-async function submitProofWithBusyRetry(code: string, body: Record<string, unknown>, signal: AbortSignal, expiresAt: number) {
-  for (let attempt = 0; ; attempt += 1) {
-    if (expiresAt <= Date.now()) throw new Error('This proof challenge expired while checking membership. Start a new proof.');
-    try {
-      return await api(`/join/${code}/prove`, 'POST', body, signal);
-    } catch (error) {
-      if (!(error instanceof ApiError) || error.code !== 'PROOF_BUSY' || attempt >= 3) throw error;
-      const delay = 250 * (attempt + 1);
-      if (expiresAt <= Date.now() + delay) throw new Error('This proof challenge is about to expire while the verifier is busy. Start a new proof.');
-      await new Promise<void>((resolve, reject) => {
-        const timer = window.setTimeout(done, delay);
-        function done() { signal.removeEventListener('abort', aborted); resolve(); }
-        function aborted() { window.clearTimeout(timer); signal.removeEventListener('abort', aborted); reject(new DOMException('Proof request cancelled.', 'AbortError')); }
-        signal.addEventListener('abort', aborted, { once: true });
-        if (signal.aborted) aborted();
-      });
-    }
-  }
 }
 
 export function WorkshopAdmission({ room, code, onAdmitted }: {

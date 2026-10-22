@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
 import { api, ApiError, requestFix } from './api.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
-import { WorkshopAdmission } from './WorkshopAdmission.js';
+import { ReusableAdmission } from './ReusableAdmission.js';
 
 function readPassFragment(): { token: string | null; invalid: boolean } {
   const values = new URLSearchParams(window.location.hash.slice(1)).getAll('pass');
@@ -171,7 +171,7 @@ export function JoinPage({ code }: { code: string }) {
       ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
         <p>The organizer has declined access for this browser.</p>
       ) : room.admissionPolicy === 'proof' ? (
-        <WorkshopAdmission
+        <ReusableAdmission
           room={room}
           code={code}
           onAdmitted={() => {

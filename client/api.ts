@@ -47,6 +47,19 @@ export function buildWorkshopEnrollmentUrl(origin: string, code: string, fingerp
   return url.toString();
 }
 
+export function buildCredentialEnrollmentUrl(origin: string, groupId: string, token: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(groupId) || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('Credential enrollment link is invalid.');
+  try {
+    const decoded = atob(token.replaceAll('-', '+').replaceAll('_', '/') + '=');
+    const canonical = btoa(decoded).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    if (decoded.length !== 32 || canonical !== token) throw new Error('invalid token');
+  } catch { throw new Error('Credential enrollment link is invalid.'); }
+  const base = new URL(origin);
+  const url = new URL(`/credentials/${encodeURIComponent(groupId)}`, base.origin);
+  url.hash = new URLSearchParams({ enroll: token }).toString();
+  return url.toString();
+}
+
 export function setPublicOrigin(origin: string) { publicOrigin = origin; }
 export function getPublicOrigin() { return publicOrigin; }
 

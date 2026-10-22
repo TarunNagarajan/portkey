@@ -5,6 +5,9 @@ import { Home } from './Home.js';
 import { JoinPage } from './JoinPage.js';
 import { RoomPage } from './RoomPage.js';
 import { Icon } from './ui.js';
+import { CredentialGroups, CredentialGroupDetail } from './CredentialGroups.js';
+import { CredentialWallet } from './CredentialWallet.js';
+import { CredentialEnrollment } from './CredentialEnrollment.js';
 import './styles.css';
 
 function App() {
@@ -26,6 +29,10 @@ function App() {
   const path = window.location.pathname;
   const room = path.match(/^\/rooms\/([a-f0-9-]+)$/i);
   const join = path.match(/^\/join\/([A-Za-z0-9_-]+)$/);
+  const credentialGroup = path.match(/^\/credential-groups\/([a-f0-9-]+)$/i);
+  const credentialEnrollment = path.match(/^\/credentials\/([a-f0-9-]+)$/i);
+  const groupList = path === '/credential-groups';
+  const wallet = path === '/my-credentials';
   return (
     <div className="app-layout">
       <a className="skip-link" href="#main">
@@ -37,14 +44,16 @@ function App() {
         </a>
         <p className="nav-label">WORKSPACE</p>
         <nav aria-label="Workspace navigation">
-          <a className={!join ? 'nav-item selected' : 'nav-item'} href="/">
+          <a className={path === '/' ? 'nav-item selected' : 'nav-item'} href="/">
             <Icon name="rooms" />
             Your rooms
           </a>
-          <a className="nav-item" href="/#new-room">
+          <a className="nav-item nav-create-room" href="/#new-room">
             <Icon name="plus" />
             Create a room
           </a>
+          <a className={groupList || credentialGroup ? 'nav-item selected' : 'nav-item'} href="/credential-groups">Credential groups</a>
+          <a className={wallet ? 'nav-item selected' : 'nav-item'} href="/my-credentials">My credentials</a>
         </nav>
         <div className="sidebar-note">
           <Icon name="shield" />
@@ -56,7 +65,7 @@ function App() {
         <div className="topbar">
           <span>
             Workspace <span className="breadcrumb-divider">/</span>{' '}
-            {join ? 'Join room' : room ? 'Room overview' : 'Rooms'}
+            {credentialEnrollment ? 'Credential enrollment' : credentialGroup || groupList ? 'Credential groups' : wallet ? 'My credentials' : join ? 'Join room' : room ? 'Room overview' : 'Rooms'}
           </span>
           {ready && (
             <span className="session-indicator">
@@ -82,6 +91,14 @@ function App() {
             <RoomPage id={room[1]} />
           ) : join ? (
             <JoinPage code={join[1]} />
+          ) : credentialEnrollment ? (
+            <CredentialEnrollment id={credentialEnrollment[1]} />
+          ) : credentialGroup ? (
+            <CredentialGroupDetail id={credentialGroup[1]} />
+          ) : groupList ? (
+            <CredentialGroups />
+          ) : wallet ? (
+            <CredentialWallet />
           ) : path === '/' ? (
             <Home />
           ) : (

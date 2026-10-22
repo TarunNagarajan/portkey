@@ -3,7 +3,7 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   metadata: { builtAssets: true },
   testDir: './e2e',
-  testMatch: 'workshop-proof-admission.spec.ts',
+  testMatch: /(?:workshop-proof-admission|reusable-credential-admission)\.spec\.ts$/,
   workers: 1,
   timeout: 180_000,
   expect: { timeout: 12_000 },

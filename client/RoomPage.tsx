@@ -8,6 +8,7 @@ import { ActivityLog } from './ActivityLog.js';
 import { PrivateInbox } from './PrivateInbox.js';
 import { PassesPanel } from './PassesPanel.js';
 import { ProofEnrollmentsPanel } from './ProofEnrollmentsPanel.js';
+import { RoomProofRuleEditor } from './RoomProofRuleEditor.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
@@ -17,11 +18,22 @@ export function RoomPage({ id }: { id: string }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [inboxFingerprint, setInboxFingerprint] = useState<string | null>(null);
+  const [reusableRule, setReusableRule] = useState<boolean | null>(null);
+  const [reusableRuleNames, setReusableRuleNames] = useState<string[]>([]);
+  const [proofRuleReady, setProofRuleReady] = useState(false);
+  const [proofRuleDirty, setProofRuleDirty] = useState(false);
+  const onProofRuleState = useCallback((configured: boolean, names: string[], ready: boolean, dirty: boolean) => {
+    setReusableRule(configured);
+    setReusableRuleNames(names);
+    setProofRuleReady(ready);
+    setProofRuleDirty(dirty);
+  }, []);
 
   const reload = useCallback(async () => {
     try {
       const current = await api<Room>(`/rooms/${id}`);
       setRoom(current);
+      if (current.admissionPolicy !== 'proof') { setReusableRule(false); setReusableRuleNames([]); setProofRuleReady(true); setProofRuleDirty(false); }
       if (current.role === 'owner') setMembers(await api<Member[]>(`/rooms/${id}/members`));
       setError('');
     } catch (error) {
@@ -153,7 +165,7 @@ export function RoomPage({ id }: { id: string }) {
           <div className="actions">
             {room.status === 'draft' && (
               <button
-                disabled={busy}
+                disabled={busy || (room.admissionPolicy === 'proof' && (!proofRuleReady || proofRuleDirty))}
                 onClick={() => void act(() => api(`/rooms/${id}/open`, 'POST'))}
               >
                 Open room
@@ -203,7 +215,8 @@ export function RoomPage({ id }: { id: string }) {
             </section>
           )}
           {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} />}
-          {room.admissionPolicy === 'proof' && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} />}
+          {room.admissionPolicy === 'proof' && <RoomProofRuleEditor room={room} onRuleState={onProofRuleState} />}
+          {room.admissionPolicy === 'proof' && reusableRule === false && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} />}
           {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} passMode={room.admissionPolicy === 'pass'} proofMode={room.admissionPolicy === 'proof'} />}
           <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
           {room.status === 'draft' && (
@@ -212,6 +225,7 @@ export function RoomPage({ id }: { id: string }) {
                 <p>{room.admissionPolicy === 'proof' ? 'Open the room when you are ready to enroll credentials and admit proofs.' : room.admissionPolicy === 'pass' ? 'Open the room when you are ready to admit pass holders.' : 'Open the room when you are ready to receive join requests.'}</p>
             </div>
           )}
+          {room.admissionPolicy === 'proof' && reusableRule && reusableRuleNames.length > 0 && <p className="muted">Reusable rule: a credential from {reusableRuleNames.join(' or ')}. New rooms can reuse these group credentials; room access stays scoped to this room.</p>}
           {!active && (
             <div className="notice">
               <Icon name="shield" />
