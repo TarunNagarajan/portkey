@@ -16,9 +16,12 @@
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:e2e": "playwright test",
     "test:e2e:built": "playwright test --config playwright.built-assets.config.ts",
+    "test:e2e:platform": "npm run build && playwright test --config playwright.platform-demo.config.ts",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx server/migrate.ts",
-    "phone:demo": "npm run build && tsx scripts/phone-demo.ts"
+    "phone:demo": "npm run build && tsx scripts/phone-demo.ts",
+    "platform:demo": "npm run build && tsx scripts/platform-demo.ts",
+    "test:e2e:platform-vite": "playwright test --config playwright.platform-vite.config.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.14",

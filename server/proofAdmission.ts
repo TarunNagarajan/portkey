@@ -1,11 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { Group } from '@semaphore-protocol/group';
-import { verifyProof, type SemaphoreProof } from '@semaphore-protocol/proof';
 import { z } from 'zod';
 import { joinCode, roomId } from '../shared/rooms.js';
 import {
-  WORKSHOP_BASE_FIELD,
   WORKSHOP_PROOF_DEPTH,
   WORKSHOP_PROOF_VERSION,
   WORKSHOP_SCALAR_FIELD,
@@ -16,6 +14,7 @@ import type { Database, Queries } from './database.js';
 import { HttpError, requireCondition } from './errors.js';
 import { recordActivity } from './activity.js';
 import { currentProofRule } from './credentialGroups.js';
+import { semaphoreProofSchema as sharedProofSchema, verifySemaphoreProofBounded } from './semaphoreProof.js';
 import {
   admissionFix,
   clock,
@@ -32,18 +31,7 @@ const canonicalDecimalPattern = /^(0|[1-9][0-9]{0,76})$/;
 const decimal = z.string().max(77).regex(canonicalDecimalPattern);
 const fieldDecimal = decimal.refine((value) => canonicalDecimalPattern.test(value) && BigInt(value) < WORKSHOP_SCALAR_FIELD);
 const commitmentDecimal = fieldDecimal.refine((value) => canonicalDecimalPattern.test(value) && BigInt(value) > 0n);
-const pointDecimal = decimal.refine((value) => canonicalDecimalPattern.test(value) && BigInt(value) < WORKSHOP_BASE_FIELD);
-const proofSchema = z.object({
-  merkleTreeDepth: z.literal(WORKSHOP_PROOF_DEPTH),
-  merkleTreeRoot: fieldDecimal,
-  message: fieldDecimal,
-  nullifier: fieldDecimal,
-  scope: fieldDecimal,
-  points: z.tuple([
-    pointDecimal, pointDecimal, pointDecimal, pointDecimal,
-    pointDecimal, pointDecimal, pointDecimal, pointDecimal,
-  ]),
-}).strict();
+const proofSchema = sharedProofSchema;
 const enrollInput = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/), commitment: commitmentDecimal }).strict();
 const proveInput = z.object({
   challengeId: z.uuid(),
@@ -86,18 +74,6 @@ async function lockRoomByCode(queries: Queries, code: string) {
   const [found] = await queries.query<{ id: string }>('SELECT id FROM rooms WHERE join_code = $1', [code]);
   requireCondition(found, 404, 'ROOM_NOT_FOUND', 'Room not found.');
   return lockRoom(queries, found.id);
-}
-
-let activeVerifications = 0;
-async function verifyBounded(proof: SemaphoreProof) {
-  if (activeVerifications >= 1)
-    throw new HttpError(429, 'PROOF_BUSY', 'Proof checks are busy. Wait a moment and try again.');
-  activeVerifications += 1;
-  try {
-    return await verifyProof(proof);
-  } finally {
-    activeVerifications -= 1;
-  }
 }
 
 function validInviteToken(token: string) {
@@ -354,7 +330,7 @@ export function proofAdmissionRoutes(database: Database) {
 
     let valid = false;
     try {
-      valid = await verifyBounded(proof);
+      valid = await verifySemaphoreProofBounded(proof);
     } catch (error) {
       if (error instanceof HttpError && error.status === 429) throw error;
       proofError();
