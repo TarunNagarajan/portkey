@@ -22,6 +22,10 @@ If the Render hostname changes, the invitation origin changes too. Create new in
 
 Install the official `cloudflared` executable separately, then run `npm run phone:demo`. The command rebuilds the current app and launches a temporary HTTPS tunnel to it on 127.0.0.1:3003. It uses the executable on `PATH` or the path in `CLOUDFLARED_PATH`, and stores demo data under `.data/phone-demo`. Set `PORTKEY_DEMO_PORT` to choose a different available port. The launcher does not read `.env` or inherit `DATABASE_URL`; it uses an isolated local database. Keep the computer and terminal running during the demo. A new `trycloudflare.com` address can take a couple of minutes to resolve publicly; startup checks its public HTTPS health for up to three minutes and reports an actionable error if it remains unreachable. The address is temporary and is not permanent hosting. Installation instructions are in [Cloudflare's official downloads guide](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
 
+## Cross-application verification
+
+Portkey supports issuer-published Semaphore membership contracts, application domain verification, explicit trust pins, and PKCE-bound signed eligibility receipts for separate relying applications. The supported adapter, backend SDK example, privacy boundaries, limits, and two-application local demo are documented in [the verification platform guide](docs/verification-platform.md). Run the complete demo with `npm run platform:demo`.
+
 ## Use the module
 
 Create a draft with a title, public description, admission policy and future expiry. The default approval policy asks the organizer to approve each browser's request. A single-use pass room admits a browser that redeems a pass supplied by the organizer. A workshop proof room admits a browser only after it saves a credential from an organizer-issued enrollment link and proves membership. Open the room when it is ready, then share its QR or link. In approval rooms, participants request access with a nickname or team label. The organizer approves or declines the request. The organizer can remove approved access or close any room.

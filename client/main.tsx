@@ -1,38 +1,62 @@
-import { useEffect, useState } from 'react';
-import { createRoot } from 'react-dom/client';
-import { configuredPageUrl, loadPublicConfig, setPublicOrigin, startSession } from './api.js';
-import { Home } from './Home.js';
-import { JoinPage } from './JoinPage.js';
-import { RoomPage } from './RoomPage.js';
-import { Icon } from './ui.js';
-import { CredentialGroups, CredentialGroupDetail } from './CredentialGroups.js';
-import { CredentialWallet } from './CredentialWallet.js';
-import { CredentialEnrollment } from './CredentialEnrollment.js';
-import './styles.css';
+import { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  configuredPageUrl,
+  loadPublicConfig,
+  setPublicOrigin,
+  startSession,
+} from "./api.js";
+import { Home } from "./Home.js";
+import { JoinPage } from "./JoinPage.js";
+import { RoomPage } from "./RoomPage.js";
+import { Icon } from "./ui.js";
+import { CredentialGroups, CredentialGroupDetail } from "./CredentialGroups.js";
+import { CredentialWallet } from "./CredentialWallet.js";
+import { CredentialEnrollment } from "./CredentialEnrollment.js";
+import "./styles.css";
+import { PlatformPage } from "./PlatformPage.js";
+import { WalletProofPage } from "./WalletProofPage.js";
+import { PublicContractPage } from "./PublicContractPage.js";
 
 function App() {
   const [ready, setReady] = useState(false);
-  const [error, setError] = useState('');
-  const [originMismatch, setOriginMismatch] = useState('');
+  const [error, setError] = useState("");
+  const [originMismatch, setOriginMismatch] = useState("");
+  const path = window.location.pathname;
+  const publicContract = path.match(
+    /^\/contracts\/([a-f0-9-]+)\/versions\/(\d+)$/i,
+  );
   useEffect(() => {
     void loadPublicConfig()
       .then(({ publicOrigin }) => {
         setPublicOrigin(publicOrigin);
         if (window.location.origin !== publicOrigin) {
-          setOriginMismatch(configuredPageUrl(publicOrigin, window.location.pathname, window.location.search, window.location.hash));
+          setOriginMismatch(
+            configuredPageUrl(
+              publicOrigin,
+              window.location.pathname,
+              window.location.search,
+              window.location.hash,
+            ),
+          );
+          return;
+        }
+        if (publicContract) {
+          setReady(true);
           return;
         }
         return startSession().then(() => setReady(true));
       })
       .catch((error) => setError(error.message));
   }, []);
-  const path = window.location.pathname;
   const room = path.match(/^\/rooms\/([a-f0-9-]+)$/i);
   const join = path.match(/^\/join\/([A-Za-z0-9_-]+)$/);
   const credentialGroup = path.match(/^\/credential-groups\/([a-f0-9-]+)$/i);
   const credentialEnrollment = path.match(/^\/credentials\/([a-f0-9-]+)$/i);
-  const groupList = path === '/credential-groups';
-  const wallet = path === '/my-credentials';
+  const groupList = path === "/credential-groups";
+  const wallet = path === "/my-credentials";
+  const platform = path === "/platform";
+  const proofRequest = path.match(/^\/prove\/([0-9a-f-]+)$/i);
   return (
     <div className="app-layout">
       <a className="skip-link" href="#main">
@@ -44,7 +68,10 @@ function App() {
         </a>
         <p className="nav-label">WORKSPACE</p>
         <nav aria-label="Workspace navigation">
-          <a className={path === '/' ? 'nav-item selected' : 'nav-item'} href="/">
+          <a
+            className={path === "/" ? "nav-item selected" : "nav-item"}
+            href="/"
+          >
             <Icon name="rooms" />
             Your rooms
           </a>
@@ -52,8 +79,26 @@ function App() {
             <Icon name="plus" />
             Create a room
           </a>
-          <a className={groupList || credentialGroup ? 'nav-item selected' : 'nav-item'} href="/credential-groups">Credential groups</a>
-          <a className={wallet ? 'nav-item selected' : 'nav-item'} href="/my-credentials">My credentials</a>
+          <a
+            className={
+              groupList || credentialGroup ? "nav-item selected" : "nav-item"
+            }
+            href="/credential-groups"
+          >
+            Credential groups
+          </a>
+          <a
+            className={wallet ? "nav-item selected" : "nav-item"}
+            href="/my-credentials"
+          >
+            My credentials
+          </a>
+          <a
+            className={platform ? "nav-item selected" : "nav-item"}
+            href="/platform"
+          >
+            Applications
+          </a>
         </nav>
         <div className="sidebar-note">
           <Icon name="shield" />
@@ -64,8 +109,24 @@ function App() {
       <div className="workspace">
         <div className="topbar">
           <span>
-            Workspace <span className="breadcrumb-divider">/</span>{' '}
-            {credentialEnrollment ? 'Credential enrollment' : credentialGroup || groupList ? 'Credential groups' : wallet ? 'My credentials' : join ? 'Join room' : room ? 'Room overview' : 'Rooms'}
+            Workspace <span className="breadcrumb-divider">/</span>{" "}
+            {publicContract
+              ? "Public contract"
+              : proofRequest
+                ? "Application request"
+                : platform
+                  ? "Applications"
+                  : credentialEnrollment
+                    ? "Credential enrollment"
+                    : credentialGroup || groupList
+                      ? "Credential groups"
+                      : wallet
+                        ? "My credentials"
+                        : join
+                          ? "Join room"
+                          : room
+                            ? "Room overview"
+                            : "Rooms"}
           </span>
           {ready && (
             <span className="session-indicator">
@@ -78,15 +139,28 @@ function App() {
           {originMismatch ? (
             <section role="alert" className="error">
               <h1>Open Portkey at its configured address</h1>
-              <p>This page’s address does not match the site address. Continue at the configured address before creating or sharing rooms.</p>
+              <p>
+                This page’s address does not match the site address. Continue at
+                the configured address before creating or sharing rooms.
+              </p>
               <a href={originMismatch}>Open the configured Portkey address</a>
             </section>
           ) : error ? (
             <p role="alert" className="error">
-              {error} <button onClick={() => window.location.reload()}>Retry</button>
+              {error}{" "}
+              <button onClick={() => window.location.reload()}>Retry</button>
             </p>
           ) : !ready ? (
             <p role="status">Starting your session…</p>
+          ) : publicContract ? (
+            <PublicContractPage
+              contractId={publicContract[1]}
+              version={publicContract[2]}
+            />
+          ) : proofRequest ? (
+            <WalletProofPage requestId={proofRequest[1]} />
+          ) : platform ? (
+            <PlatformPage />
           ) : room ? (
             <RoomPage id={room[1]} />
           ) : join ? (
@@ -99,7 +173,7 @@ function App() {
             <CredentialGroups />
           ) : wallet ? (
             <CredentialWallet />
-          ) : path === '/' ? (
+          ) : path === "/" ? (
             <Home />
           ) : (
             <h1>Page not found.</h1>
@@ -114,4 +188,4 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById("root")!).render(<App />);
