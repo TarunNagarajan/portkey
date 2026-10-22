@@ -9,6 +9,11 @@ test('workshop proof enrollment saves locally, survives reload, enters directly,
   await mkdir(evidenceDirectory, { recursive: true });
   const pageErrors: string[] = [];
   const consoleErrors: string[] = [];
+  const proofTimeline: { elapsedMs: number; event: string; path?: string; method?: string; status?: number; code?: string; detail?: string }[] = [];
+  const timelineStartedAt = Date.now();
+  const timeline = (event: string, detail?: Omit<typeof proofTimeline[number], 'elapsedMs' | 'event'>) => {
+    proofTimeline.push({ elapsedMs: Date.now() - timelineStartedAt, event, ...detail });
+  };
   const requestBodies: string[] = [];
   const proofBodies: string[] = [];
   const requestFailures: { url: string; errorText: string }[] = [];
@@ -16,6 +21,7 @@ test('workshop proof enrollment saves locally, survives reload, enters directly,
   let busyResponseInjected = false;
   let enrollmentResponseLost = false;
   let lostEnrollmentRequestUrl = '';
+  let proofClickElapsed = Number.POSITIVE_INFINITY;
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await page.goto('/');
   await page.getByLabel('Room title').fill('Credential proof workshop');
@@ -42,8 +48,22 @@ test('workshop proof enrollment saves locally, survives reload, enters directly,
   const participantContext = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const participant = await participantContext.newPage();
   participant.on('pageerror', (error) => pageErrors.push(error.message));
+  participant.on('framenavigated', (frame) => {
+    if (frame === participant.mainFrame()) timeline('main-frame-navigated', { path: new URL(frame.url()).pathname });
+  });
+  participant.on('domcontentloaded', () => timeline('domcontentloaded', { path: new URL(participant.url()).pathname }));
+  participant.on('load', () => timeline('page-load', { path: new URL(participant.url()).pathname }));
   participant.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
-  participant.on('requestfailed', (request) => requestFailures.push({ url: request.url(), errorText: request.failure()?.errorText ?? '' }));
+  participant.on('requestfailed', (request) => {
+    requestFailures.push({ url: request.url(), errorText: request.failure()?.errorText ?? '' });
+    const path = new URL(request.url()).pathname;
+    if (path.includes('/proof') || path.endsWith('/prove')) timeline('request-failed', { path, method: request.method(), detail: request.failure()?.errorText ?? '' });
+  });
+  participant.on('worker', (worker) => {
+    timeline('worker-started', { path: new URL(worker.url()).pathname });
+    worker.on('console', (message) => timeline('worker-console', { detail: `${message.type()}: ${message.text()}` }));
+    worker.on('close', () => timeline('worker-closed'));
+  });
   const assetResponses = new Map<string, { status: number; type: string }>();
   participant.on('response', (response) => {
     const name = new URL(response.url()).pathname.split('/').at(-1);
@@ -52,8 +72,21 @@ test('workshop proof enrollment saves locally, survives reload, enters directly,
   });
   participant.on('request', (request) => {
     if (request.postData()) requestBodies.push(request.postData()!);
-    if (request.url().includes('/proof-challenge')) challengeRequests += 1;
-    if (request.url().endsWith('/prove') && request.postData()) proofBodies.push(request.postData()!);
+    const path = new URL(request.url()).pathname;
+    if (path.includes('/proof-challenge')) challengeRequests += 1;
+    if (path.endsWith('/prove') && request.postData()) proofBodies.push(request.postData()!);
+    if (path.includes('/proof') || path.endsWith('/prove')) timeline('request', { path, method: request.method() });
+  });
+  participant.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (!path.includes('/proof') && !path.endsWith('/prove')) return;
+    void (async () => {
+      let code: string | undefined;
+      if (!response.ok()) {
+        try { code = (await response.json() as { error?: { code?: string } }).error?.code; } catch { code = 'invalid-error-body'; }
+      }
+      timeline('response', { path, status: response.status(), ...(code ? { code } : {}) });
+    })();
   });
   await participant.route('**/api/join/*/prove', async (route) => {
     if (busyResponseInjected) return route.continue();
@@ -132,9 +165,43 @@ test('workshop proof enrollment saves locally, survives reload, enters directly,
   await participant.reload();
   await expect(participant.getByRole('button', { name: 'Prove membership and enter' })).toBeVisible();
   await expect(participant).toHaveURL(/#key=[a-f0-9]{64}$/);
+  proofClickElapsed = Date.now() - timelineStartedAt;
+  timeline('proof-button-clicked');
   await participant.getByRole('button', { name: 'Prove membership and enter' }).click();
-  await expect(participant).toHaveURL((url) => url.pathname === roomPath && /^#key=[a-f0-9]{64}$/.test(url.hash), { timeout: 140_000 });
+  try {
+    await expect(participant).toHaveURL((url) => url.pathname === roomPath && /^#key=[a-f0-9]{64}$/.test(url.hash), { timeout: 140_000 });
+  } catch (error) {
+    const state = await participant.evaluate(() => {
+      const section = document.querySelector<HTMLElement>('.workshop-admission');
+      const button = section?.querySelector<HTMLButtonElement>('button[type="submit"]');
+      return {
+        path: location.pathname,
+        fragmentKeys: Array.from(new URLSearchParams(location.hash.slice(1)).keys()),
+        sectionText: section?.innerText ?? '',
+        buttonText: button?.innerText ?? '',
+        buttonDisabled: button?.disabled ?? null,
+        alerts: Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"]')).map((element) => element.innerText),
+      };
+    });
+    const stamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
+    await participant.screenshot({ path: join(evidenceDirectory, `proof-failure-${stamp}.png`), fullPage: true });
+    await writeFile(join(evidenceDirectory, `proof-failure-${stamp}.json`), JSON.stringify({
+      elapsedMs: Date.now() - timelineStartedAt,
+      state,
+      challengeRequests,
+      proofRequestAttempts: proofBodies.length,
+      proofRequestFields: proofBodies.map((value) => Object.keys(JSON.parse(value) as object)),
+      assetResponses: Object.fromEntries(assetResponses),
+      pageErrors,
+      consoleErrors,
+      requestFailures: requestFailures.map(({ url, errorText }) => ({ path: new URL(url).pathname, errorText })),
+      proofTimeline,
+    }, null, 2), 'utf8');
+    throw error;
+  }
   expect(challengeRequests).toBe(1);
+  expect(proofTimeline.filter((item) => item.event === 'main-frame-navigated'
+    && item.elapsedMs > proofClickElapsed && item.path === new URL(enrollmentLink!).pathname)).toEqual([]);
   expect(busyResponseInjected).toBe(true);
   expect(proofBodies).toHaveLength(2);
   expect(JSON.parse(proofBodies[1])).toEqual(JSON.parse(proofBodies[0]));
