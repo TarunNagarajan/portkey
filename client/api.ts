@@ -3,15 +3,31 @@ import type { PlaceSuggestion } from '../shared/rooms.js';
 let csrfToken = '';
 let publicOrigin = '';
 
-export function buildInvitationUrl(origin: string, code: string, fingerprint?: string | null): string {
+export function buildInvitationUrl(origin: string, code: string, fingerprint?: string | null, passToken?: string): string {
   let base: URL;
   try { base = new URL(origin); } catch { throw new Error('Invitation origin is invalid.'); }
-  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.pathname !== '/' || base.search || base.hash)
+  if (
+    !['http:', 'https:'].includes(base.protocol) ||
+    base.username ||
+    base.password ||
+    base.pathname !== '/' ||
+    base.search ||
+    base.hash
+  )
     throw new Error('Invitation origin is invalid.');
   if (!/^[A-Za-z0-9_-]{16}$/.test(code)) throw new Error('Room invitation code is invalid.');
   if (fingerprint && !/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error('Inbox key fingerprint is invalid.');
+  if (
+    passToken !== undefined &&
+    !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(passToken)
+  ) {
+    throw new Error('Admission pass is invalid.');
+  }
   const url = new URL(`/join/${encodeURIComponent(code)}`, base.origin);
-  if (fingerprint) url.hash = `key=${encodeURIComponent(fingerprint)}`;
+  const fragment = new URLSearchParams();
+  if (passToken !== undefined) fragment.set('pass', passToken);
+  if (fingerprint) fragment.set('key', fingerprint);
+  if (fragment.size) url.hash = fragment.toString();
   return url.toString();
 }
 

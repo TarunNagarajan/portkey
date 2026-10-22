@@ -156,6 +156,7 @@ test('the join address reveals public details but never owner or membership reco
   const room = await createRoom(owner);
   const response = await visitor.get(`/join/${room.joinCode}`).expect(200);
   assert.deepEqual(Object.keys(response.body).sort(), [
+    'admissionPolicy',
     'description',
     'expiresAt',
     'geo',

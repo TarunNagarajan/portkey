@@ -9,9 +9,12 @@ export type ActivityKind =
   | 'member_denied'
   | 'member_revoked'
   | 'submission_cleanup_enabled'
-  | 'submissions_purged';
+  | 'submissions_purged'
+  | 'admission_passes_issued'
+  | 'pass_revoked'
+  | 'pass_redeemed';
 
-export type RoomField = 'title' | 'description' | 'expiresAt';
+export type RoomField = 'title' | 'description' | 'expiresAt' | 'admissionPolicy';
 
 export interface ActivityEvent {
   id: string;

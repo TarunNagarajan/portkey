@@ -1,6 +1,6 @@
 # Portkey
 
-Room management, organizer activity, and browser-encrypted private submissions. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
+Room management, organizer activity, browser-encrypted private submissions, and single-use workshop admission passes. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
 
 ## Run locally
 
@@ -24,11 +24,15 @@ Install the official `cloudflared` executable separately, then run `npm run phon
 
 ## Use the module
 
-Create a draft with a title, public description and future expiry. Edit the draft, then open it. Share the generated QR or link. In a separate browser profile, request access with a nickname or team label. The organizer approves or declines the request. An approved participant can enter the room; the organizer can remove that access or close the room.
+Create a draft with a title, public description, admission policy and future expiry. The default policy asks the organizer to approve each browser's request. A single-use pass room admits a browser that redeems a pass supplied by the organizer. Open the room when it is ready, then share its QR or link. In approval rooms, participants request access with a nickname or team label. The organizer approves or declines the request. The organizer can remove approved access or close either kind of room.
+
+In pass rooms, the organizer generates one to 20 passes per batch, up to 1,000 over the room's lifetime. The QR, copy link and CSV controls show each token only in the issuance response and the current browser page; save the batch before dismissing it. Portkey cannot recover a lost token. An unused pass can be revoked, but a used pass cannot be reused or revoked; remove the admitted browser from Participant access instead. The ordinary room link shows a preview and does not grant access. Templates copy the admission policy, but not passes or redemption history. Policy changes are available only while the room is a draft.
+
+A pass is a room-bound bearer capability, not verified identity or a zero-knowledge credential. Anyone who receives the link before redemption can use it. A successful redemption binds admission to that browser session; the existing room expiry, closure, location and access-removal rules still apply. It does not erase files a recipient already downloaded.
 
 The workspace shows room counts and lets you search titles/descriptions or filter by lifecycle status. Use an owned room as a template for another event: its title and description are prefilled, you choose a fresh deadline, and a new draft is created with a new invitation. Memberships and approvals are never copied. Closed and expired rooms can be reused without reopening the original.
 
-The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process.
+The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process; passes are for distributing entry through a channel the organizer trusts.
 
 Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; room expiry separately triggers submission cleanup for rooms whose cleanup policy is enabled.
 
@@ -38,9 +42,11 @@ New rooms automatically remove their encrypted submission records after the room
 
 Each room overview includes an organizer-only timeline of creation, template reuse, metadata edits, opening, closure, access requests and admission decisions. The latest page refreshes every five seconds. Use Older activity to browse previous pages; Back to latest resumes live updates. Older pages remain stable while new actions occur. History remains readable by the owner after closure or expiry.
 
-Migration `002_room_activity.sql` adds the history table without changing existing rooms. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
+Migration `002_room_activity.sql` adds the history table without changing existing rooms. Migration `007_admission_passes.sql` adds the room policy and pass records; existing rooms retain approval. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests, pass redemption retries, and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
 
 Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
+
+Pass tokens use 256 bits of randomness. The server stores only a SHA-256 digest, and the owner list returns status and timestamps without token material. A token appears in a pass invitation's URL fragment, alongside the existing inbox key fingerprint when the organizer's verified local key is available. Browsers do not send fragments in HTTP requests; the redeem API receives the token in its request body. Redemption, revocation, issuance limits and room closure serialize on the room row. This protects single-use state; the pass does not prove who redeemed it.
 
 ## Encrypted submission inbox
 
@@ -76,7 +82,7 @@ Coordinates and accuracy are stored on the membership so the organizer can see w
 
 `sessions` contains hashed browser credentials and their expiry. `rooms` belongs to one organizer session and has a unique random join address. `memberships` links one browser session to one room with a pending, approved, denied, or revoked status. `schema_migrations` records applied SQL and checksums. Foreign keys, uniqueness, checks and indexes are defined in `server/migrations/001_initial.sql`.
 
-The public join page exposes only title, description, effective status and deadline, plus the caller's own membership state. Private room entry requires approved membership. Only the room owner can edit metadata, change lifecycle, inspect requests or decide membership. Approval and lifecycle changes lock the room in a transaction so concurrent requests cannot bypass closure. Revoked and denied sessions cannot request access again to that room. A new browser session can request again, so this prototype does not implement a human-level ban.
+The public join page exposes only title, description, effective status and deadline, plus the caller's own membership state and admission policy. Private room entry requires approved membership. Only the room owner can edit metadata, change lifecycle, inspect requests or decide membership. Approval, pass redemption and lifecycle changes lock the room in a transaction so concurrent requests cannot bypass closure or reuse a pass. Revoked and denied sessions cannot request or redeem access again to that room. A new browser session can request again, so this prototype does not implement a human-level ban.
 
 Writes require the configured Origin and a CSRF token derived from the session secret. Cookies are HttpOnly and SameSite=Strict, and gain Secure plus the `__Host-` prefix in production. API responses use no-store caching, JSON payloads have a size limit, input objects reject unknown fields, SQL uses parameters, and request limits use browser sessions rather than grouping every workshop participant under one Wi-Fi address.
 
@@ -98,6 +104,10 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | POST | `/api/rooms/:id/submission-cleanup` | Owner enables irreversible automatic cleanup with an empty JSON object |
 | GET | `/api/join/:code` | Read public room details and own admission state |
 | POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` and, for a restricted room, `{ lat, lng, accuracyM, timestamp }` |
+| POST | `/api/join/:code/redeem` | Redeem `{ token, label }` and, for a restricted room, the same location fields; pass rooms do not accept ordinary access requests |
+| GET | `/api/rooms/:id/passes` | Owner reads pass number, status and timestamps; tokens are never returned |
+| POST | `/api/rooms/:id/passes` | Owner issues `{ "count": 1 }` through `{ "count": 20 }`; raw tokens appear only in this response |
+| PATCH | `/api/rooms/:id/passes/:passId` | Owner revokes an unused pass with `{ "status": "revoked" }` |
 | GET | `/api/geo/search` | Search places for a room area with `?q=Warangal` |
 | POST | `/api/rooms/:id/geo` | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }` |
 | DELETE | `/api/rooms/:id/geo` | Owner clears a draft room's area |
@@ -113,7 +123,7 @@ Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Pre
 | GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
 | DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
 
-Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
+Creation and metadata edits accept `title`, `description`, an ISO timestamp `expiresAt` with an offset, and optional `admissionPolicy` (`approval` or `pass`). Omitted policy defaults to approval on creation and preserves the current value on edits. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
 The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `description` override the original values; omitted values are copied. It applies the same deadline/session limits as ordinary room creation.
 
@@ -121,6 +131,6 @@ The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `descr
 
 Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/rooms.ts`, and the frontend components. `server/app.ts` assembles middleware and routes; `server/database.ts` separates database drivers from room logic.
 
-Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e-private-inbox` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
+Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e-private-inbox` rather than your development database. Set `PORTKEY_E2E_DATA_DIR` to choose another isolated test directory. The API test server ignores `.env` and inherited `DATABASE_URL`. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
 
 Anonymous membership proofs and secure device pairing are not implemented. Key verification relies on an organizer-delivered invitation or an explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.
