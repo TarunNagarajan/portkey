@@ -123,7 +123,14 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   await page.getByLabel('Number of passes').fill('1');
   await page.getByRole('button', { name: 'Generate passes' }).click();
   await expect(page.getByRole('alert')).toContainText('uncertain response may have created passes');
+  const refreshedPassList = page.waitForResponse((response) =>
+    response.url().includes(`/api${roomPath}/passes`) &&
+    response.request().method() === 'GET' &&
+    response.ok(),
+  );
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await refreshedPassList;
+  await expect(page.getByRole('alert')).toContainText('uncertain response may have created passes');
   await expect(page.getByRole('row').filter({ hasText: '#4' })).toContainText('available');
   expect(issueRequests).toBe(1);
   await page.unroute(`**/api${roomPath}/passes`);

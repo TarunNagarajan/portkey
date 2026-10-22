@@ -29,7 +29,8 @@ export function PassesPanel({
   const [count, setCount] = useState(1);
   const [qr, setQr] = useState<{ url: string; image: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [listError, setListError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [message, setMessage] = useState('');
 
   const terminal = ['closed', 'expired'].includes(room.status);
@@ -51,9 +52,9 @@ export function PassesPanel({
     try {
       const rows = await api<PassInfo[]>(`/rooms/${room.id}/passes`);
       setPasses(rows);
-      setError('');
+      setListError('');
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Unable to load passes.');
+      setListError(cause instanceof Error ? cause.message : 'Unable to load passes.');
     }
   }
 
@@ -96,7 +97,7 @@ export function PassesPanel({
   async function issue(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
-    setError('');
+    setActionError('');
     setMessage('');
     try {
       const result = await api<{ passes: IssuedPass[] }>(
@@ -112,7 +113,7 @@ export function PassesPanel({
       );
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : 'Unable to issue passes.';
-      setError(
+      setActionError(
         `${detail} Check the pass list before trying again; an uncertain response may have created passes.`,
       );
     } finally {
@@ -122,11 +123,13 @@ export function PassesPanel({
 
   async function copyLink() {
     if (!selectedUrl) return;
+    setActionError('');
+    setMessage('');
     try {
       await navigator.clipboard.writeText(selectedUrl);
       setMessage('Pass link copied.');
     } catch {
-      setError('Clipboard access failed. Select the link and copy it manually.');
+      setActionError('Clipboard access failed. Select the link and copy it manually.');
     }
   }
 
@@ -156,14 +159,14 @@ export function PassesPanel({
   async function revoke(pass: PassInfo) {
     if (!window.confirm(`Revoke unused pass ${pass.number}? This cannot be undone.`)) return;
     setBusy(true);
-    setError('');
+    setActionError('');
     setMessage('');
     try {
       await api(`/rooms/${room.id}/passes/${pass.id}`, 'PATCH', { status: 'revoked' });
       await refresh();
       setMessage(`Pass ${pass.number} revoked.`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Unable to revoke pass.');
+      setActionError(cause instanceof Error ? cause.message : 'Unable to revoke pass.');
     } finally {
       setBusy(false);
     }
@@ -180,7 +183,8 @@ export function PassesPanel({
           Refresh
         </button>
       </div>
-      {error && <p role="alert" className="error passes-message">{error}</p>}
+      {listError && <p role="alert" className="error passes-message">{listError}</p>}
+      {actionError && <p role="alert" className="error passes-message">{actionError}</p>}
       {message && <p role="status" className="muted passes-message">{message}</p>}
       {!terminal && (
         <form className="pass-issue" onSubmit={(event) => void issue(event)}>
@@ -254,6 +258,7 @@ export function PassesPanel({
               setBatch(null);
               setSelected('');
               setQr(null);
+              setActionError('');
             }}
           >
             Dismiss one-time links
