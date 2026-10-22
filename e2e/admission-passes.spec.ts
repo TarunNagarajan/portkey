@@ -132,9 +132,14 @@ test('pass admission is one use, preserves the inbox fingerprint, and supports e
   await expect(other.getByRole('alert')).toContainText('invalid, unavailable, or already used');
 
   const previewLink = await page.locator('.share-room .join-link').getAttribute('href');
-  await other.goto(previewLink!);
-  await expect(other.getByText('This public room link does not grant access.')).toBeVisible();
-  await expect(other.getByRole('button', { name: 'Request access' })).toHaveCount(0);
+  const previewContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const preview = await previewContext.newPage();
+  await preview.goto(previewLink!);
+  await expect(preview.getByText('This public room link does not grant access.')).toBeVisible();
+  await expect(preview.getByRole('button', { name: 'Request access' })).toHaveCount(0);
+  await expect(preview.getByRole('button', { name: 'Redeem pass' })).toHaveCount(0);
+  await expect(preview.getByRole('link', { name: 'Enter room' })).toHaveCount(0);
+  await previewContext.close();
 
   await selector.selectOption({ label: 'Pass 3' });
   const thirdLink = await page.locator('.pass-selected .join-link').getAttribute('href');
