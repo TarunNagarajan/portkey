@@ -133,7 +133,7 @@ The wallet routes are session, origin, and CSRF protected under `/api/platform/w
 
 Organizer accounts use discoverable, user-verified passkeys. Creating an account explicitly adopts the current unclaimed browser workspace; signing into an existing account never merges unrelated guest resources. Guest workspaces expire with their 30-day browser session, while adopted ownership persists across seven-day organizer sign-ins. Existing room, group, contract, application, invitation, trust, signing-key and recipient-key identifiers remain attached to the original stable ownership anchor.
 
-Passkeys are tied to the configured site hostname. If the hostname changes, enroll a new passkey while signed in when possible. If the database and recovery key are retained, recovery at the new configured origin can also replace the old passkeys with a new one. Recovery does not restore browser-local inbox decryption keys or attendee credentials; encrypted key backup remains separate.
+Existing passkeys do not work at a changed hostname. Retain the database and recovery key, then use **Recover an account** at the new configured HTTPS origin to register a replacement passkey. Browser-local inbox keys still require the separate encrypted backup.
 
 Recovery requires the one-time recovery key and a replacement passkey. Recovery replaces all old passkeys and revokes every organizer sign-in session. It does not restore browser-local inbox decryption keys or attendee proof credentials; encrypted key backup remains separate. Passkeys belong to the configured Portkey hostname, so a changed tunnel or deployment domain requires enrolling a new passkey while account access is available.
 
