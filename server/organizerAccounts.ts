@@ -124,28 +124,40 @@ export function organizerAccountRoutes(
       "ACCOUNT_REQUIRED",
       "Sign in with your passkey to manage organizer access.",
     );
+  const lockActiveBrowser = async (tx: Queries, req: Request) => {
+    const [locked] = await tx.query<{ id: string }>(
+      "SELECT id FROM sessions WHERE id=$1 FOR UPDATE",
+      [req.session!.id],
+    );
+    const [active] = locked
+      ? await tx.query<{ valid: boolean }>(
+          "SELECT expires_at > clock_timestamp() AS valid FROM sessions WHERE id=$1",
+          [req.session!.id],
+        )
+      : [];
+    requireCondition(
+      active?.valid,
+      401,
+      "SESSION_EXPIRED",
+      "This browser session expired. Start a new passkey attempt.",
+    );
+  };
   const requireFresh = async (tx: Queries, req: Request) => {
     activeAccount(req);
-    await tx.query("SELECT id FROM organizer_accounts WHERE id=$1 FOR UPDATE", [
-      req.organizer!.accountId,
-    ]);
+    const [account] = await tx.query<{ auth_generation: number }>(
+      "SELECT auth_generation FROM organizer_accounts WHERE id=$1 FOR UPDATE",
+      [req.organizer!.accountId],
+    );
+    await tx.query(
+      "SELECT id FROM organizer_sessions WHERE id=$1 AND account_id=$2 FOR UPDATE",
+      [req.organizer!.id, req.organizer!.accountId],
+    );
     const [session] = await tx.query<{ valid: boolean }>(
-      `SELECT os.expires_at > clock_timestamp()
-        AND os.auth_generation = $3
-        AND os.verified_at > clock_timestamp() - interval '5 minutes' AS valid
-      FROM organizer_sessions os
-      WHERE os.id = $1 AND os.account_id = $2
-      FOR UPDATE`,
-      [
-        req.organizer!.id,
-        req.organizer!.accountId,
-        (
-          await tx.query<{ auth_generation: number }>(
-            "SELECT auth_generation FROM organizer_accounts WHERE id=$1",
-            [req.organizer!.accountId],
-          )
-        )[0]?.auth_generation,
-      ],
+      `SELECT expires_at > clock_timestamp()
+        AND auth_generation = $3
+        AND verified_at > clock_timestamp() - interval '5 minutes' AS valid
+       FROM organizer_sessions WHERE id=$1 AND account_id=$2`,
+      [req.organizer!.id, req.organizer!.accountId, account?.auth_generation],
     );
     requireCondition(
       session?.valid,
@@ -162,11 +174,64 @@ export function organizerAccountRoutes(
   ) => {
     const browserId = req.session!.id;
     return database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE", [
-        browserId,
-      ]);
+      let accountGeneration: number | undefined;
+      if (extras.account_id) {
+        const [account] = await tx.query<{ auth_generation: number }>(
+          "SELECT auth_generation FROM organizer_accounts WHERE id=$1 FOR UPDATE",
+          [extras.account_id],
+        );
+        requireCondition(
+          account,
+          401,
+          "ACCOUNT_SESSION_EXPIRED",
+          "Sign in again with your passkey.",
+        );
+        accountGeneration = account.auth_generation;
+        if (extras.auth_generation !== undefined)
+          requireCondition(
+            extras.auth_generation === accountGeneration,
+            401,
+            "CEREMONY_INVALID",
+            "Start this passkey attempt again.",
+          );
+        if (extras.recovery_digest) {
+          const [current] = await tx.query<{ recovery_digest: Buffer }>(
+            "SELECT recovery_digest FROM organizer_accounts WHERE id=$1",
+            [extras.account_id],
+          );
+          requireCondition(
+            current &&
+              current.recovery_digest.length ===
+                extras.recovery_digest.length &&
+              timingSafeEqual(current.recovery_digest, extras.recovery_digest),
+            401,
+            "AUTHENTICATION_FAILED",
+            "Passkey or recovery key could not be verified.",
+          );
+        }
+      }
+      if (extras.organizer_session_id) {
+        await tx.query(
+          "SELECT id FROM organizer_sessions WHERE id=$1 AND account_id=$2 FOR UPDATE",
+          [extras.organizer_session_id, extras.account_id],
+        );
+        const [active] = await tx.query<{ valid: boolean }>(
+          `SELECT expires_at > clock_timestamp() AND auth_generation=$3 AS valid
+           FROM organizer_sessions WHERE id=$1 AND account_id=$2`,
+          [extras.organizer_session_id, extras.account_id, accountGeneration],
+        );
+        requireCondition(
+          active?.valid,
+          401,
+          "ACCOUNT_SESSION_EXPIRED",
+          "Sign in again with your passkey.",
+        );
+        if (kind === "add_passkey") await requireFresh(tx, req);
+      }
+      await lockActiveBrowser(tx, req);
       await tx.query(
-        "DELETE FROM organizer_ceremonies WHERE expires_at<=clock_timestamp() OR consumed_at<clock_timestamp()-interval '1 day'",
+        "DELETE FROM organizer_ceremonies WHERE browser_session_id=$1 AND (expires_at<=clock_timestamp() OR consumed_at<clock_timestamp()-interval '1 day')",
+        [browserId],
       );
       const [count] = await tx.query<{ count: number }>(
         "SELECT count(*)::int AS count FROM organizer_ceremonies WHERE browser_session_id=$1 AND consumed_at IS NULL AND expires_at>clock_timestamp()",
@@ -277,16 +342,7 @@ export function organizerAccountRoutes(
     id: string,
     kinds: string[],
   ) => {
-    const [browser] = await tx.query<{ id: string }>(
-      "SELECT id FROM sessions WHERE id=$1 AND expires_at>clock_timestamp() FOR UPDATE",
-      [req.session!.id],
-    );
-    requireCondition(
-      browser,
-      401,
-      "SESSION_EXPIRED",
-      "This browser session expired. Start a new passkey attempt.",
-    );
+    await lockActiveBrowser(tx, req);
     const [row] = await tx.query<Ceremony>(
       `SELECT * FROM organizer_ceremonies WHERE id=$1 AND browser_session_id=$2 AND kind=ANY($3::text[]) AND consumed_at IS NULL AND expires_at>clock_timestamp() FOR UPDATE`,
       [id, req.session!.id, kinds],
@@ -307,6 +363,32 @@ export function organizerAccountRoutes(
     return row;
   };
   const markConsumed = async (tx: Queries, ceremonyId: string) => {
+    const [ceremony] = await tx.query<{ browser_session_id: string }>(
+      "SELECT browser_session_id FROM organizer_ceremonies WHERE id=$1",
+      [ceremonyId],
+    );
+    requireCondition(
+      ceremony?.browser_session_id,
+      400,
+      "CEREMONY_INVALID",
+      "This passkey attempt expired or was already used. Start again.",
+    );
+    const [browserLock] = await tx.query<{ id: string }>(
+      "SELECT id FROM sessions WHERE id=$1 FOR UPDATE",
+      [ceremony.browser_session_id],
+    );
+    const [browser] = browserLock
+      ? await tx.query<{ active: boolean }>(
+          "SELECT expires_at>clock_timestamp() AS active FROM sessions WHERE id=$1",
+          [ceremony.browser_session_id],
+        )
+      : [];
+    requireCondition(
+      browser?.active,
+      401,
+      "SESSION_EXPIRED",
+      "This browser session expired. Start a new passkey attempt.",
+    );
     const [row] = await tx.query<{ id: string }>(
       `UPDATE organizer_ceremonies SET consumed_at=clock_timestamp()
       WHERE id=$1 AND consumed_at IS NULL AND expires_at>clock_timestamp() RETURNING id`,
