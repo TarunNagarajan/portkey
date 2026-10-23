@@ -635,7 +635,10 @@ test('concurrent chunk writes allocate room quota atomically', async () => {
 
 test(
   'the API accepts a 250 MiB payload with all GCM tags and rejects another chunk',
-  { timeout: 180_000 },
+  // The full 250 MiB path takes about 232 seconds on the constrained 8 GiB
+  // verification host. Keep the complete-size assertion while allowing for
+  // hardware and CI load variation.
+  { timeout: 600_000 },
   async () => {
     const { participant, room, path } = await inbox();
     const upload = await beginUpload(participant, path);
