@@ -164,6 +164,10 @@ test("organizer passkeys preserve adopted ownership across login and recovery", 
     await expect(
       activePage.getByRole("heading", { name: "Organizer account active" }),
     ).toBeVisible();
+    const currentOldCredential = (
+      await exportCredentials(activeAuth.cdp, activeAuth.authenticatorId)
+    )[0];
+    expect(currentOldCredential).toBeTruthy();
 
     await secondAuth.cdp.send("WebAuthn.removeVirtualAuthenticator", {
       authenticatorId: secondAuth.authenticatorId,
@@ -215,7 +219,7 @@ test("organizer passkeys preserve adopted ownership across login and recovery", 
       id: oldLoginAuth.authenticatorId,
     });
     await importCredentials(oldLoginAuth.cdp, oldLoginAuth.authenticatorId, [
-      oldCredential,
+      currentOldCredential,
     ]);
     await oldLoginPage.goto("/account");
     await oldLoginPage
