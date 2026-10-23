@@ -14,6 +14,7 @@ import { credentialGroupRoutes } from "./credentialGroups.js";
 import { platformControlRoutes } from "./platformControl.js";
 import { platformAppApiRoutes, platformPublicRoutes } from "./platformApi.js";
 import { platformWalletRoutes } from "./platformWallet.js";
+import { organizerAccountRoutes } from "./organizerAccounts.js";
 
 export interface AppOptions {
   origin: string;
@@ -44,11 +45,9 @@ export function createApp(database: Database, options: AppOptions) {
   app.use("/v1", platformPublicRoutes(database, options.origin));
   app.use("/v1", platformAppApiRoutes(database, options.origin));
   app.use("/v1", (_request, response) =>
-    response
-      .status(404)
-      .json({
-        error: { code: "NOT_FOUND", message: "API endpoint not found." },
-      }),
+    response.status(404).json({
+      error: { code: "NOT_FOUND", message: "API endpoint not found." },
+    }),
   );
   app.use("/api", (_request, response, next) => {
     response.setHeader("Cache-Control", "no-store");
@@ -82,6 +81,13 @@ export function createApp(database: Database, options: AppOptions) {
     response.json({ publicOrigin: options.origin }),
   );
   app.post("/api/session", sessions.checkOrigin, sessions.start);
+  app.use(
+    "/api",
+    organizerAccountRoutes(database, options, {
+      checkOrigin: sessions.checkOrigin,
+      checkCsrf: sessions.checkCsrf,
+    }),
+  );
   app.use("/api", sessions.authenticate);
   app.use("/api", (request, response, next) => {
     if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return next();
@@ -111,11 +117,9 @@ export function createApp(database: Database, options: AppOptions) {
   );
   app.use("/api", submissionRoutes(database));
   app.use("/api", (_request, response) => {
-    response
-      .status(404)
-      .json({
-        error: { code: "NOT_FOUND", message: "API endpoint not found." },
-      });
+    response.status(404).json({
+      error: { code: "NOT_FOUND", message: "API endpoint not found." },
+    });
   });
   const handleError: ErrorRequestHandler = (
     error,
@@ -124,19 +128,16 @@ export function createApp(database: Database, options: AppOptions) {
     _next,
   ) => {
     if (error instanceof ZodError) {
-      response
-        .status(422)
-        .json({
-          error: {
-            code: "INVALID_INPUT",
-            message: error.issues
-              .map(
-                (issue) =>
-                  `${issue.path.join(".") || "input"}: ${issue.message}`,
-              )
-              .join("; "),
-          },
-        });
+      response.status(422).json({
+        error: {
+          code: "INVALID_INPUT",
+          message: error.issues
+            .map(
+              (issue) => `${issue.path.join(".") || "input"}: ${issue.message}`,
+            )
+            .join("; "),
+        },
+      });
     } else if (error instanceof HttpError) {
       response
         .status(error.status)
@@ -145,26 +146,22 @@ export function createApp(database: Database, options: AppOptions) {
       error.type === "entity.parse.failed" ||
       error.type === "entity.too.large"
     ) {
-      response
-        .status(error.type === "entity.too.large" ? 413 : 400)
-        .json({
-          error: {
-            code: "INVALID_BODY",
-            message: "Request body is invalid or too large.",
-          },
-        });
+      response.status(error.type === "entity.too.large" ? 413 : 400).json({
+        error: {
+          code: "INVALID_BODY",
+          message: "Request body is invalid or too large.",
+        },
+      });
     } else {
       console.error("API request failed", {
         name: error instanceof Error ? error.name : "UnknownError",
       });
-      response
-        .status(500)
-        .json({
-          error: {
-            code: "INTERNAL_ERROR",
-            message: "Something went wrong. Please try again.",
-          },
-        });
+      response.status(500).json({
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "Something went wrong. Please try again.",
+        },
+      });
     }
   };
   app.use(handleError);

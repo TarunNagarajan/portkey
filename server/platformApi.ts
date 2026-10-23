@@ -46,8 +46,8 @@ export function platformPublicRoutes(database: Database, origin: string) {
         names: string[];
       }>(
         `SELECT v.contract_id,v.version,v.description,v.group_ids,v.digest,v.retired_at,v.published_at,c.issuer_label,c.name AS contract_name,
-       s.expires_at>clock_timestamp() AS available,ARRAY(SELECT g.name FROM credential_groups g WHERE g.id=ANY(v.group_ids) ORDER BY g.id) AS names
-       FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN sessions s ON s.id=c.owner_session_id WHERE v.contract_id=$1 AND v.version=$2`,
+       s.available AS available,ARRAY(SELECT g.name FROM credential_groups g WHERE g.id=ANY(v.group_ids) ORDER BY g.id) AS names
+       FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id WHERE v.contract_id=$1 AND v.version=$2`,
         [contractId, version],
       );
       requireCondition(
@@ -176,8 +176,8 @@ export function platformAppApiRoutes(database: Database, origin: string) {
           `INSERT INTO platform_requests(id,app_id,key_generation,contract_id,contract_version,trust_revision,redirect_uri,state,state_digest,code_challenge,capability_digest,expires_at)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,LEAST(
           clock_timestamp()+interval '5 minutes',
-          (SELECT owner.expires_at FROM platform_apps a JOIN sessions owner ON owner.id=a.owner_session_id WHERE a.id=$2),
-          (SELECT issuer.expires_at FROM platform_contracts c JOIN sessions issuer ON issuer.id=c.owner_session_id WHERE c.id=$4),
+          (SELECT owner.expires_at FROM platform_apps a JOIN owner_authorities owner ON owner.id=a.owner_session_id WHERE a.id=$2),
+          (SELECT issuer.expires_at FROM platform_contracts c JOIN owner_authorities issuer ON issuer.id=c.owner_session_id WHERE c.id=$4),
           (SELECT a.domain_verified_at+interval '24 hours' FROM platform_apps a WHERE a.id=$2)
         )) RETURNING expires_at`,
           [
@@ -225,12 +225,12 @@ export function platformAppApiRoutes(database: Database, origin: string) {
         contract_valid: boolean;
       }>(
         `SELECT r.id,r.status,r.expires_at,r.expires_at>clock_timestamp() AS request_active,r.contract_id,r.contract_version,r.key_generation,a.key_generation AS app_generation,
-      a.disabled_at IS NULL AND a.domain_verified_at>clock_timestamp()-interval '24 hours' AND s.expires_at>clock_timestamp() AS valid,
+      a.disabled_at IS NULL AND a.domain_verified_at>clock_timestamp()-interval '24 hours' AND s.available AS valid,
       EXISTS(SELECT 1 FROM platform_app_trust t WHERE t.app_id=a.id AND t.contract_id=r.contract_id AND t.contract_version=r.contract_version AND t.trust_revision=r.trust_revision) AS trusted,
-      v.retired_at IS NULL AND issuer.expires_at>clock_timestamp() AS contract_valid
-      FROM platform_requests r JOIN platform_apps a ON a.id=r.app_id JOIN sessions s ON s.id=a.owner_session_id
+      v.retired_at IS NULL AND issuer.available AS contract_valid
+      FROM platform_requests r JOIN platform_apps a ON a.id=r.app_id JOIN owner_authorities s ON s.id=a.owner_session_id
       JOIN platform_contract_versions v ON v.contract_id=r.contract_id AND v.version=r.contract_version
-      JOIN platform_contracts c ON c.id=v.contract_id JOIN sessions issuer ON issuer.id=c.owner_session_id
+      JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities issuer ON issuer.id=c.owner_session_id
       WHERE r.id=$1 AND r.app_id=$2`,
         [requestId, app.id],
       );

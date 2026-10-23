@@ -46,7 +46,7 @@ export function platformControlRoutes(
   router.get("/platform/contracts", async (request, response) => {
     const rows = await database.query(
       "SELECT id,name,issuer_label,created_at FROM platform_contracts WHERE owner_session_id=$1 ORDER BY created_at DESC LIMIT 32",
-      [request.session!.id],
+      [request.ownerId!],
     );
     response.json({ contracts: rows });
   });
@@ -62,9 +62,12 @@ export function platformControlRoutes(
       "Choose distinct credential groups.",
     );
     const result = await database.transaction(async (tx) => {
+      await tx.query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE", [
+        request.ownerId!,
+      ]);
       const [owner] = await tx.query<{ available: boolean }>(
-        "SELECT expires_at>clock_timestamp() AS available FROM sessions WHERE id=$1 FOR UPDATE",
-        [request.session!.id],
+        "SELECT available FROM owner_authorities WHERE id=$1",
+        [request.ownerId!],
       );
       requireCondition(
         owner?.available,
@@ -74,7 +77,7 @@ export function platformControlRoutes(
       );
       const [count] = await tx.query<{ total: number }>(
         "SELECT count(*)::int AS total FROM platform_contracts WHERE owner_session_id=$1",
-        [request.session!.id],
+        [request.ownerId!],
       );
       requireCondition(
         count.total < 32,
@@ -84,9 +87,9 @@ export function platformControlRoutes(
       );
       const contractId = randomUUID();
       const owned = await tx.query<{ id: string; name: string }>(
-        `SELECT g.id,g.name FROM credential_groups g JOIN sessions s ON s.id=g.owner_session_id
-        WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.expires_at>clock_timestamp() ORDER BY g.id FOR UPDATE OF g`,
-        [groups, request.session!.id],
+        `SELECT g.id,g.name FROM credential_groups g JOIN owner_authorities s ON s.id=g.owner_session_id
+        WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.available ORDER BY g.id FOR UPDATE OF g`,
+        [groups, request.ownerId!],
       );
       requireCondition(
         owned.length === groups.length,
@@ -96,7 +99,7 @@ export function platformControlRoutes(
       );
       await tx.query(
         "INSERT INTO platform_contracts(id,owner_session_id,name,issuer_label) VALUES($1,$2,$3,$4)",
-        [contractId, request.session!.id, input.name, input.issuerLabel],
+        [contractId, request.ownerId!, input.name, input.issuerLabel],
       );
       const digest = platformContractDigest(contractId, 1, groups);
       await tx.query(
@@ -113,7 +116,7 @@ export function platformControlRoutes(
       const contractId = id.parse(request.params.contractId);
       const [owned] = await database.query(
         "SELECT id FROM platform_contracts WHERE id=$1 AND owner_session_id=$2",
-        [contractId, request.session!.id],
+        [contractId, request.ownerId!],
       );
       requireCondition(owned, 404, "CONTRACT_NOT_FOUND", "Contract not found.");
       const versions = await database.query(
@@ -142,7 +145,7 @@ export function platformControlRoutes(
       const result = await database.transaction(async (tx) => {
         const [contract] = await tx.query<{ id: string }>(
           "SELECT id FROM platform_contracts WHERE id=$1 AND owner_session_id=$2 FOR UPDATE",
-          [contractId, request.session!.id],
+          [contractId, request.ownerId!],
         );
         requireCondition(
           contract,
@@ -161,9 +164,9 @@ export function platformControlRoutes(
           "This contract has reached its version limit.",
         );
         const owned = await tx.query<{ id: string; name: string }>(
-          `SELECT g.id,g.name FROM credential_groups g JOIN sessions s ON s.id=g.owner_session_id
-        WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.expires_at>clock_timestamp() ORDER BY g.id FOR UPDATE OF g`,
-          [groups, request.session!.id],
+          `SELECT g.id,g.name FROM credential_groups g JOIN owner_authorities s ON s.id=g.owner_session_id
+        WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.available ORDER BY g.id FOR UPDATE OF g`,
+          [groups, request.ownerId!],
         );
         requireCondition(
           owned.length === groups.length,
@@ -190,7 +193,7 @@ export function platformControlRoutes(
       await database.transaction(async (tx) => {
         const [contract] = await tx.query<{ id: string }>(
           "SELECT id FROM platform_contracts WHERE id=$1 AND owner_session_id=$2 FOR UPDATE",
-          [contractId, request.session!.id],
+          [contractId, request.ownerId!],
         );
         requireCondition(
           contract,
@@ -219,7 +222,7 @@ export function platformControlRoutes(
         ORDER BY t.contract_id,t.contract_version) FILTER (WHERE t.app_id IS NOT NULL),'[]') AS contracts
       FROM platform_apps a LEFT JOIN platform_app_trust t ON t.app_id=a.id
       WHERE a.owner_session_id=$1 GROUP BY a.id ORDER BY a.created_at DESC LIMIT 10`,
-      [request.session!.id],
+      [request.ownerId!],
     );
     response.json({ apps });
   });
@@ -295,9 +298,12 @@ export function platformControlRoutes(
     const secret = randomBytes(32).toString("base64url");
     const appId = randomUUID();
     await database.transaction(async (tx) => {
+      await tx.query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE", [
+        request.ownerId!,
+      ]);
       const [owner] = await tx.query<{ active: boolean }>(
-        "SELECT expires_at>clock_timestamp() AS active FROM sessions WHERE id=$1 FOR UPDATE",
-        [request.session!.id],
+        "SELECT available AS active FROM owner_authorities WHERE id=$1",
+        [request.ownerId!],
       );
       requireCondition(
         owner?.active,
@@ -307,7 +313,7 @@ export function platformControlRoutes(
       );
       const [count] = await tx.query<{ total: number }>(
         "SELECT count(*)::int AS total FROM platform_apps WHERE owner_session_id=$1",
-        [request.session!.id],
+        [request.ownerId!],
       );
       requireCondition(
         count.total < 10,
@@ -317,14 +323,7 @@ export function platformControlRoutes(
       );
       await tx.query(
         "INSERT INTO platform_apps(id,owner_session_id,name,origin,redirect_uris,key_digest) VALUES($1,$2,$3,$4,$5,$6)",
-        [
-          appId,
-          request.session!.id,
-          input.name,
-          origin,
-          redirects,
-          hash(secret),
-        ],
+        [appId, request.ownerId!, input.name, origin, redirects, hash(secret)],
       );
     });
     response.status(201).json({
@@ -341,7 +340,7 @@ export function platformControlRoutes(
     await database.transaction(async (tx) => {
       const [app] = await tx.query<{ id: string }>(
         "SELECT id FROM platform_apps WHERE id=$1 AND owner_session_id=$2 FOR UPDATE",
-        [appId, request.session!.id],
+        [appId, request.ownerId!],
       );
       requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
       const seen = new Set<string>();
@@ -401,7 +400,7 @@ export function platformControlRoutes(
     const appId = id.parse(request.params.appId);
     const [app] = await database.query(
       "SELECT id FROM platform_apps WHERE id=$1 AND owner_session_id=$2",
-      [appId, request.session!.id],
+      [appId, request.ownerId!],
     );
     requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
     const contracts = await database.query(
@@ -418,7 +417,7 @@ export function platformControlRoutes(
       const [app] = await database.query<{ origin: string }>(
         `UPDATE platform_apps SET domain_challenge_digest=$3, domain_challenge_expires_at=clock_timestamp()+interval '15 minutes'
       WHERE id=$1 AND owner_session_id=$2 AND disabled_at IS NULL RETURNING origin`,
-        [appId, request.session!.id, hash(challenge)],
+        [appId, request.ownerId!, hash(challenge)],
       );
       requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
       response.json({
@@ -443,9 +442,9 @@ export function platformControlRoutes(
         active: boolean;
       }>(
         `SELECT a.origin,a.domain_challenge_digest AS challenge_digest,a.domain_challenge_expires_at AS challenge_expires_at,
-      a.domain_challenge_expires_at>clock_timestamp() AND s.expires_at>clock_timestamp() AS active
-      FROM platform_apps a JOIN sessions s ON s.id=a.owner_session_id WHERE a.id=$1 AND a.owner_session_id=$2 AND a.disabled_at IS NULL`,
-        [appId, request.session!.id],
+      a.domain_challenge_expires_at>clock_timestamp() AND s.available AS active
+      FROM platform_apps a JOIN owner_authorities s ON s.id=a.owner_session_id WHERE a.id=$1 AND a.owner_session_id=$2 AND a.disabled_at IS NULL`,
+        [appId, request.ownerId!],
       );
       requireCondition(
         snapshot?.challenge_digest && snapshot.active,
@@ -474,9 +473,9 @@ export function platformControlRoutes(
           active: boolean;
         }>(
           `SELECT a.origin,a.domain_challenge_digest AS challenge_digest,a.domain_challenge_expires_at AS challenge_expires_at,
-        a.domain_challenge_expires_at>clock_timestamp() AND s.expires_at>clock_timestamp() AS active
-        FROM platform_apps a JOIN sessions s ON s.id=a.owner_session_id WHERE a.id=$1 AND a.owner_session_id=$2 AND a.disabled_at IS NULL FOR UPDATE OF a`,
-          [appId, request.session!.id],
+        a.domain_challenge_expires_at>clock_timestamp() AND s.available AS active
+        FROM platform_apps a JOIN owner_authorities s ON s.id=a.owner_session_id WHERE a.id=$1 AND a.owner_session_id=$2 AND a.disabled_at IS NULL FOR UPDATE OF a`,
+          [appId, request.ownerId!],
         );
         requireCondition(
           locked &&
@@ -523,7 +522,7 @@ export function platformControlRoutes(
     const secret = randomBytes(32).toString("base64url");
     const [app] = await database.query<{ id: string; key_generation: number }>(
       "UPDATE platform_apps SET key_digest=$3,key_generation=key_generation+1 WHERE id=$1 AND owner_session_id=$2 AND disabled_at IS NULL RETURNING id,key_generation",
-      [appId, request.session!.id, hash(secret)],
+      [appId, request.ownerId!, hash(secret)],
     );
     requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
     response.json({
@@ -538,7 +537,7 @@ export function platformControlRoutes(
       .parse(request.body ?? {});
     const [app] = await database.query(
       "UPDATE platform_apps SET disabled_at=COALESCE(disabled_at,clock_timestamp()),key_generation=key_generation+1 WHERE id=$1 AND owner_session_id=$2 RETURNING id",
-      [appId, request.session!.id],
+      [appId, request.ownerId!],
     );
     requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
     response.json({ disabled: true });
@@ -556,7 +555,7 @@ export function platformControlRoutes(
     const cursor = cursorSchema.parse(request.query.cursor);
     const [app] = await database.query(
       "SELECT id FROM platform_apps WHERE id=$1 AND owner_session_id=$2",
-      [appId, request.session!.id],
+      [appId, request.ownerId!],
     );
     requireCondition(app, 404, "APP_NOT_FOUND", "Application not found.");
     let before: { createdAt: string; id: string } | undefined;

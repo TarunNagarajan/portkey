@@ -15,7 +15,7 @@ after(async () => {
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
-test('migration 010 upgrades populated migrations 001–009 without changing existing records', async () => {
+test('migrations 010 and 011 upgrade populated migrations 001–009 without changing existing records', async () => {
   directory = await mkdtemp(join(tmpdir(), 'portkey-platform-migration-'));
   database = await openDatabase({ dataDir: directory });
   await database.exec(`CREATE TABLE schema_migrations (
@@ -55,6 +55,12 @@ test('migration 010 upgrades populated migrations 001–009 without changing exi
   assert.deepEqual(room, { title: 'Existing room', status: 'open' });
   assert.deepEqual(membership, { label: 'Existing member', status: 'approved' });
   assert.equal(group.name, 'Existing credential group');
-  assert.equal(migrationRows.length, 10);
-  assert.equal(migrationRows.at(-1)?.name, '010_verification_platform.sql');
+  assert.deepEqual(
+    migrationRows.map(({ name }) => name),
+    [
+      ...migrations,
+      '010_verification_platform.sql',
+      '011_organizer_accounts.sql',
+    ],
+  );
 });

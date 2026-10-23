@@ -76,8 +76,8 @@ export function appAuth(database: Database) {
         disabled_at: Date | null;
         owner_available: boolean;
       }>(
-        `SELECT a.id,a.key_digest,a.key_generation,a.origin,a.disabled_at,s.expires_at>clock_timestamp() AS owner_available
-         FROM platform_apps a JOIN sessions s ON s.id=a.owner_session_id WHERE a.key_digest=$1`,
+        `SELECT a.id,a.key_digest,a.key_generation,a.origin,a.disabled_at,s.available AS owner_available
+         FROM platform_apps a JOIN owner_authorities s ON s.id=a.owner_session_id WHERE a.key_digest=$1`,
         [hash(match[1].slice("pk_live_".length))],
       );
       if (!app || app.disabled_at || !app.owner_available)
@@ -107,9 +107,9 @@ export async function appCurrent(tx: Queries, app: AppAuth) {
     owner_available: boolean;
     verified: boolean;
   }>(
-    `SELECT a.id,a.key_generation,a.origin,a.disabled_at IS NOT NULL AS disabled,s.expires_at>clock_timestamp() AS owner_available,
+    `SELECT a.id,a.key_generation,a.origin,a.disabled_at IS NOT NULL AS disabled,s.available AS owner_available,
       a.domain_verified_at>clock_timestamp()-interval '24 hours' AS verified
-     FROM platform_apps a JOIN sessions s ON s.id=a.owner_session_id WHERE a.id=$1 FOR UPDATE OF a`,
+     FROM platform_apps a JOIN owner_authorities s ON s.id=a.owner_session_id WHERE a.id=$1 FOR UPDATE OF a`,
     [app.id],
   );
   requireCondition(
@@ -144,9 +144,9 @@ export async function trustedContract(
     trust_revision: string;
   }>(
     `SELECT v.contract_id AS id,v.version,v.description,v.group_ids,v.digest,v.retired_at,c.issuer_label,c.name AS contract_name,
-      s.expires_at>clock_timestamp() AS available,t.trust_revision
+      s.available AS available,t.trust_revision
      FROM platform_app_trust t JOIN platform_contract_versions v ON v.contract_id=t.contract_id AND v.version=t.contract_version
-     JOIN platform_contracts c ON c.id=v.contract_id JOIN sessions s ON s.id=c.owner_session_id
+     JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id
      WHERE t.app_id=$1 AND t.contract_id=$2 AND t.contract_version=$3 FOR UPDATE OF v`,
     [appId, contractId, version],
   );
@@ -189,8 +189,8 @@ export async function lockRequestAuthority(
     origin: string;
   }>(
     `SELECT a.id,a.key_generation,a.disabled_at IS NOT NULL AS disabled,
-     a.domain_verified_at>clock_timestamp()-interval '24 hours' AS domain_valid,s.expires_at>clock_timestamp() AS app_owner_valid,a.origin
-     FROM platform_apps a JOIN sessions s ON s.id=a.owner_session_id WHERE a.id=$1 FOR UPDATE OF a`,
+     a.domain_verified_at>clock_timestamp()-interval '24 hours' AS domain_valid,s.available AS app_owner_valid,a.origin
+     FROM platform_apps a JOIN owner_authorities s ON s.id=a.owner_session_id WHERE a.id=$1 FOR UPDATE OF a`,
     [head.app_id],
   );
   requireCondition(
@@ -213,8 +213,8 @@ export async function lockRequestAuthority(
     contract_name: string;
     issuer_label: string;
   }>(
-    `SELECT v.retired_at IS NOT NULL AS retired,s.expires_at>clock_timestamp() AS issuer_valid,v.digest,v.group_ids,v.description,c.name AS contract_name,c.issuer_label
-     FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN sessions s ON s.id=c.owner_session_id
+    `SELECT v.retired_at IS NOT NULL AS retired,s.available AS issuer_valid,v.digest,v.group_ids,v.description,c.name AS contract_name,c.issuer_label
+     FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id
      WHERE v.contract_id=$1 AND v.version=$2 FOR UPDATE OF v`,
     [head.contract_id, head.contract_version],
   );
@@ -274,17 +274,17 @@ export async function lockRequestAuthority(
     `SELECT a.disabled_at IS NULL
        AND a.key_generation=$2
        AND a.domain_verified_at>clock_timestamp()-interval '24 hours'
-       AND app_owner.expires_at>clock_timestamp()
-       AND issuer.expires_at>clock_timestamp()
+       AND app_owner.available
+       AND issuer.available
        AND v.retired_at IS NULL
        AND r.expires_at>clock_timestamp()
        AND EXISTS (SELECT 1 FROM platform_app_trust t WHERE t.app_id=r.app_id AND t.contract_id=r.contract_id AND t.contract_version=r.contract_version AND t.trust_revision=r.trust_revision) AS current
      FROM platform_requests r
      JOIN platform_apps a ON a.id=r.app_id
-     JOIN sessions app_owner ON app_owner.id=a.owner_session_id
+     JOIN owner_authorities app_owner ON app_owner.id=a.owner_session_id
      JOIN platform_contract_versions v ON v.contract_id=r.contract_id AND v.version=r.contract_version
      JOIN platform_contracts c ON c.id=v.contract_id
-     JOIN sessions issuer ON issuer.id=c.owner_session_id
+     JOIN owner_authorities issuer ON issuer.id=c.owner_session_id
      WHERE r.id=$1 AND r.app_id=$3`,
     [requestId, app.key_generation, head.app_id],
   );
