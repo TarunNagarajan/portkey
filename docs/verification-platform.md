@@ -14,7 +14,7 @@ The two relying applications run separate backends and use distinct host-only co
 
 ## Setup
 
-Create an issuer-owned credential group and publish a contract version from **Applications** in Portkey. Register the relying application's exact HTTPS origin and one to three same-origin callback URLs. Host the issued `{ "appId": "…", "challenge": "…" }` JSON at the provided `/.well-known/portkey-app.json` address, then ask Portkey to verify it. Verification lasts 24 hours. Pin the exact published contract version in the application settings. The app owner and issuer owner are separate 30-day browser sessions. This prototype has no sign-in, renewal, or ownership migration; when an owner session expires, its apps or contracts become unavailable and must be recreated under a new session.
+Create an issuer-owned credential group and publish a contract version from **Applications** in Portkey. Register the relying application's exact HTTPS origin and one to three same-origin callback URLs. Host the issued `{ "appId": "…", "challenge": "…" }` JSON at the provided `/.well-known/portkey-app.json` address, then ask Portkey to verify it. Verification lasts 24 hours. Pin the exact published contract version in the application settings. Guest-owned apps and contracts remain available for the lifetime of their 30-day browser session. Creating an organizer account explicitly adopts that browser's current workspace, including its apps and contracts; account ownership persists across sign-outs and seven-day organizer sign-ins. Signing into an existing account does not adopt another guest workspace.
 
 The application API key is shown once. Store it in a backend secret manager or environment variable, never in a browser bundle, URL, local storage, log, or source control. Rotating the key increments its generation and immediately invalidates the old key and all requests created under the old generation. Disabling an app is permanent. Removing a trust pin permanently invalidates every unexchanged request created under that pin. Re-adding the same contract version creates a new trust revision and does not revive those requests; unchanged pins keep their revision when another pin is added or removed. Retiring a contract version blocks new requests and invalidates unexchanged results.
 
@@ -114,7 +114,7 @@ Adapt the session save/claim to the application's session store; the delete must
 }
 ```
 
-The API returns `201` with `{ "requestId": "…", "walletUrl": "https://portkey.example/prove/<request UUID>#request=<capability>", "expiresAt": "…" }`. Requests last up to five minutes and are clipped to any remaining guest-owner expiry; account-owned apps and contracts have no guest-session expiry to clip against. The 24-hour app-domain verification, five-minute request, signing-key generation, and trust-revision checks still apply. The API allows at most 1,000 unexpired pending or verified requests and 10,000 retained requests per app. Rate limits also apply. `GET /v1/proof-requests/:requestId` returns safe status and contract metadata only.
+The API returns `201` with `{ "requestId": "…", "walletUrl": "https://portkey.example/prove/<request UUID>#request=<capability>", "expiresAt": "…" }`. Requests last up to five minutes and are clipped to any remaining guest-owner expiry; account-owned apps and contracts have no guest-session expiry to clip against. The 24-hour app-domain verification, five-minute request, application API-key generation, and trust-revision checks still apply. The API allows at most 1,000 unexpired pending or verified requests and 10,000 retained requests per app. Rate limits also apply. `GET /v1/proof-requests/:requestId` returns safe status and contract metadata only.
 
 After the user proves membership, the app backend calls `POST /v1/proof-requests/:requestId/exchange` with the returned code and original verifier:
 
@@ -132,6 +132,8 @@ The wallet routes are session, origin, and CSRF protected under `/api/platform/w
 ## Organizer accounts and ownership
 
 Organizer accounts use discoverable, user-verified passkeys. Creating an account explicitly adopts the current unclaimed browser workspace; signing into an existing account never merges unrelated guest resources. Guest workspaces expire with their 30-day browser session, while adopted ownership persists across seven-day organizer sign-ins. Existing room, group, contract, application, invitation, trust, signing-key and recipient-key identifiers remain attached to the original stable ownership anchor.
+
+Passkeys are tied to the configured site hostname. If the hostname changes, enroll a new passkey while signed in when possible. If the database and recovery key are retained, recovery at the new configured origin can also replace the old passkeys with a new one. Recovery does not restore browser-local inbox decryption keys or attendee credentials; encrypted key backup remains separate.
 
 Recovery requires the one-time recovery key and a replacement passkey. Recovery replaces all old passkeys and revokes every organizer sign-in session. It does not restore browser-local inbox decryption keys or attendee proof credentials; encrypted key backup remains separate. Passkeys belong to the configured Portkey hostname, so a changed tunnel or deployment domain requires enrolling a new passkey while account access is available.
 
