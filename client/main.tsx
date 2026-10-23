@@ -17,6 +17,7 @@ import "./styles.css";
 import { PlatformPage } from "./PlatformPage.js";
 import { WalletProofPage } from "./WalletProofPage.js";
 import { PublicContractPage } from "./PublicContractPage.js";
+import { AccountPage } from "./AccountPage.js";
 
 function App() {
   const [ready, setReady] = useState(false);
@@ -56,6 +57,7 @@ function App() {
   const groupList = path === "/credential-groups";
   const wallet = path === "/my-credentials";
   const platform = path === "/platform";
+  const account = path === "/account";
   const proofRequest = path.match(/^\/prove\/([0-9a-f-]+)$/i);
   return (
     <div className="app-layout">
@@ -99,11 +101,20 @@ function App() {
           >
             Applications
           </a>
+          <a
+            className={account ? "nav-item selected" : "nav-item"}
+            href="/account"
+          >
+            Account
+          </a>
         </nav>
         <div className="sidebar-note">
           <Icon name="shield" />
-          <strong>Access stays with this browser.</strong>
-          <p>Keep this browser’s cookies to retain access to your rooms.</p>
+          <strong>Protect organizer access.</strong>
+          <p>
+            Create a passkey account to manage the same workspace across
+            browsers.
+          </p>
         </div>
       </aside>
       <div className="workspace">
@@ -116,17 +127,19 @@ function App() {
                 ? "Application request"
                 : platform
                   ? "Applications"
-                  : credentialEnrollment
-                    ? "Credential enrollment"
-                    : credentialGroup || groupList
-                      ? "Credential groups"
-                      : wallet
-                        ? "My credentials"
-                        : join
-                          ? "Join room"
-                          : room
-                            ? "Room overview"
-                            : "Rooms"}
+                  : account
+                    ? "Account"
+                    : credentialEnrollment
+                      ? "Credential enrollment"
+                      : credentialGroup || groupList
+                        ? "Credential groups"
+                        : wallet
+                          ? "My credentials"
+                          : join
+                            ? "Join room"
+                            : room
+                              ? "Room overview"
+                              : "Rooms"}
           </span>
           {ready && (
             <span className="session-indicator">
@@ -161,6 +174,8 @@ function App() {
             <WalletProofPage requestId={proofRequest[1]} />
           ) : platform ? (
             <PlatformPage />
+          ) : account ? (
+            <AccountPage />
           ) : room ? (
             <RoomPage id={room[1]} />
           ) : join ? (

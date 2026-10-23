@@ -114,7 +114,7 @@ Adapt the session save/claim to the application's session store; the delete must
 }
 ```
 
-The API returns `201` with `{ "requestId": "…", "walletUrl": "https://portkey.example/prove/<request UUID>#request=<capability>", "expiresAt": "…" }`. Requests last up to five minutes and are clipped to app-owner and issuer-session expiry. The API allows at most 1,000 unexpired pending or verified requests and 10,000 retained requests per app. Rate limits also apply. `GET /v1/proof-requests/:requestId` returns safe status and contract metadata only.
+The API returns `201` with `{ "requestId": "…", "walletUrl": "https://portkey.example/prove/<request UUID>#request=<capability>", "expiresAt": "…" }`. Requests last up to five minutes and are clipped to any remaining guest-owner expiry; account-owned apps and contracts have no guest-session expiry to clip against. The 24-hour app-domain verification, five-minute request, signing-key generation, and trust-revision checks still apply. The API allows at most 1,000 unexpired pending or verified requests and 10,000 retained requests per app. Rate limits also apply. `GET /v1/proof-requests/:requestId` returns safe status and contract metadata only.
 
 After the user proves membership, the app backend calls `POST /v1/proof-requests/:requestId/exchange` with the returned code and original verifier:
 
@@ -128,6 +128,12 @@ After the user proves membership, the app backend calls `POST /v1/proof-requests
 The endpoint consumes the short-lived code once and returns `{ "receipt": "<compact JWS>", "claims": { … } }`. `client.exchange(requestId, code, codeVerifier, expectation)` validates the PKCE binding, fetches JWKS only from the configured Portkey origin, and verifies the Ed25519 signature plus exact issuer, app audience, request, contract version, and digest. The SDK rejects extra or missing claims, unsupported algorithms, malformed keys, expired receipts, and oversized or slow responses. The claim set contains the Portkey issuer, application audience, random receipt ID, request and contract metadata, `result: true`, and issue/expiry times. It has no stable user identifier, credential ID, commitment, nullifier, name, or raw state. Receipts expire within five minutes. A signed receipt is a service assertion, not a trustless statement about Portkey's honesty.
 
 The wallet routes are session, origin, and CSRF protected under `/api/platform/wallet/proof-requests/:requestId`. A capability is placed in the wallet URL fragment and stored server-side only as a digest. A normal GET or preview does not consent or create a proof. The browser creates a real Semaphore proof locally, and the server verifies it through the same bounded proof-verification gate used by Portkey rooms.
+
+## Organizer accounts and ownership
+
+Organizer accounts use discoverable, user-verified passkeys. Creating an account explicitly adopts the current unclaimed browser workspace; signing into an existing account never merges unrelated guest resources. Guest workspaces expire with their 30-day browser session, while adopted ownership persists across seven-day organizer sign-ins. Existing room, group, contract, application, invitation, trust, signing-key and recipient-key identifiers remain attached to the original stable ownership anchor.
+
+Recovery requires the one-time recovery key and a replacement passkey. Recovery replaces all old passkeys and revokes every organizer sign-in session. It does not restore browser-local inbox decryption keys or attendee proof credentials; encrypted key backup remains separate. Passkeys belong to the configured Portkey hostname, so a changed tunnel or deployment domain requires enrolling a new passkey while account access is available.
 
 ## Public contract and keys
 

@@ -93,12 +93,12 @@ export function platformWalletRoutes(
         trusted: boolean;
       }>(
         `SELECT r.id,r.app_id,a.name,a.origin,r.redirect_uri,r.contract_id,r.contract_version,c.name AS contract_name,c.issuer_label,v.description,v.digest,v.group_ids,r.expires_at,
-       r.expires_at>clock_timestamp() AS request_active,s.expires_at>clock_timestamp() AS available,v.retired_at IS NOT NULL AS retired,r.status,r.wallet_session_id,r.key_generation,
+       r.expires_at>clock_timestamp() AS request_active,s.available AS available,v.retired_at IS NOT NULL AS retired,r.status,r.wallet_session_id,r.key_generation,
        a.key_generation=r.key_generation AND a.disabled_at IS NULL AND a.domain_verified_at>clock_timestamp()-interval '24 hours' AS domain_valid,
-       appOwner.expires_at>clock_timestamp() AS app_owner_valid,
+       appOwner.available AS app_owner_valid,
        EXISTS(SELECT 1 FROM platform_app_trust t WHERE t.app_id=a.id AND t.contract_id=r.contract_id AND t.contract_version=r.contract_version AND t.trust_revision=r.trust_revision) AS trusted
-       FROM platform_requests r JOIN platform_apps a ON a.id=r.app_id JOIN sessions appOwner ON appOwner.id=a.owner_session_id
-       JOIN platform_contract_versions v ON v.contract_id=r.contract_id AND v.version=r.contract_version JOIN platform_contracts c ON c.id=v.contract_id JOIN sessions s ON s.id=c.owner_session_id
+       FROM platform_requests r JOIN platform_apps a ON a.id=r.app_id JOIN owner_authorities appOwner ON appOwner.id=a.owner_session_id
+       JOIN platform_contract_versions v ON v.contract_id=r.contract_id AND v.version=r.contract_version JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id
        WHERE r.id=$1 AND r.capability_digest=$2`,
         [requestId, hash(capability)],
       );
@@ -167,8 +167,8 @@ export function platformWalletRoutes(
           "This request is unavailable or expired.",
         );
         const groups = await tx.query<{ commitment: string }>(
-          `SELECT DISTINCT m.commitment FROM credential_group_commitments m JOIN credential_groups g ON g.id=m.group_id JOIN sessions s ON s.id=g.owner_session_id
-        WHERE m.group_id=ANY($1::uuid[]) AND s.expires_at>clock_timestamp() ORDER BY m.commitment LIMIT 1001`,
+          `SELECT DISTINCT m.commitment FROM credential_group_commitments m JOIN credential_groups g ON g.id=m.group_id JOIN owner_authorities s ON s.id=g.owner_session_id
+        WHERE m.group_id=ANY($1::uuid[]) AND s.available ORDER BY m.commitment LIMIT 1001`,
           [contract.group_ids],
         );
         requireCondition(

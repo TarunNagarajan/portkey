@@ -36,7 +36,9 @@ A pass is a room-bound bearer capability, not verified identity or a zero-knowle
 
 The workspace shows room counts and lets you search titles/descriptions or filter by lifecycle status. Use an owned room as a template for another event: its title and description are prefilled, you choose a fresh deadline, and a new draft is created with a new invitation. Memberships and approvals are never copied. Closed and expired rooms can be reused without reopening the original.
 
-The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process; passes are for distributing entry through a channel the organizer trusts.
+Anyone can start a 30-day guest browser session and organize a room without a name, email, roll number, or external ID. Rooms last at most seven days. Guest ownership expires with that browser session. Organizers can create a passkey account from **Account** and explicitly adopt the workspace shown for that browser. Account ownership remains available after the original guest session expires; each organizer sign-in lasts seven days. Signing into an existing account never adopts unrelated guest work. Attendee labels remain self-asserted and are not verified identity.
+
+Organizer accounts use discoverable passkeys with user verification and a separate recovery key. Save the recovery key when it is shown; losing every passkey and that key means the account cannot be recovered. Recovery replaces all existing passkeys and signs out other organizer sessions. It does not restore browser-local inbox decryption keys or attendee proof credentials; use the encrypted key backup for inbox keys. Passkeys are tied to Portkey’s configured site hostname, so changing a tunnel or domain requires enrolling a new passkey while you still have access.
 
 Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; room expiry separately triggers submission cleanup for rooms whose cleanup policy is enabled.
 
@@ -84,7 +86,7 @@ Coordinates and accuracy are stored on the membership so the organizer can see w
 
 ## Database and access boundaries
 
-`sessions` contains hashed browser credentials and their expiry. `rooms` belongs to one organizer session and has a unique random join address. `memberships` links one browser session to one room with a pending, approved, denied, or revoked status. `schema_migrations` records applied SQL and checksums. Foreign keys, uniqueness, checks and indexes are defined in `server/migrations/001_initial.sql`.
+`sessions` contains hashed guest browser credentials and their expiry. `organizer_accounts` links an account to its immutable original ownership anchor; finite organizer sign-in sessions and public passkey credentials are stored separately. Rooms and organizer resources retain their existing owner IDs, while memberships and attendee proofs continue to use actual browser session IDs. `schema_migrations` records applied SQL and checksums.
 
 The public join page exposes only title, description, effective status and deadline, plus the caller's own membership state and admission policy. Private room entry requires approved membership. Only the room owner can edit metadata, change lifecycle, inspect requests or decide membership. Approval, pass redemption and lifecycle changes lock the room in a transaction so concurrent requests cannot bypass closure or reuse a pass. Revoked and denied sessions cannot request or redeem access again to that room. A new browser session can request again, so this prototype does not implement a human-level ban.
 
@@ -92,45 +94,56 @@ Writes require the configured Origin and a CSRF token derived from the session s
 
 ## API
 
-Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Preserve its cookie and use the returned `csrfToken` as `X-CSRF-Token` on subsequent writes. All remaining room routes require a valid session.
+Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Preserve its cookie and use the returned `csrfToken` as `X-CSRF-Token` on subsequent writes. Account enrollment requires an active guest session, explicit workspace adoption, and an actual user-verified passkey ceremony.
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| GET | `/api/health` | Database readiness |
-| POST | `/api/session` | Start or reuse a browser session |
-| GET | `/api/rooms` | List the caller's owned/requested rooms |
-| POST | `/api/rooms` | Create a draft |
-| POST | `/api/rooms/:id/duplicate` | Create an owner-only draft from a room template |
-| GET | `/api/rooms/:id` | Read owner or approved-participant room details |
-| PATCH | `/api/rooms/:id` | Replace title, description and expiry |
-| POST | `/api/rooms/:id/open` | Open a draft |
-| POST | `/api/rooms/:id/close` | Close a draft or open room |
-| POST | `/api/rooms/:id/submission-cleanup` | Owner enables irreversible automatic cleanup with an empty JSON object |
-| GET | `/api/join/:code` | Read public room details and own admission state |
-| POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` and, for a restricted room, `{ lat, lng, accuracyM, timestamp }` |
-| POST | `/api/join/:code/redeem` | Redeem `{ token, label }` and, for a restricted room, the same location fields; pass rooms do not accept ordinary access requests |
-| GET | `/api/rooms/:id/passes` | Owner reads pass number, status and timestamps; tokens are never returned |
-| POST | `/api/rooms/:id/passes` | Owner issues `{ "count": 1 }` through `{ "count": 20 }`; raw tokens appear only in this response |
-| PATCH | `/api/rooms/:id/passes/:passId` | Owner revokes an unused pass with `{ "status": "revoked" }` |
-| GET/POST | `/api/rooms/:id/enrollments` | Owner reads enrollment-link status/counts or issues `{ "count": 1 }` through `{ "count": 20 }` one-use links |
-| PATCH | `/api/rooms/:id/enrollments/:inviteId` | Owner revokes an unused enrollment link with `{ "status": "revoked" }` |
-| POST | `/api/join/:code/enroll` | Save `{ "token", "commitment" }` for a proof-policy room; this does not grant access |
-| POST | `/api/join/:code/proof-challenge` | Get the short-lived proof challenge and pinned commitment snapshot |
-| POST | `/api/join/:code/prove` | Verify `{ "challengeId", "proof" }` and atomically admit the browser session |
-| GET | `/api/geo/search` | Search places for a room area with `?q=Warangal` |
-| POST | `/api/rooms/:id/geo` | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }` |
-| DELETE | `/api/rooms/:id/geo` | Owner clears a draft room's area |
-| GET | `/api/rooms/:id/members` | List requests for the owner |
-| GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
-| PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |
-| GET | `/api/rooms/:id/submissions/keys` | Read public recipient keys for the owner or approved participant |
-| POST | `/api/rooms/:id/submissions/owner-key` | Register the immutable organizer public key |
-| POST | `/api/rooms/:id/submissions/submitter-key` | Register the current browser's immutable submitter public key |
-| POST/PUT | `/api/rooms/:id/submissions` and `/api/rooms/:id/submissions/:submissionId/metadata` | Start an encrypted upload and set its encrypted descriptor and recipient envelopes |
-| PUT/POST | `/api/rooms/:id/submissions/:submissionId/chunks/:index` and `/complete` | Store immutable encrypted chunks and finalize a verified receipt |
-| GET | `/api/rooms/:id/submissions` | Read a private, paginated list of completed submissions |
-| GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
-| DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
+| Method   | Endpoint                                                                             | Purpose                                                                                                                           |
+| -------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| GET      | `/api/health`                                                                        | Database readiness                                                                                                                |
+| POST     | `/api/session`                                                                       | Start or reuse a browser session                                                                                                  |
+| GET      | `/api/account/status`                                                                | Read safe workspace counts and account status                                                                                     |
+| POST     | `/api/account/signup/options` and `/verify`                                          | Explicitly adopt this guest workspace with a new passkey                                                                          |
+| POST     | `/api/account/login/options` and `/verify`                                           | Sign in with a discoverable passkey                                                                                               |
+| POST     | `/api/account/recovery/options` and `/verify`                                        | Replace all account passkeys using the recovery key and a new passkey                                                             |
+| GET      | `/api/account/passkeys`                                                              | List safe passkey metadata                                                                                                        |
+| POST     | `/api/account/passkeys/options` and `/verify`                                        | Add a passkey after recent passkey verification                                                                                   |
+| DELETE   | `/api/account/passkeys/:credentialId`                                                | Remove a passkey after recent verification, keeping at least one                                                                  |
+| POST     | `/api/account/recovery/rotate`                                                       | Rotate the one-time recovery key after recent verification                                                                        |
+| GET      | `/api/account/sessions`                                                              | List this account's active sign-in sessions                                                                                       |
+| POST     | `/api/account/sessions/:id/revoke`                                                   | Revoke one of this account's other sessions                                                                                       |
+| POST     | `/api/account/logout`                                                                | Revoke the current organizer sign-in                                                                                              |
+| GET      | `/api/rooms`                                                                         | List the caller's owned/requested rooms                                                                                           |
+| POST     | `/api/rooms`                                                                         | Create a draft                                                                                                                    |
+| POST     | `/api/rooms/:id/duplicate`                                                           | Create an owner-only draft from a room template                                                                                   |
+| GET      | `/api/rooms/:id`                                                                     | Read owner or approved-participant room details                                                                                   |
+| PATCH    | `/api/rooms/:id`                                                                     | Replace title, description and expiry                                                                                             |
+| POST     | `/api/rooms/:id/open`                                                                | Open a draft                                                                                                                      |
+| POST     | `/api/rooms/:id/close`                                                               | Close a draft or open room                                                                                                        |
+| POST     | `/api/rooms/:id/submission-cleanup`                                                  | Owner enables irreversible automatic cleanup with an empty JSON object                                                            |
+| GET      | `/api/join/:code`                                                                    | Read public room details and own admission state                                                                                  |
+| POST     | `/api/join/:code`                                                                    | Request access with `{ "label": "Team Cedar" }` and, for a restricted room, `{ lat, lng, accuracyM, timestamp }`                  |
+| POST     | `/api/join/:code/redeem`                                                             | Redeem `{ token, label }` and, for a restricted room, the same location fields; pass rooms do not accept ordinary access requests |
+| GET      | `/api/rooms/:id/passes`                                                              | Owner reads pass number, status and timestamps; tokens are never returned                                                         |
+| POST     | `/api/rooms/:id/passes`                                                              | Owner issues `{ "count": 1 }` through `{ "count": 20 }`; raw tokens appear only in this response                                  |
+| PATCH    | `/api/rooms/:id/passes/:passId`                                                      | Owner revokes an unused pass with `{ "status": "revoked" }`                                                                       |
+| GET/POST | `/api/rooms/:id/enrollments`                                                         | Owner reads enrollment-link status/counts or issues `{ "count": 1 }` through `{ "count": 20 }` one-use links                      |
+| PATCH    | `/api/rooms/:id/enrollments/:inviteId`                                               | Owner revokes an unused enrollment link with `{ "status": "revoked" }`                                                            |
+| POST     | `/api/join/:code/enroll`                                                             | Save `{ "token", "commitment" }` for a proof-policy room; this does not grant access                                              |
+| POST     | `/api/join/:code/proof-challenge`                                                    | Get the short-lived proof challenge and pinned commitment snapshot                                                                |
+| POST     | `/api/join/:code/prove`                                                              | Verify `{ "challengeId", "proof" }` and atomically admit the browser session                                                      |
+| GET      | `/api/geo/search`                                                                    | Search places for a room area with `?q=Warangal`                                                                                  |
+| POST     | `/api/rooms/:id/geo`                                                                 | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }`                                                      |
+| DELETE   | `/api/rooms/:id/geo`                                                                 | Owner clears a draft room's area                                                                                                  |
+| GET      | `/api/rooms/:id/members`                                                             | List requests for the owner                                                                                                       |
+| GET      | `/api/rooms/:id/activity`                                                            | Read paginated organizer-only activity                                                                                            |
+| PATCH    | `/api/rooms/:id/members/:memberId`                                                   | Decide `{ "status": "approved" }`, `denied`, or `revoked`                                                                         |
+| GET      | `/api/rooms/:id/submissions/keys`                                                    | Read public recipient keys for the owner or approved participant                                                                  |
+| POST     | `/api/rooms/:id/submissions/owner-key`                                               | Register the immutable organizer public key                                                                                       |
+| POST     | `/api/rooms/:id/submissions/submitter-key`                                           | Register the current browser's immutable submitter public key                                                                     |
+| POST/PUT | `/api/rooms/:id/submissions` and `/api/rooms/:id/submissions/:submissionId/metadata` | Start an encrypted upload and set its encrypted descriptor and recipient envelopes                                                |
+| PUT/POST | `/api/rooms/:id/submissions/:submissionId/chunks/:index` and `/complete`             | Store immutable encrypted chunks and finalize a verified receipt                                                                  |
+| GET      | `/api/rooms/:id/submissions`                                                         | Read a private, paginated list of completed submissions                                                                           |
+| GET      | `/api/rooms/:id/submissions/:submissionId/chunks/:index`                             | Retrieve one authorized encrypted chunk                                                                                           |
+| DELETE   | `/api/rooms/:id/submissions/:submissionId`                                           | Discard an incomplete upload                                                                                                      |
 
 Creation and metadata edits accept `title`, `description`, an ISO timestamp `expiresAt` with an offset, and optional `admissionPolicy` (`approval`, `pass`, or `proof`). Omitted policy defaults to approval on creation and preserves the current value on edits. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
 
@@ -156,7 +169,7 @@ Use **Credential groups** to enroll a browser once and reuse that credential in 
 
 Reusable groups and legacy room enrollment links are separate sources. A room cannot attach a reusable rule after room specific enrollment links have been issued. Clearing a reusable rule returns a draft room to its room specific enrollment flow. Duplicating a proof room reuses its group rule, but starts with fresh room scope and copies no invitation links, commitments, memberships, or participant keys. A reusable credential can therefore prove separately in multiple rooms; each room records its own admission and nullifier.
 
-The fixed Semaphore adapter accepts a union of at most 1,000 commitments (depth 10). An organizer session can own up to 32 groups; each group permits at most 250 enrollment links over its lifetime and each issuance request can create up to 20. Groups remain tied to the organizer browser session, which expires after 30 days. They are not permanent accounts or portable wallets. The organizer can see the group’s enrolled commitments and invitation status; unused links can be revoked. Revoking an enrollment link does not remove existing room access or invalidate a credential already enrolled. Room admission removal blocks that browser session while the room’s permanent nullifier prevents replay from a fresh session.
+The fixed Semaphore adapter accepts a union of at most 1,000 commitments (depth 10). An organizer account can own up to 32 groups; each group permits at most 250 enrollment links over its lifetime and each issuance request can create up to 20. Guest-owned groups follow the 30-day guest session expiry; account-owned groups remain available across sign-ins. The organizer can see the group’s enrolled commitments and invitation status; unused links can be revoked. Revoking an enrollment link does not remove existing room access or invalidate a credential already enrolled. Room admission removal blocks that browser session while the room’s permanent nullifier prevents replay from a fresh session.
 
 The reusable-group flow has the same privacy limits as room-specific proof admission. The organizer learns which commitment enrolled in a group, and can link enrollment activity to that commitment. The proof hides which member of the combined union qualified, but public group names, small or exclusive groups, browser sessions, timing, IP addresses, and network activity can reveal or correlate participation. A proof establishes membership of at least one selected group; it does not establish identity, attendance, uniqueness, or one credential per person. Credentials are stored for this browser origin; changing the temporary demo address does not carry them over. Clearing site data loses them, and there is no recovery or transfer. Do not describe the system as anonymous or unlinkable.
 

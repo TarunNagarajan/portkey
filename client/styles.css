@@ -1468,3 +1468,88 @@ footer {
     max-width: 100%;
   }
 }
+.account-page {
+  max-width: 760px;
+  margin: 0 auto;
+}
+.account-card,
+.recovery-panel {
+  background: var(--surface, #fff);
+  border: 1px solid var(--line, #dfe3e8);
+  border-radius: 14px;
+  padding: 22px;
+  margin: 18px 0;
+}
+.account-card > label {
+  display: grid;
+  gap: 7px;
+  margin: 14px 0;
+}
+.account-card input:not([type="checkbox"]) {
+  max-width: 420px;
+  padding: 10px;
+  border: 1px solid var(--line, #dfe3e8);
+  border-radius: 8px;
+}
+.checkbox-row {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 9px !important;
+}
+.checkbox-row input[type="checkbox"] {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 0;
+  margin-top: 3px;
+}
+.button-row,
+.passkey-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 14px 0;
+}
+.passkey-row {
+  justify-content: space-between;
+  border-top: 1px solid var(--line, #dfe3e8);
+  padding: 12px 0;
+}
+.passkey-row span {
+  display: grid;
+  gap: 5px;
+}
+.passkey-row small,
+.muted {
+  color: var(--muted, #657080);
+}
+.recovery-panel {
+  position: fixed;
+  z-index: 20;
+  inset: 12% max(16px, calc((100vw - 700px) / 2)) auto;
+  box-shadow: 0 16px 60px #1e293b40;
+  max-width: 700px;
+  width: calc(100% - 32px);
+  max-height: 80vh;
+  overflow: auto;
+}
+.recovery-panel::backdrop {
+  background: #0f172a80;
+}
+.recovery-panel code {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 14px;
+  background: #f3f5f7;
+  border-radius: 8px;
+}
+@media (max-width: 600px) {
+  .account-card,
+  .recovery-panel {
+    padding: 16px;
+  }
+  .recovery-panel {
+    inset: 8% 12px auto;
+    width: calc(100% - 24px);
+  }
+}
