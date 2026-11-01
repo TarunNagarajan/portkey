@@ -92,10 +92,10 @@ export function RoomForm({
       </p>
       {isCreate && (
         <p className="muted">
-          Encrypted submissions are automatically removed after this deadline, usually within a
-          minute while running and longer with a backlog or downtime. Room activity, membership and
-          public keys remain. Unfinished uploads are removed after 24 hours; backups and copies
-          saved by recipients are not erased.
+          Encrypted private submissions and shared files are automatically removed after this
+          deadline, usually within a minute while running and longer with a backlog or downtime.
+          Room activity, membership and public keys remain. Unfinished uploads are removed after
+          24 hours; backups and copies saved by recipients are not erased.
         </p>
       )}
       {error && (

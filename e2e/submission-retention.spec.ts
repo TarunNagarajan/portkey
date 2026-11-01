@@ -4,18 +4,18 @@ test('submission retention is disclosed on creation and join, and historical opt
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/');
   await expect(page.getByLabel('Room title')).toBeVisible();
-  await expect(page.getByText('Encrypted submissions are automatically removed after this deadline', { exact: false })).toBeVisible();
+  await expect(page.getByText('Encrypted private submissions and shared files are automatically removed after this deadline', { exact: false })).toBeVisible();
   await page.getByLabel('Room title').fill('Retention workflow');
   await page.getByRole('button', { name: 'Create draft' }).click();
   await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
   const roomId = new URL(page.url()).pathname.split('/').at(-1)!;
-  await expect(page.getByText('Completed encrypted submissions are scheduled for removal after the room deadline', { exact: false })).toBeVisible();
+  await expect(page.getByText('Completed encrypted private submissions and shared files are scheduled for removal after the room deadline', { exact: false })).toBeVisible();
   const joinCode = await page.evaluate(async (id) => {
     const response = await fetch('/api/rooms/' + id);
     return (await response.json()).joinCode as string;
   }, roomId);
   await page.goto('/join/' + joinCode);
-  await expect(page.getByText('Completed encrypted submissions are scheduled for removal after this deadline', { exact: false })).toBeVisible();
+  await expect(page.getByText('Completed encrypted private submissions and shared files are scheduled for removal after this deadline', { exact: false })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   const joinCard = page.locator('.join-page');
   expect((await joinCard.boundingBox())!.width).toBeLessThanOrEqual(390);
@@ -54,7 +54,7 @@ test('submission retention is disclosed on creation and join, and historical opt
   await page.screenshot({ path: 'test-results/submission-retention-desktop.png', fullPage: true });
   completed = true;
   await page.reload();
-  await expect(page.getByText('The server removed this room’s encrypted submissions after its deadline.', { exact: true })).toBeVisible();
+  await expect(page.getByText('The server removed this room’s encrypted private submissions and shared files after its deadline.', { exact: true })).toBeVisible();
   await page.goto('/?template=' + roomId + '#new-room');
-  await expect(page.getByText('Encrypted submissions are automatically removed after this deadline', { exact: false })).toBeVisible();
+  await expect(page.getByText('Encrypted private submissions and shared files are automatically removed after this deadline', { exact: false })).toBeVisible();
 });

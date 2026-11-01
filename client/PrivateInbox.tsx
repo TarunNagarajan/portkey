@@ -356,7 +356,7 @@ export function PrivateInbox({
 
   useEffect(() => {
     void loadState();
-  }, [room.id, room.role, room.status, invitationHash]);
+  }, [room.id, room.role, invitationHash]);
 
   async function enableInbox() {
     setBusy(true);

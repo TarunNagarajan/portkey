@@ -78,8 +78,12 @@ export function RoomFiles({
   const refreshLock = useRef(false);
   const loadedOlderPages = useRef(false);
   const lifecycle = useRef(0);
+  const listGeneration = useRef(0);
   const fragmentGeneration = useRef(0);
   const requestControllers = useRef(new Set<AbortController>());
+  const listControllers = useRef(new Set<AbortController>());
+  const roomStatus = useRef(room.status);
+  roomStatus.current = room.status;
 
   const createRequest = useCallback(() => {
     const controller = new AbortController();
@@ -89,15 +93,26 @@ export function RoomFiles({
   const finishRequest = useCallback((controller: AbortController) => {
     requestControllers.current.delete(controller);
   }, []);
+  const createListRequest = useCallback(() => {
+    const controller = new AbortController();
+    listControllers.current.add(controller);
+    return controller;
+  }, []);
+  const finishListRequest = useCallback((controller: AbortController) => {
+    listControllers.current.delete(controller);
+  }, []);
   const rejectActiveKey = useCallback((message: string, malformed: boolean) => {
     setSecret(null);
     onKeyReady?.(null);
     setFiles([]);
     setFileNames({});
     setNextCursor(null);
+    setPlans([]);
     activeController.current?.abort();
     for (const controller of requestControllers.current) controller.abort();
     requestControllers.current.clear();
+    for (const controller of listControllers.current) controller.abort();
+    listControllers.current.clear();
     setInvalid(malformed);
     setError(message);
   }, [onKeyReady]);
@@ -120,10 +135,23 @@ export function RoomFiles({
       requestControllers.current.clear();
       activeController.current?.abort();
     };
+  }, [room.id]);
+
+  useEffect(() => {
+    listGeneration.current += 1;
+    for (const controller of listControllers.current) controller.abort();
+    listControllers.current.clear();
+    if (room.status !== 'open') {
+      setFiles([]);
+      setFileNames({});
+      setNextCursor(null);
+      loadedOlderPages.current = false;
+      activeController.current?.abort();
+    }
   }, [room.id, room.status]);
 
   const refresh = useCallback(async () => {
-    if (room.status !== 'open') {
+    if (roomStatus.current !== 'open') {
       setFiles([]);
       setFileNames({});
       setNextCursor(null);
@@ -133,10 +161,11 @@ export function RoomFiles({
     if (refreshLock.current) return;
     refreshLock.current = true;
     const generation = lifecycle.current;
-    const controller = createRequest();
+    const currentListGeneration = listGeneration.current;
+    const controller = createListRequest();
     try {
       const page = await api<FileListPage>(`/rooms/${room.id}/files`, 'GET', undefined, controller.signal);
-      if (generation !== lifecycle.current || controller.signal.aborted) return;
+      if (generation !== lifecycle.current || currentListGeneration !== listGeneration.current || controller.signal.aborted || roomStatus.current !== 'open') return;
       const activeIds = new Set(page.activeIds);
       setFiles((current) => mergeFiles(
         current.filter((file) => activeIds.has(file.id)),
@@ -154,16 +183,17 @@ export function RoomFiles({
       }
       setConnectionError(cause instanceof Error ? cause.message : 'Unable to load shared files.');
     } finally {
-      finishRequest(controller);
+      finishListRequest(controller);
       refreshLock.current = false;
     }
-  }, [room.id, room.status, createRequest, finishRequest, markAccessLost]);
+  }, [room.id, createListRequest, finishListRequest, markAccessLost]);
 
   async function loadOlder() {
     if (!nextCursor || refreshLock.current) return;
     refreshLock.current = true;
     const generation = lifecycle.current;
-    const controller = createRequest();
+    const currentListGeneration = listGeneration.current;
+    const controller = createListRequest();
     try {
       const page = await api<FileListPage>(
         `/rooms/${room.id}/files?before=${encodeURIComponent(nextCursor)}`,
@@ -171,7 +201,7 @@ export function RoomFiles({
         undefined,
         controller.signal,
       );
-      if (generation !== lifecycle.current || controller.signal.aborted) return;
+      if (generation !== lifecycle.current || currentListGeneration !== listGeneration.current || controller.signal.aborted || roomStatus.current !== 'open') return;
       loadedOlderPages.current = true;
       const activeIds = new Set(page.activeIds);
       setFiles((current) => mergeFiles(current.filter((file) => activeIds.has(file.id)), page.files));
@@ -185,7 +215,7 @@ export function RoomFiles({
       }
       setConnectionError(cause instanceof Error ? cause.message : 'Unable to load older shared files.');
     } finally {
-      finishRequest(controller);
+      finishListRequest(controller);
       refreshLock.current = false;
     }
   }
@@ -223,12 +253,6 @@ export function RoomFiles({
         if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
         setRegistered(serverKey.fingerprint);
         setAvailable(Boolean(serverKey.fingerprint) || room.role === 'owner');
-        if (fragment.invalid) {
-          setSecret(null);
-          onKeyReady?.(null);
-          setError('The shared files key in this invitation is invalid.');
-          return;
-        }
 
         const savedSecret = await loadRoomFileSecret(room.id);
         if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
@@ -246,13 +270,13 @@ export function RoomFiles({
           setSecret(candidate);
           if (fragment.secret) removeFilesFragment();
           onKeyReady?.(candidate);
+          const pendingPlans = await listRoomFilePlans(room.id);
+          if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
+          setPlans(pendingPlans);
         }
 
-        if (room.status === 'open' && (serverKey.fingerprint || room.role === 'owner')) {
+        if (roomStatus.current === 'open' && (serverKey.fingerprint || room.role === 'owner'))
           await refresh();
-          if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
-          setPlans(await listRoomFilePlans(room.id));
-        }
       } catch (cause) {
         if (controller.signal.aborted || generation !== lifecycle.current) return;
         if (isAccessLost(cause)) {
@@ -278,7 +302,7 @@ export function RoomFiles({
       finishRequest(controller);
       onKeyReady?.(null);
     };
-  }, [room.id, room.role, room.status, refresh, onKeyReady, createRequest, finishRequest, rejectActiveKey]);
+  }, [room.id, room.role, onKeyReady, createRequest, finishRequest, rejectActiveKey]);
 
   useEffect(() => {
     if (room.status !== 'open') {

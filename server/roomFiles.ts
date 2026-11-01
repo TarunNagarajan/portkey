@@ -56,6 +56,12 @@ async function admit(
     "This room is no longer accepting shared files.",
   );
   if (r.owner_id === ownerId) return { uploader: r.owner_id, owner: true };
+  requireCondition(
+    r.owner_id !== sessionId,
+    403,
+    "ORGANIZER_REQUIRED",
+    "Sign in to your organizer account to access this room.",
+  );
   const [m] = await q.query<{
     status: string;
   }>(

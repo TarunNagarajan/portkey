@@ -98,6 +98,58 @@ test("an unapproved session cannot read or register the shared file key", async 
     .expect(403);
 });
 
+test("legacy owner session cannot reenter its adopted organizer room as an attendee", async () => {
+  const owner = await client();
+  const room = await makeRoom(owner);
+  await openRoom(owner, room.id);
+  const [ownerSession] = await db.query<{ id: string }>(
+    "SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1",
+  );
+  const fingerprint = "3".repeat(64);
+  await owner.post(`/rooms/${room.id}/files/key`, { fingerprint }).expect(201);
+  const fileId = randomUUID();
+  await owner
+    .post(`/rooms/${room.id}/files`, {
+      id: fileId,
+      keyFingerprint: fingerprint,
+      descriptor: Buffer.from("owner encrypted metadata").toString("base64"),
+      chunkCount: 1,
+      encryptedBytes: 16,
+    })
+    .expect(201);
+  await db.query(
+    `INSERT INTO organizer_accounts(id,user_handle,owner_session_id,recovery_digest)
+     VALUES($1,$2,$3,$4)`,
+    [randomUUID(), Buffer.alloc(32, 4), ownerSession.id, Buffer.alloc(32, 5)],
+  );
+  await db.query(
+    `INSERT INTO memberships(id,room_id,session_id,label,status,decided_at)
+     VALUES($1,$2,$3,'Legacy organizer','approved',clock_timestamp())`,
+    [randomUUID(), room.id, ownerSession.id],
+  );
+
+  await owner
+    .get(`/rooms/${room.id}/files`)
+    .expect(403)
+    .then((response) =>
+      assert.equal(response.body.error.code, "ORGANIZER_REQUIRED"),
+    );
+  await owner.get(`/rooms/${room.id}/files/key`).expect(403);
+  await owner
+    .post(`/rooms/${room.id}/files`, {
+      id: randomUUID(),
+      keyFingerprint: fingerprint,
+      descriptor: Buffer.from("attempted attendee upload").toString("base64"),
+      chunkCount: 1,
+      encryptedBytes: 16,
+    })
+    .expect(403);
+  await owner
+    .put(`/rooms/${room.id}/files/${fileId}/chunks/0`, Buffer.alloc(16))
+    .expect(403);
+  await owner.delete(`/rooms/${room.id}/files/${fileId}`).expect(403);
+});
+
 test("shared file routes enforce fresh inside-geofence state for admitted attendees", async () => {
   const owner = await client();
   const room = await makeRoom(owner);
