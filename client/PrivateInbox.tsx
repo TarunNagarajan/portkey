@@ -189,6 +189,7 @@ export function PrivateInbox({
     const refresh = async () => {
       if (disposed || !eligible || document.visibilityState !== 'visible' || !navigator.onLine) return;
       if (pollBusy.current) {
+        clearTimeout(timer);
         timer = setTimeout(refresh, 250);
         return;
       }
@@ -207,8 +208,10 @@ export function PrivateInbox({
       }
       finally {
         pollBusy.current = false;
-        if (!disposed && document.visibilityState === 'visible')
+        if (!disposed && document.visibilityState === 'visible') {
+          clearTimeout(timer);
           timer = setTimeout(refresh, 5000);
+        }
       }
     };
     const wake = () => {

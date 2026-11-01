@@ -295,8 +295,10 @@ export function RoomFiles({
     const poll = async () => {
       if (!active) return;
       if (document.visibilityState === 'visible' && navigator.onLine) await refresh();
-      if (active && document.visibilityState === 'visible')
+      if (active && document.visibilityState === 'visible') {
+        clearTimeout(timer);
         timer = setTimeout(() => void poll(), 5_000);
+      }
     };
     const wake = () => {
       clearTimeout(timer);
