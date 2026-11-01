@@ -135,6 +135,13 @@ export function JoinPage({ code }: { code: string }) {
       <p className="eyebrow">YOU’RE INVITED</p>
       <h1>{room.title}</h1>
       <p>{room.description}</p>
+      <h2 className="join-action-label">
+        {room.admissionPolicy === 'approval'
+          ? 'Request access'
+          : room.admissionPolicy === 'pass'
+            ? 'Redeem an admission pass'
+            : 'Prove credential eligibility'}
+      </h2>
       <p className="join-deadline">
         <Icon name="clock" />
         Access ends {formatDate(room.expiresAt)}
@@ -169,7 +176,9 @@ export function JoinPage({ code }: { code: string }) {
       ) : room.membershipStatus === 'pending' && room.admissionPolicy === 'approval' ? (
         <p role="status">Waiting for organizer approval. This page updates automatically.</p>
       ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
-        <p>The organizer has declined access for this browser.</p>
+        <p role="status">
+          Access is unavailable for this browser. Contact the organizer if you think this was a mistake.
+        </p>
       ) : room.admissionPolicy === 'proof' ? (
         <ReusableAdmission
           room={room}
@@ -210,8 +219,8 @@ export function JoinPage({ code }: { code: string }) {
           )}
           {room.admissionPolicy === 'pass' && (
             <p className="muted">
-              A pass is used once and binds access to this browser. Anyone holding the link can
-              redeem it before you do.
+              This pass link can be used once and then belongs to this browser. Anyone with the link can
+              use it first; ask the organizer for a new link if it has already been redeemed.
             </p>
           )}
           <button disabled={busy}>

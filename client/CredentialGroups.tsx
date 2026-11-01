@@ -137,9 +137,9 @@ export function CredentialGroups() {
       <section className="panel credential-panel">
         <h2>Create a credential group</h2>
         <p>
-          Groups last as long as this organizer browser session, which expires
-          after 30 days. This prototype does not provide permanent organizer
-          accounts.
+          Guest groups remain available until the browser session expires after
+          30 days. Create an organizer account to keep your groups across
+          sign-ins.
         </p>
         <form onSubmit={(event) => void create(event)}>
           <label>

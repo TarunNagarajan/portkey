@@ -2,9 +2,16 @@ import { defineConfig } from '@playwright/test';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
-const dataDirectory = resolve(tmpdir(), `portkey-platform-demo-${randomUUID()}`);
-process.env.PORTKEY_PLATFORM_DEMO_DATA_DIR = dataDirectory;
+const dataDirectory =
+  process.env.PORTKEY_PLATFORM_DEMO_DATA_DIR ??
+  resolve(tmpdir(), `portkey-platform-demo-${randomUUID()}`);
+const bootstrapToken =
+  process.env.PORTKEY_PLATFORM_DEMO_BOOTSTRAP_TOKEN ??
+  randomBytes(32).toString('base64url');
+process.env.PORTKEY_PLATFORM_DEMO_DATA_DIR ??= dataDirectory;
+process.env.PORTKEY_PLATFORM_DEMO_BOOTSTRAP_TOKEN = bootstrapToken;
 
 export default defineConfig({
   metadata: { builtAssets: true, isolatedDemoData: dataDirectory },
@@ -21,8 +28,11 @@ export default defineConfig({
   },
   webServer: {
     command: 'npx tsx scripts/platform-demo.ts',
-    url: 'http://127.0.0.1:5300/platform-demo/ready',
-    env: { PORTKEY_PLATFORM_DEMO_DATA_DIR: dataDirectory },
+    url: 'http://localhost:5300/platform-demo/ready',
+    env: {
+      PORTKEY_PLATFORM_DEMO_DATA_DIR: dataDirectory,
+      PORTKEY_PLATFORM_DEMO_BOOTSTRAP_TOKEN: bootstrapToken,
+    },
     reuseExistingServer: false,
     timeout: 120_000,
   },
