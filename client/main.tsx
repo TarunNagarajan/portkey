@@ -1,13 +1,20 @@
 import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { startSession } from './api.js';
+import { RecoverRoom } from './Recovery.js';
 import { Home } from './Home.js';
 import { JoinPage } from './JoinPage.js';
 import { RoomPage } from './RoomPage.js';
-import { Icon } from './ui.js';
+import { BrandMark } from './ui.js';
 import './styles.css';
 
 function App() {
+  const [online, setOnline] = useState(navigator.onLine);
+  useEffect(() => {
+    const changed = () => setOnline(navigator.onLine);
+    window.addEventListener('online', changed); window.addEventListener('offline', changed);
+    return () => { window.removeEventListener('online', changed); window.removeEventListener('offline', changed); };
+  }, []);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -19,66 +26,72 @@ function App() {
   const room = path.match(/^\/rooms\/([a-f0-9-]+)$/i);
   const join = path.match(/^\/join\/([A-Za-z0-9_-]+)$/);
   return (
-    <div className="app-layout">
+    <div className="frame">
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <aside className="sidebar">
-        <a className="brand" href="/">
-          <span className="brand-mark">P</span>Portkey
-        </a>
-        <p className="nav-label">WORKSPACE</p>
-        <nav aria-label="Workspace navigation">
-          <a className={!join ? 'nav-item selected' : 'nav-item'} href="/">
-            <Icon name="rooms" />
-            Your rooms
+      <header className="bar">
+        <div className="shell">
+          <a className="brand" href="/">
+            <BrandMark size={22} />
+            Portkey
           </a>
-          <a className="nav-item" href="/#new-room">
-            <Icon name="plus" />
-            Create a room
-          </a>
-        </nav>
-        <div className="sidebar-note">
-          <Icon name="shield" />
-          <strong>Access stays with this browser.</strong>
-          <p>Keep this browser’s cookies to retain access to your rooms.</p>
-        </div>
-      </aside>
-      <div className="workspace">
-        <div className="topbar">
-          <span>
-            Workspace <span className="breadcrumb-divider">/</span>{' '}
-            {join ? 'Join room' : room ? 'Room overview' : 'Rooms'}
-          </span>
+          <nav className="bar-links" aria-label="Workspace">
+            <a aria-current={join ? undefined : 'page'} href="/">
+              Your rooms
+            </a>
+            <a href="/#new-room">Create a room</a>
+            <a href="/recover">Recover room</a>
+          </nav>
           {ready && (
-            <span className="session-indicator">
-              <span className="status-dot" />
-              Session active
-            </span>
+            <p className="bar-note">
+              <span className="square pulse" aria-hidden="true" />
+              Session held in this browser
+            </p>
           )}
         </div>
-        <main id="main">
-          {error ? (
-            <p role="alert" className="error">
-              {error} <button onClick={() => window.location.reload()}>Retry</button>
+      </header>
+      <main id="main" className="board shell">
+        {!online && <p className="notice span-12" role="status">You are offline. Saved uploads remain in this browser. Reconnect to resume.</p>}
+        {error ? (
+          <p role="alert" className="error">
+            {error} <button onClick={() => window.location.reload()}>Retry</button>
+          </p>
+        ) : !ready ? (
+          <p role="status">Starting your session…</p>
+        ) : room ? (
+          <RoomPage id={room[1]} />
+        ) : join ? (
+          <JoinPage code={join[1]} />
+        ) : path === '/recover' ? (<RecoverRoom />
+        ) : path === '/' ? (
+          <Home />
+        ) : (
+          <h1>Page not found.</h1>
+        )}
+      </main>
+      <footer className="foot">
+        <div className="shell">
+          <div className="foot-line">
+            <p className="foot-mark">
+              <BrandMark size={18} />
+              Portkey — rooms that open by invitation
             </p>
-          ) : !ready ? (
-            <p role="status">Starting your session…</p>
-          ) : room ? (
-            <RoomPage id={room[1]} />
-          ) : join ? (
-            <JoinPage code={join[1]} />
-          ) : path === '/' ? (
-            <Home />
-          ) : (
-            <h1>Page not found.</h1>
-          )}
-        </main>
-        <footer>
-          <span>Portkey</span>
-          <span>Access managed by the organizer.</span>
-        </footer>
-      </div>
+            <nav className="foot-links" aria-label="Footer">
+              <a href="/">Your rooms</a>
+              <a href="/#new-room">Create a room</a>
+            </nav>
+            <p className="foot-year">2026</p>
+          </div>
+          <p className="foot-credits" data-ui>
+            Pictures: “Set old keys hanging wall” by Markus Spiske (CC0, rawpixel) · “Entrance to
+            the East Block of the Parliament of Canada in Ottawa” by Hayden Soloviev (CC BY 4.0,
+            Wikimedia Commons) · “Igreja do Curral das Freiras: Azulejo, Tiles” by Celsoazevedo
+            (CC BY 4.0, Wikimedia Commons) · “Einsteckschloss-Animation” by Andreas Gortan
+            (CC BY-SA 4.0, Wikimedia Commons).
+          </p>
+        </div>
+      </footer>
     </div>
   );
 }

@@ -13,13 +13,37 @@ export class ApiError extends Error {
   }
 }
 
+// A misdirected request (for example, the dev proxy pointing at a port another
+// service owns) answers with HTML or an empty body. Report that plainly instead
+// of surfacing the browser's "JSON.parse: unexpected character" message.
+async function readJson(response: Response): Promise<unknown> {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ApiError(
+      response.status,
+      'INVALID_RESPONSE',
+      `The API answered HTTP ${response.status} without JSON. Check that the API is running on the port the frontend calls.`,
+    );
+  }
+}
+
+async function fetchApi(input: string, init: RequestInit) {
+  try { return await fetch(input, init); }
+  catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw new ApiError(0, 'NETWORK_UNAVAILABLE', 'Cannot reach Portkey. Check your connection and retry. Saved uploads remain in this browser.');
+  }
+}
+
 export async function api<T>(
   path: string,
   method = 'GET',
   body?: unknown,
   signal?: AbortSignal,
 ): Promise<T> {
-  const response = await fetch(`/api${path}`, {
+  const response = await fetchApi(`/api${path}`, {
     method,
     credentials: 'same-origin',
     signal,
@@ -30,14 +54,16 @@ export async function api<T>(
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   if (response.status === 204) return undefined as T;
-  const data = await response.json();
-  if (!response.ok)
+  const data = await readJson(response);
+  if (!response.ok) {
+    const error = (data as { error?: { code?: string; message?: string } }).error;
     throw new ApiError(
       response.status,
-      data.error.code,
-      data.error.message,
+      error?.code ?? 'INVALID_RESPONSE',
+      error?.message ?? `The API answered HTTP ${response.status}.`,
       Number(response.headers.get('Retry-After') ?? 0),
     );
+  }
   return data as T;
 }
 
@@ -47,7 +73,7 @@ export async function apiBytes(
   body?: Uint8Array,
   signal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; sha256: string }> {
-  const response = await fetch(`/api${path}`, {
+  const response = await fetchApi(`/api${path}`, {
     method,
     credentials: 'same-origin',
     signal,
@@ -58,7 +84,7 @@ export async function apiBytes(
     ...(body ? { body: Uint8Array.from(body).buffer } : {}),
   });
   if (!response.ok) {
-    const data = await response.json();
+    const data = (await readJson(response)) as { error: { code: string; message: string } };
     throw new ApiError(
       response.status,
       data.error.code,
@@ -84,58 +110,4 @@ export async function searchPlaces(query: string) {
   return response.results;
 }
 
-export interface GeoFix {
-  lat: number;
-  lng: number;
-  accuracyM: number;
-  timestamp: string;
-}
-
-function readOnce(timeoutMs: number): Promise<GeoFix> {
-  return new Promise((resolve, reject) => {
-    if (!('geolocation' in navigator)) {
-      reject(new Error('Location is not supported on this device or browser.'));
-      return;
-    }
-    const timer = setTimeout(() => reject(new Error('Location timed out. Try again near a window or outdoors.')), timeoutMs);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        clearTimeout(timer);
-        resolve({
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-          accuracyM: position.coords.accuracy,
-          timestamp: new Date(position.timestamp).toISOString(),
-        });
-      },
-      (error) => {
-        clearTimeout(timer);
-        if (error.code === error.PERMISSION_DENIED)
-          reject(new Error('Location permission was denied. Allow location access and try again.'));
-        else if (error.code === error.POSITION_UNAVAILABLE)
-          reject(new Error('Location is unavailable. Try again near a window or outdoors.'));
-        else reject(new Error('Location timed out. Try again.'));
-      },
-      { enableHighAccuracy: true, maximumAge: 0, timeout: timeoutMs },
-    );
-  });
-}
-
-export async function requestFix(): Promise<GeoFix> {
-  const samples: GeoFix[] = [];
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      samples.push(await readOnce(9000));
-    } catch (error) {
-      if (samples.length === 0 && attempt === 2) throw error;
-      if (samples.length > 0) break;
-    }
-  }
-  const middle = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-  return {
-    lat: middle(samples.map((sample) => sample.lat)),
-    lng: middle(samples.map((sample) => sample.lng)),
-    accuracyM: middle(samples.map((sample) => sample.accuracyM)),
-    timestamp: samples[samples.length - 1].timestamp,
-  };
-}
+export { requestFix, type GeoFix } from './location.js';

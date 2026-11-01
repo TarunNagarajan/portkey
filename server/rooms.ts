@@ -1,25 +1,29 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Router } from 'express';
-import { z } from 'zod';
 import {
   geoAreaInput,
   joinCode,
   joinRequest,
   memberDecision,
+  maxEntryAccuracyM,
   placeQuery,
   positionReport,
+  roomCreateInput,
   roomId,
   roomInput,
   roomTemplateInput,
   type GeoRule,
   type Room,
-  type RoomInput,
+  type RoomCreateInput,
   type PublicRoom,
 } from '../shared/rooms.js';
-import { haversineMeters } from '../shared/geo.js';
+import { credentialRequirement, type CredentialRule } from '../shared/credentials.js';
+import { haversineMeters, locationAccuracyMessage } from '../shared/geo.js';
 import type { Database, Queries } from './database.js';
-import { requireCondition } from './errors.js';
+import { HttpError, requireCondition } from './errors.js';
+import { credentialIssuer, verifyCredentialProof } from './zk.js';
 import type { Geocoder } from './geocoding.js';
+import { requireParticipantAccess } from './participantAccess.js';
 import { activityQuery, readActivity, recordActivity } from './activity.js';
 import type { ActivityKind, RoomField } from '../shared/activity.js';
 
@@ -36,10 +40,12 @@ interface RoomRow {
   geo_lng: number | null;
   geo_radius_m: number | null;
   geo_label: string | null;
+  credential_dept: number | null;
+  credential_year: number | null;
+  credential_issuer_ax: string | null;
+  credential_issuer_ay: string | null;
   is_expired: boolean;
   membership_status: Room['membershipStatus'];
-  submission_cleanup_enabled: boolean;
-  submissions_purged_at: Date | null;
 }
 
 interface MemberRow {
@@ -53,6 +59,7 @@ interface MemberRow {
   last_distance_m: number | null;
   last_inside: boolean | null;
   last_checked_at: Date | null;
+  credential_verified_at: Date | null;
 }
 
 const selection = `SELECT r.*, r.expires_at <= clock_timestamp() AS is_expired,
@@ -64,6 +71,31 @@ function geoOf(row: RoomRow): GeoRule | null {
   return { lat: row.geo_lat, lng: row.geo_lng, radiusM: row.geo_radius_m };
 }
 
+function credentialOf(row: RoomRow): CredentialRule | null {
+  if (
+    row.credential_dept == null ||
+    row.credential_year == null ||
+    row.credential_issuer_ax == null ||
+    row.credential_issuer_ay == null
+  ) {
+    return null;
+  }
+  return {
+    dept: row.credential_dept,
+    year: row.credential_year,
+    issuer: { ax: row.credential_issuer_ax, ay: row.credential_issuer_ay },
+  };
+}
+
+function isCredentialReuse(error: unknown) {
+  if (typeof error !== 'object' || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  if (code !== '23505') return false;
+  const constraint = (error as { constraint?: unknown }).constraint;
+  const text = `${typeof constraint === 'string' ? constraint : ''} ${error instanceof Error ? error.message : ''}`;
+  return text.includes('credential_nullifier');
+}
+
 function roomView(row: RoomRow, sessionId: string): Room {
   return {
     id: row.id,
@@ -73,12 +105,11 @@ function roomView(row: RoomRow, sessionId: string): Room {
     expiresAt: row.expires_at.toISOString(),
     createdAt: row.created_at.toISOString(),
     joinCode: row.join_code,
-    submissionCleanupEnabled: row.submission_cleanup_enabled,
-    submissionsPurgedAt: row.submissions_purged_at?.toISOString() ?? null,
     role: row.owner_id === sessionId ? 'owner' : 'participant',
     membershipStatus: row.membership_status ?? null,
     geo: geoOf(row),
     geoLabel: row.geo_label,
+    credential: credentialOf(row),
   };
 }
 
@@ -98,10 +129,9 @@ function publicView(
     isOwner: view.role === 'owner',
     organizerKeyFingerprint: key?.fingerprint ?? null,
     organizerPublicKey: key?.publicKey ?? null,
-    submissionCleanupEnabled: view.submissionCleanupEnabled,
-    submissionsPurgedAt: view.submissionsPurgedAt,
     geo: view.geo,
     geoLabel: view.geoLabel,
+    credential: view.credential,
     needsLocation:
       view.geo != null && view.role !== 'owner' && view.membershipStatus !== 'approved',
   };
@@ -119,19 +149,18 @@ function memberView(row: MemberRow) {
     accuracyM:
       row.last_accuracy_m == null ? null : Math.round((row.last_accuracy_m as number) * 10) / 10,
     checkedAt: row.last_checked_at ? (row.last_checked_at as Date).toISOString() : null,
+    credentialVerified: row.credential_verified_at != null,
   };
 }
 
-const ENTRY_FRESH_MS = 5 * 60 * 1000;
 const FIX_FRESH_MS = 60 * 1000;
-const ACCURACY_CAP_M = 75;
 
 function validateFix(input: { lat: number; lng: number; accuracyM: number; timestamp: string }) {
   requireCondition(
-    input.accuracyM <= ACCURACY_CAP_M,
+    input.accuracyM <= maxEntryAccuracyM,
     422,
     'GEO_INACCURATE',
-    `Location accuracy is too low (${Math.round(input.accuracyM)} m). Move near a window or outdoors and try again.`,
+    locationAccuracyMessage(input.accuracyM, maxEntryAccuracyM),
   );
   const age = Date.now() - new Date(input.timestamp).getTime();
   requireCondition(
@@ -177,6 +206,22 @@ function requireOpen(row: RoomRow) {
   requireCondition(row.status === 'open', 409, 'ROOM_NOT_OPEN', 'This room is not open yet.');
 }
 
+// The area may be adjusted until somebody has been admitted under it. After
+// that the fence is fixed, so an admitted participant is never re-scoped out
+// of the room they were approved for.
+async function requireNoAdmissions(queries: Queries, id: string) {
+  const [approved] = await queries.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM memberships WHERE room_id = $1 AND status IN ('approved', 'revoked')",
+    [id],
+  );
+  requireCondition(
+    approved.count === 0,
+    409,
+    'INVALID_TRANSITION',
+    'Room admission rules are fixed once a participant has been admitted.',
+  );
+}
+
 function validateExpiry(value: string, now: Date, sessionExpiry: Date) {
   const expiresAt = new Date(value);
   requireCondition(expiresAt > now, 422, 'INVALID_EXPIRY', 'Choose an expiry time in the future.');
@@ -199,13 +244,15 @@ async function insertRoom(
   queries: Queries,
   ownerId: string,
   sessionExpiry: Date,
-  input: RoomInput,
+  input: RoomCreateInput,
   kind: Extract<ActivityKind, 'room_created' | 'room_duplicated'> = 'room_created',
 ) {
   const expiresAt = validateExpiry(input.expiresAt, await clock(queries), sessionExpiry);
+  const issuer = input.credential ? credentialIssuer() : null;
   const [row] = await queries.query<RoomRow>(
-    `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *, false AS is_expired`,
+    `INSERT INTO rooms (id, owner_id, join_code, title, description, expires_at,
+       credential_dept, credential_year, credential_issuer_ax, credential_issuer_ay)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *, false AS is_expired`,
     [
       randomUUID(),
       ownerId,
@@ -213,6 +260,10 @@ async function insertRoom(
       input.title,
       input.description,
       expiresAt,
+      input.credential?.dept ?? null,
+      input.credential?.year ?? null,
+      issuer?.ax ?? null,
+      issuer?.ay ?? null,
     ],
   );
   await recordActivity(queries, row.id, kind);
@@ -233,7 +284,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
   });
 
   router.post('/rooms', async (request, response) => {
-    const input = roomInput.parse(request.body);
+    const input = roomCreateInput.parse(request.body);
     response
       .status(201)
       .json(
@@ -257,6 +308,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
           title: input.title ?? original.title,
           description: input.description ?? original.description,
           expiresAt: input.expiresAt,
+          credential: input.credential ?? null,
         },
         'room_duplicated',
       );
@@ -305,12 +357,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       const room = await lockRoom(transaction, id);
       requireOwner(room, request.session!.id);
       requireActive(room);
-      requireCondition(
-        room.status === 'draft',
-        409,
-        'INVALID_TRANSITION',
-        'Only a draft room can be restricted to an area.',
-      );
+      await requireNoAdmissions(transaction, id);
       const [updated] = await transaction.query<RoomRow>(
         `UPDATE rooms SET geo_lat = $2, geo_lng = $3, geo_radius_m = $4, geo_label = $5,
            geo_source = $6
@@ -328,12 +375,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       const room = await lockRoom(transaction, id);
       requireOwner(room, request.session!.id);
       requireActive(room);
-      requireCondition(
-        room.status === 'draft',
-        409,
-        'INVALID_TRANSITION',
-        'Only a draft room can change its area.',
-      );
+      await requireNoAdmissions(transaction, id);
       const [updated] = await transaction.query<RoomRow>(
         `UPDATE rooms SET geo_lat = NULL, geo_lng = NULL, geo_radius_m = NULL,
            geo_label = NULL, geo_source = NULL
@@ -345,15 +387,77 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
     response.json(roomView(row, request.session!.id));
   });
 
+  for (const method of ['put', 'delete'] as const) {
+    router[method]('/rooms/:id/credential', async (request, response) => {
+      const id = roomId.parse(request.params.id);
+      const input = method === 'put' ? credentialRequirement.parse(request.body) : null;
+      const issuer = credentialIssuer();
+      const row = await database.transaction(async (transaction) => {
+        const room = await lockRoom(transaction, id);
+        requireOwner(room, request.session!.id);
+        requireActive(room);
+        await requireNoAdmissions(transaction, id);
+        const before = credentialOf(room);
+        const [updated] = await transaction.query<RoomRow>(
+          `UPDATE rooms SET credential_dept = $2, credential_year = $3,
+             credential_issuer_ax = $4, credential_issuer_ay = $5
+           WHERE id = $1 RETURNING *, false AS is_expired`,
+          [
+            id,
+            input?.dept ?? null,
+            input?.year ?? null,
+            input ? issuer.ax : null,
+            input ? issuer.ay : null,
+          ],
+        );
+        const changedCredential =
+          (before === null) !== (input === null) ||
+          (before !== null &&
+            input !== null &&
+            (before.dept !== input.dept || before.year !== input.year));
+        if (changedCredential)
+          await recordActivity(transaction, id, 'room_updated', null, ['credential']);
+        return updated;
+      });
+      response.json(roomView(row, request.session!.id));
+    });
+  }
+
+  router.post('/join/:code/challenge', async (request, response) => {
+    const code = joinCode.parse(request.params.code);
+    const [room] = await database.query<RoomRow>('SELECT * FROM rooms WHERE join_code = $1', [code]);
+    requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+    requireOpen({ ...room, is_expired: room.expires_at <= await clock(database) });
+    const challenge = BigInt(`0x${randomBytes(31).toString('hex')}`).toString();
+    const [row] = await database.query<{ expires_at: Date }>(
+      `INSERT INTO credential_challenges(room_id, session_id, challenge, expires_at)
+       VALUES ($1, $2, $3, clock_timestamp() + interval '10 minutes')
+       ON CONFLICT(room_id, session_id) DO UPDATE SET challenge = EXCLUDED.challenge, expires_at = EXCLUDED.expires_at
+       RETURNING expires_at`, [room.id, request.session!.id, challenge]);
+    response.json({ challenge, expiresAt: row.expires_at.toISOString() });
+  });
+
   router.post('/join/:code', async (request, response) => {
     const code = joinCode.parse(request.params.code);
     const input = joinRequest.parse(request.body);
-    const membership = await database.transaction(async (transaction) => {
-      const [found] = await transaction.query<RoomRow>(
-        'SELECT * FROM rooms WHERE join_code = $1',
-        [code],
+    const [found] = await database.query<RoomRow>('SELECT * FROM rooms WHERE join_code = $1', [
+      code,
+    ]);
+    requireCondition(found, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+    // Verify before opening the transaction: a pairing check takes a few hundred
+    // milliseconds and must not hold the room lock.
+    const requirement = credentialOf(found);
+    let verified: { nullifier: string; challenge: string; validUntil: number } | null = null;
+    if (requirement) {
+      requireCondition(
+        input.credentialProof != null,
+        403,
+        'CREDENTIAL_REQUIRED',
+        'This room requires a zero-knowledge proof of your institution credential.',
       );
-      requireCondition(found, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      verified = await verifyCredentialProof(input.credentialProof, found.id, requirement);
+    }
+    const membership = await database.transaction(async (transaction) => {
       const row = await lockRoom(transaction, found.id);
       requireOpen(row);
       requireCondition(
@@ -362,9 +466,31 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         'ALREADY_OWNER',
         'You already organize this room.',
       );
+      const currentRule = credentialOf(row);
+      requireCondition(
+        (currentRule === null) === (requirement === null) &&
+          (requirement === null ||
+            (currentRule!.dept === requirement.dept &&
+              currentRule!.year === requirement.year &&
+              currentRule!.issuer.ax === requirement.issuer.ax &&
+              currentRule!.issuer.ay === requirement.issuer.ay)),
+        409,
+        'INVALID_TRANSITION',
+        'This room’s credential requirement changed. Request access again.',
+      );
+      if (verified) {
+        const [challenge] = await transaction.query<{ challenge: string }>(
+          `SELECT challenge FROM credential_challenges WHERE room_id = $1 AND session_id = $2
+           AND expires_at > clock_timestamp() FOR UPDATE`, [row.id, request.session!.id]);
+        requireCondition(challenge?.challenge === verified.challenge, 422, 'CREDENTIAL_CHALLENGE_INVALID', 'Generate a fresh proof in this browser.');
+        requireCondition(verified.validUntil * 1000 > (await clock(transaction)).getTime(), 403, 'CREDENTIAL_EXPIRED', 'This credential has expired.');
+        const revoked = await transaction.query('SELECT 1 FROM credential_revocations WHERE room_id = $1 AND nullifier = $2', [row.id, verified.nullifier]);
+        requireCondition(!revoked.length, 403, 'CREDENTIAL_REVOKED', 'The issuer revoked this credential for this room.');
+      }
       const [existing] = await transaction.query<MemberRow>(
         `SELECT id, label, status, requested_at AS "requestedAt",
-           last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at
+           last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at,
+           credential_verified_at
          FROM memberships WHERE room_id = $1 AND session_id = $2`,
         [row.id, request.session!.id],
       );
@@ -400,21 +526,35 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         );
         fix = { ...report, distanceM, inside };
       }
-      if (existing && !fix) return memberView(existing);
+      if (existing && !fix && (!verified || existing.credential_verified_at)) return memberView(existing);
       const [member] = await transaction.query<MemberRow>(
-        `INSERT INTO memberships (id, room_id, session_id, label, last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $9::boolean IS NULL THEN NULL ELSE clock_timestamp() END)
+        `INSERT INTO memberships (id, room_id, session_id, label, status, decided_at,
+           credential_nullifier, credential_verified_at,
+           last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at)
+         VALUES ($1, $2, $3, $4, $5::varchar,
+           CASE WHEN $5::varchar = 'approved' THEN clock_timestamp() ELSE NULL END,
+           $6, CASE WHEN $6::text IS NULL THEN NULL ELSE clock_timestamp() END,
+           $7, $8, $9, $10, $11,
+           CASE WHEN $11::boolean IS NULL THEN NULL ELSE clock_timestamp() END)
          ON CONFLICT (room_id, session_id) DO UPDATE SET label = memberships.label,
+           status = CASE WHEN memberships.status = 'pending' AND EXCLUDED.status = 'approved'
+             THEN 'approved' ELSE memberships.status END,
+           credential_nullifier = COALESCE(memberships.credential_nullifier, EXCLUDED.credential_nullifier),
+           credential_verified_at = COALESCE(memberships.credential_verified_at, EXCLUDED.credential_verified_at),
+           decided_at = COALESCE(memberships.decided_at, EXCLUDED.decided_at),
            last_lat = EXCLUDED.last_lat, last_lng = EXCLUDED.last_lng,
            last_accuracy_m = EXCLUDED.last_accuracy_m, last_distance_m = EXCLUDED.last_distance_m,
            last_inside = EXCLUDED.last_inside, last_checked_at = EXCLUDED.last_checked_at
          RETURNING id, label, status, requested_at AS "requestedAt",
-           last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at`,
+           last_lat, last_lng, last_accuracy_m, last_distance_m, last_inside, last_checked_at,
+           credential_verified_at`,
         [
           randomUUID(),
           row.id,
           request.session!.id,
           input.label,
+          verified ? 'approved' : 'pending',
+          verified?.nullifier ?? null,
           fix?.lat ?? null,
           fix?.lng ?? null,
           fix?.accuracyM ?? null,
@@ -422,8 +562,27 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
           fix?.inside ?? null,
         ],
       );
-      if (!existing) await recordActivity(transaction, row.id, 'join_requested', member.label);
+      if (!existing || (verified && !existing.credential_verified_at))
+        await recordActivity(
+          transaction,
+          row.id,
+          verified ? 'credential_proved' : 'join_requested',
+          member.label,
+        );
+      if (verified) {
+        await transaction.query('UPDATE memberships SET credential_expires_at = to_timestamp($3) WHERE room_id = $1 AND session_id = $2', [row.id, request.session!.id, verified.validUntil]);
+        await transaction.query('DELETE FROM credential_challenges WHERE room_id = $1 AND session_id = $2', [row.id, request.session!.id]);
+      }
       return memberView(member);
+    }).catch((error: unknown) => {
+      if (isCredentialReuse(error)) {
+        throw new HttpError(
+          409,
+          'CREDENTIAL_ALREADY_USED',
+          'This credential has already taken the seat it admits in this room.',
+        );
+      }
+      throw error;
     });
     response.status(200).json(membership);
   });
@@ -470,30 +629,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         'Organizer approval is required.',
       );
       requireOpen(row);
-      const geo = geoOf(row);
-      if (geo) {
-        const [membership] = await database.query<{
-          last_inside: boolean | null;
-          last_checked_at: Date | null;
-        }>(
-          'SELECT last_inside, last_checked_at FROM memberships WHERE room_id = $1 AND session_id = $2',
-          [id, request.session!.id],
-        );
-        requireCondition(
-          membership?.last_checked_at,
-          403,
-          'GEO_STALE',
-          'Share a fresh location to enter this room.',
-        );
-        const age = Date.now() - new Date(membership.last_checked_at as Date).getTime();
-        requireCondition(age <= ENTRY_FRESH_MS, 403, 'GEO_STALE', 'Share a fresh location to enter this room.');
-        requireCondition(
-          membership.last_inside === true,
-          403,
-          'GEO_OUTSIDE',
-          'You are outside this room\u2019s area.',
-        );
-      }
+      await requireParticipantAccess(database, id, request.session!.id);
     }
     response.json(roomView(row, request.session!.id));
   });
@@ -522,25 +658,6 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       if (changedFields.length)
         await recordActivity(transaction, id, 'room_updated', null, changedFields);
       return updated;
-    });
-    response.json(roomView(row, request.session!.id));
-  });
-
-  router.post('/rooms/:id/submission-cleanup', async (request, response) => {
-    const id = roomId.parse(request.params.id);
-    z.object({}).strict().parse(request.body);
-    const row = await database.transaction(async (transaction) => {
-      const room = await lockRoom(transaction, id);
-      requireOwner(room, request.session!.id);
-      if (!room.submission_cleanup_enabled) {
-        const [updated] = await transaction.query<RoomRow>(
-          'UPDATE rooms SET submission_cleanup_enabled = TRUE WHERE id = $1 RETURNING *, expires_at <= clock_timestamp() AS is_expired',
-          [id],
-        );
-        await recordActivity(transaction, id, 'submission_cleanup_enabled');
-        return updated;
-      }
-      return room;
     });
     response.json(roomView(row, request.session!.id));
   });
@@ -587,7 +704,8 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
     requireOwner(room, request.session!.id);
     const rows = await database.query<MemberRow>(
       `SELECT m.id, m.label, m.status, m.requested_at AS "requestedAt",
-        m.last_lat, m.last_lng, m.last_accuracy_m, m.last_distance_m, m.last_inside, m.last_checked_at
+        m.last_lat, m.last_lng, m.last_accuracy_m, m.last_distance_m, m.last_inside, m.last_checked_at,
+        m.credential_verified_at
        FROM memberships m JOIN sessions s ON s.id = m.session_id
        WHERE m.room_id = $1 AND s.expires_at > clock_timestamp() ORDER BY m.requested_at`,
       [id],
@@ -603,12 +721,16 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
       const room = await lockRoom(transaction, id);
       requireOwner(room, request.session!.id);
       requireOpen(room);
-      const [current] = await transaction.query<{ status: string }>(
-        `SELECT m.status FROM memberships m JOIN sessions s ON s.id = m.session_id
+      const [current] = await transaction.query<{ status: string; credential_verified_at: Date | null }>(
+        `SELECT m.status, m.credential_verified_at FROM memberships m JOIN sessions s ON s.id = m.session_id
          WHERE m.id = $1 AND m.room_id = $2 AND s.expires_at > clock_timestamp()`,
         [memberId, id],
       );
       requireCondition(current, 404, 'MEMBER_NOT_FOUND', 'Join request not found.');
+      requireCondition(
+        status !== 'approved' || !credentialOf(room) || current.credential_verified_at != null,
+        403, 'CREDENTIAL_REQUIRED', 'This participant must prove their credential before admission.',
+      );
       const allowed =
         status === 'revoked' ? current.status === 'approved' : current.status === 'pending';
       requireCondition(

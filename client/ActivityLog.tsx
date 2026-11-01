@@ -13,14 +13,21 @@ const descriptions: Record<ActivityKind, string> = {
   member_approved: 'Access approved',
   member_denied: 'Access declined',
   member_revoked: 'Access removed',
-  submission_cleanup_enabled: 'Automatic submission cleanup enabled',
-  submissions_purged: 'Room submissions removed after deadline',
+  key_registered: 'Room encryption key registered',
+  file_published: 'File published to the room',
+  files_purged: 'Room files removed after deadline',
+  key_rotated: 'Encryption key rotated',
+  file_access_granted: 'Earlier file access granted',
+  ownership_recovered: 'Ownership recovered in another browser',
+  file_deleted: 'Published file deleted',
+  credential_proved: 'Admitted by credential proof',
 };
 
 const fields: Record<RoomField, string> = {
   title: 'Title',
   description: 'Description',
   expiresAt: 'Access deadline',
+  credential: 'Credential requirement',
 };
 
 export function ActivityLog({ roomId }: { roomId: string }) {
@@ -75,7 +82,7 @@ export function ActivityLog({ roomId }: { roomId: string }) {
   }, [roomId, cursor, attempt]);
 
   return (
-    <section className="panel activity-panel" aria-labelledby="activity-title">
+    <section className="panel activity-panel" data-ui aria-labelledby="activity-title">
       <div className="panel-heading">
         <div>
           <h2 id="activity-title">Room activity</h2>

@@ -1,114 +1,151 @@
 # Portkey
 
-Room management, organizer activity, and browser-encrypted private submissions. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
+A temporary-room file-sharing platform built with React, TypeScript, Express and PostgreSQL/PGlite. Organizers distribute browser-encrypted files to approved participants. Optional Groth16 credential proofs admit eligible students without sending their credential secret, signature, name or roll number to the API.
 
-## Run locally
+## Run
 
-Use Node.js 22.12 or newer. From this directory, run `npm ci`, then `npm run dev`. Open http://localhost:5173. The API listens on 127.0.0.1:3001. Default configuration works without an environment file. Copy `.env.example` to `.env` when changing configuration.
+Use Node.js 22.12 or newer:
 
-Local development uses PGlite, an embedded PostgreSQL engine, with persistent data under `.data/portkey`. Set `DATABASE_URL` to use a PostgreSQL server through the `pg` connection pool instead. Migrations run at startup; `npm run db:migrate` applies them separately. Migration checksums prevent silently changing an already-applied schema. Add a new numbered SQL file for future changes.
+```bash
+npm ci
+npm run dev
+```
 
-The Vite development proxy targets port 3001; set `API_ORIGIN` when using another API address. `APP_ORIGIN` must match the browser address exactly; localhost and 127.0.0.1 are different origins. Place search for room areas uses OpenStreetMap Nominatim and needs outbound network access; set `GEOCODING=false` to disable it. For production, run `npm run build`, set `NODE_ENV=production` and an HTTPS `APP_ORIGIN`, and run `npm start` behind an HTTPS reverse proxy. The API then serves the built frontend. The included rate limiter is process-local; a multi-instance deployment needs a shared store.
+Open http://localhost:5173. The API listens on 127.0.0.1:3001. Defaults work without `.env`; copy `.env.example` to customize them. PGlite persists data under `.data/portkey`. Set `DATABASE_URL` for PostgreSQL. Startup applies numbered migrations and checks their checksums; never edit an applied migration.
 
-## Use the module
+`APP_ORIGIN` must exactly match the browser origin. Set `API_ORIGIN` to change the Vite proxy target. `GEOCODING=false` disables Nominatim place lookup. `HOST` defaults to `127.0.0.1`; containers can use `HOST=0.0.0.0` behind an appropriate proxy.
 
-Create a draft with a title, public description and future expiry. Edit the draft, then open it. Share the generated QR or link. In a separate browser profile, request access with a nickname or team label. The organizer approves or declines the request. An approved participant can enter the room; the organizer can remove that access or close the room.
+For production, build with `npm run build`, use `NODE_ENV=production`, an HTTPS `APP_ORIGIN`, and an explicit `ISSUER_PUBLIC_KEY`, then run `npm start` behind an HTTPS reverse proxy. `ALLOW_DEMO_CREDENTIALS=true` explicitly permits the bundled development issuer for a course demo. An explicit issuer configuration does **not** replace the development Groth16 trusted setup: production proof trust still requires independently reviewed ceremony artifacts.
 
-The workspace shows room counts and lets you search titles/descriptions or filter by lifecycle status. Use an owned room as a template for another event: its title and description are prefilled, you choose a fresh deadline, and a new draft is created with a new invitation. Memberships and approvals are never copied. Closed and expired rooms can be reused without reopening the original.
+For phone testing, `npm run share` builds the app and starts a public Cloudflare quick tunnel. It requires `cloudflared` on PATH, uses HTTPS and explicitly opts into demo credentials unless overridden. Stop with Ctrl+C. Treat this as a public course demo, not an institutional deployment.
 
-The organizer's browser holds an HttpOnly session cookie. There is no registration or required name, email, roll number, or external ID. Anyone can start a session and organize a room. Session tokens are random, only their hashes are persisted, and sessions last 30 days. Rooms last at most seven days and must expire before their organizer session does. Clearing organizer cookies loses management access; recovery and co-host delegation are future modules. A participant label is self-asserted and is not verified identity. Approval must follow the organizer's own check-in process.
+## Room workflow
 
-Room transitions are `draft → open → closed`, or `draft → closed`. Any draft/open room becomes effectively expired at its deadline. Expiry uses the database clock on requests, independent of a background worker. Closed and expired rooms cannot reopen or extend their deadlines. Owners can inspect their terminal rooms, but participants cannot enter them. Closing blocks admission; room expiry separately triggers submission cleanup for rooms whose cleanup policy is enabled.
+1. Create a draft with a title, description and future expiry, at most seven days away.
+2. Optionally require a department/class-year credential and/or set a circular geographic area.
+3. Open the room. Encryption is prepared automatically.
+4. Share the QR/invitation through a trusted channel. Its fragment includes the room access secret; do not publish it openly.
+5. Participants request access with a self-chosen label. The organizer approves them, or a matching credential proof admits them automatically.
+6. Publish files at any time. Every admitted member can download earlier and future publications, even if the organizer browser is closed. Download verifies and decrypts the file automatically.
 
-New rooms automatically remove their encrypted submission records after the room deadline. A server cleanup pass runs at startup and about every 60 seconds while running; removal usually happens within a minute, subject to a bounded backlog, and passes resume after downtime. Closing a room early does not trigger deletion; an allowed deadline edit while active changes the cleanup deadline. Historical rooms keep cleanup disabled until the owner explicitly enables it. Incomplete uploads are removed after 24 hours regardless of room policy. This is logical deletion from the active database: room history, membership, public keys and room metadata remain, while backups, browser keys and already downloaded copies follow their own retention.
+Fingerprints, encrypted key backups and organizer key replacement are under **Security and recovery (optional)**. Organizers should save a protected backup for recovery.
 
-## Organizer activity log
+Rooms transition from draft to open to closed; expiry is enforced by the database clock independently of the cleanup worker. Closed/expired rooms cannot reopen. Owners can inspect room metadata and activity afterward; file access ends at closure/expiry. Templates create fresh drafts with new invitations and no memberships. Search/filter works in the workspace.
 
-Each room overview includes an organizer-only timeline of creation, template reuse, metadata edits, opening, closure, access requests and admission decisions. The latest page refreshes every five seconds. Use Older activity to browse previous pages; Back to latest resumes live updates. Older pages remain stable while new actions occur. History remains readable by the owner after closure or expiry.
+Ownership and membership are tied to a 30-day HttpOnly browser session. Clearing cookies loses authorization. An encrypted key backup recovers only the encryption key, not the session or room ownership. Organizers can create a separate one-time ownership recovery code and redeem it at `/recover`. Recovery transfers authorization; the encrypted key backup separately restores decryption. Co-host roles are not part of this implementation.
 
-Migration `002_room_activity.sql` adds the history table without changing existing rooms. Activity starts when this feature is installed; earlier actions are not reconstructed. Actions and their events commit together, so a logging failure rolls back the action. Repeated join requests and unchanged edits do not add duplicate/no-op events. The API provides no history-editing endpoints. This is an operational log, not a tamper-proof audit system: a database administrator can modify stored data.
+The current product distributes files **organizer → participants**. Participant uploads/private submissions were removed. Migration `008_room_files_only.sql` drops the historical submission tables and their data. Back up an older deployment before upgrading; its old inbox contents are not migrated to room files.
 
-Events retain timestamps, event types, participant label snapshots and changed field names. They do not retain cookies, session tokens, IP addresses or old/new metadata values. Labels may identify participants, which is why approved participants cannot read the organizer's history. Logs share their room's current retention and are deleted with the room record. Deadline expiry is enforced by existing access checks; reaching a deadline does not create a fabricated user-action event.
+## Encryption and file limits
 
-## Encrypted submission inbox
+The browser encrypts filenames/metadata and file contents using AES-256-GCM. Each file has a fresh secret and salt, separate HKDF-SHA256 content/metadata keys, and indexed chunk nonces. HPKE P-256/HKDF-SHA256/AES-256-GCM wraps each file key for the organizer and the shared room receiving key. Authenticated contexts bind the room, file, recipient and purpose. Server storage contains ciphertext, recipient envelopes, sizes and acceptance receipts; it cannot read file names or contents through the normal protocol.
 
-An organizer can enable a private submission inbox from a room overview. The browser creates an HPKE P-256 organizer key and keeps its private half in IndexedDB. Before inviting submissions, download and store an encrypted key backup. The backup uses a passphrase and browser-side encryption; restoring it recovers the decryption key but does not restore lost room access or the browser session.
+Chunk retries must contain identical ciphertext. Completion checks a SHA-256 manifest of the encrypted descriptor and ordered chunk hashes. Downloads authenticate chunks and the complete manifest before saving plaintext. The receipt records server acceptance; it is not an independently signed attestation.
 
-Organizer invitations include the public-key fingerprint in the URL fragment. Browsers omit URL fragments from HTTP requests; Portkey does not transmit the invitation fingerprint fragment. Organizer links use a fingerprint verified against the locally held organizer key. Participants should open the invitation received directly through the organizer's trusted channel. A newly copied room link from the API does not prove the organizer's identity. Existing participants without a trusted invitation must compare the shown fingerprint with the organizer through another trusted channel before explicitly pinning it. A changed or mismatched fingerprint blocks uploads.
+Limits: 250 MiB per file, 250 chunks of up to 1 MiB plaintext, 1,000 files and 5 GiB encrypted chunk storage per room, at most 20 incomplete uploads. Capacity is checked under the room lock as chunks arrive rather than reserving a full file upfront. Metadata/envelopes also have bounded payloads. Failed/cancelled browser uploads attempt to delete their incomplete server record; inaccessible/disconnected attempts are reclaimed after 24 hours. Upload plans and immutable ciphertext chunks survive reloads in IndexedDB. The original source snapshot lives in OPFS, or a bounded 50 MiB ArrayBuffer fallback. Resume never re-encrypts an already reserved index: if a crash lost ciphertext after reservation, discard and start with a fresh file key. Failed network transfers keep their local journal and can be resumed; discard removes it. Browser eviction can still remove local state.
 
-Files and filenames are encrypted in the participant's browser. The browser encrypts chunks one at a time with AES-256-GCM and wraps a random file key separately for the organizer and original submitter using HPKE P-256/HKDF-SHA256/AES-256-GCM. The server stores immutable ciphertext, encrypted metadata, envelopes and an acceptance receipt. It cannot list filenames or decrypt file contents. Only the room owner and original submitter can list completed submissions or retrieve their ciphertext. Current approval, room state and deadline are checked on every mutation and read. The inbox supports files up to 250 MiB, 250 chunks, 1,000 submissions per room and 5 GiB total encrypted storage; interrupted uploads are retained locally for retry and starting a fresh upload removes pending uploads older than 24 hours. Limits allocate encrypted chunk bytes under the room lock; capacity for an entire file is not reserved in advance. Metadata and envelope storage is separately bounded by payload and object limits.
+All admitted members use a shared room receiving key carried in the trusted invitation fragment. The private key stays in browsers; the API stores its public key and encrypted file-key envelopes. Admission, credential validity, geographic checks, revocation and room expiry still gate every file API request. New members can read earlier publications without an online organizer. Removing access blocks future requests, but cannot retract ciphertext, keys or plaintext already downloaded. Anyone with the invitation secret and a separately obtained ciphertext copy can decrypt that copy: this design intentionally gives admitted members equal file access, rather than individual cryptographic isolation.
 
-Downloads authenticate each encrypted chunk and the complete manifest before saving the plaintext. Browsers with the Origin Private File System stage plaintext locally and verify it before final save. A save-file picker copies verified data to the chosen file and removes staging. Standard browser downloads retain their temporary source until you use Remove local download copies after saving; at most five copies are accepted sequentially. This avoids canceling an active download. Browsers without private file storage are limited to 50 MiB memory downloads. Browser storage can be cleared by the user or browser policy. Keep the encrypted key backup separately and protect its passphrase. Backups contain decryption keys but do not contain session authorization, room membership, pending upload ciphertext, or a way to recover an expired/removed browser session.
+Invitation fragments are not sent in HTTP requests. The browser validates the invitation key against the room's registered public fingerprint silently. A fingerprint identifies a key; it is not independently verified institutional identity.
 
-`GET /api/rooms/:id/activity` returns `{ events, nextCursor }`, with up to 20 newest-first events. Pass `?before=<nextCursor>` for the next page. Cursors are numeric event IDs represented as strings; all requests independently verify room ownership. Logged timestamps use the database clock.
+Private keys live in IndexedDB. Optional organizer key replacement atomically rewraps the organizer's personal envelopes and requires pending uploads to finish or be discarded first. It preserves the shared room key and student access; it does not revoke a leaked room secret. Candidate keys are saved before server commit so a lost response can be reconciled. Export a fresh organizer backup afterward. Encrypted backups use PBKDF2-HMAC-SHA256 (600,000 iterations), a random salt and AES-256-GCM. Organizer backups include the room receiving key; restoration validates the room, registered fingerprints and keypairs. The browser clears the passphrase after successful export/restore.
 
-### Encryption and trust limits
+Migration 011 adds shared room access. Open an existing active room once in its organizer browser to upgrade earlier files automatically, then distribute its current invitation. No ciphertext is re-uploaded. Legacy individual-envelope APIs remain compatible until that upgrade. An original organizer backup can derive the initial room receiving key; after organizer key replacement use the latest backup.
 
-Every upload has a fresh 32-byte secret and 32-byte HKDF salt. Separate HKDF-SHA256 labels derive content and metadata AES-256-GCM keys. Chunk nonces combine a random eight-byte prefix with a four-byte big-endian index; metadata uses a separate random 12-byte nonce and key. IndexedDB reserves each index before encryption and atomically saves its immutable ciphertext. If that ciphertext is lost after reservation, the upload must be discarded and restarted with a fresh key. A retry never encrypts changed data with the old nonce.
+Downloads use Origin Private File System staging when available. Save-file-picker downloads remove staging after saving; fallback downloads retain their temporary source until “Remove local download copies” is used (at most five retained copies). Without OPFS, memory downloads are limited to 50 MiB. Browser/device compromise can expose private keys and local plaintext.
 
-HPKE uses RFC 9180 Base mode with P-256/HKDF-SHA256/AES-256-GCM. Envelope info and authenticated data bind protocol version, room, upload, recipient fingerprint and purpose. Metadata binds room/upload/purpose; chunk authenticated data additionally binds index and plaintext length. Completion verifies a SHA-256 manifest of the encrypted descriptor and ordered ciphertext hashes. A receipt records server acceptance and is not an independent signed attestation. The library is checked against the [published RFC test-vector revision](https://github.com/cfrg/draft-irtf-cfrg-hpke/blob/5f503c564da00b0687b3de75f1dfbdfc4079ad31/test-vectors.json).
+## Location restrictions
 
-Key backups use PBKDF2-HMAC-SHA256 with 600,000 iterations, a random 16-byte salt and AES-256-GCM with a random 12-byte nonce. Version 1 fixes the KDF cost rather than accepting attacker-supplied iteration counts. Inputs and decoded byte lengths are bounded before derivation. Restoration checks the room, public fingerprint and private/public key match before retaining a key. Passphrases stay in the browser.
+Areas range from 50 metres to 50 kilometres. An area can change on an active room until anyone has been admitted; revocation does not unlock it. Place lookup supplies a center/label, not an authorization decision.
 
-Content encryption assumes the intended browser application executes. A malicious server serving modified JavaScript could steal plaintext or keys. Session relationships, admission labels, room descriptions, sizes, timings and network addresses are not concealed by this feature. Private keys, pending upload keys and decrypted download copies are local browser data; they are not protected against compromise of that browser or device. Closure and expiry block future API access. Submission cleanup logically deletes encrypted submission rows from the active database, but does not erase backups, browser keys or files already saved by a recipient.
+Joining requires a fresh location with accuracy at most 75 m. The browser watches for up to 20 seconds so an initial coarse network location can improve. If it remains inaccurate, the app explains the reported uncertainty and asks the participant to enable precise location and retry near a window or outdoors; it does not reduce the admission accuracy requirement. Participant room entry, encryption-key registration, key retrieval, file lists and every ciphertext chunk require an inside location checked within five minutes, using the database clock. Owners are exempt. Participants can refresh with `POST /api/rooms/:id/position`. The browser room page refreshes stale fixes on demand.
 
-## Location-restricted rooms
+Location is self-reported by the browser and can be spoofed; this is not cryptographic proof of physical presence. Coordinates reach the server and appear as proximity information for the organizer. Cleanup clears stored proximity fields after 24 hours. `GEO_STALE`, `GEO_OUTSIDE`, `GEO_REQUIRED` and `GEO_INACCURATE` explain rejected fixes.
 
-An organizer can restrict a draft room to a circular area so that only devices physically inside it can request access or enter. Set the area from a room overview: search for a place (for example a city or campus) or use your current location, then adjust the radius from 50 metres to 50 kilometres. Place search uses OpenStreetMap Nominatim and only supplies a centre, a suggested radius and a display label. Disable it with `GEOCODING=false`, or point `NOMINATIM_URL` at another geocoder.
+## Zero-knowledge credential gate
 
-A participant must send a fresh, accurate location fix with a join request. The server computes the great-circle distance and rejects requests outside the area with `403 GEO_OUTSIDE`, missing or denied location with `403 GEO_REQUIRED`, a stale reading with `403 GEO_STALE`, and a low-accuracy reading with `422 GEO_INACCURATE`. Approved participants re-share a fix on entry: the last reading must be inside the area and no more than five minutes old, otherwise entry is refused with `403 GEO_STALE` or `403 GEO_OUTSIDE`. Without a location, a participant cannot join or enter. The area is fixed once the room opens and can be cleared while it is still a draft.
+The v2 issuer signs `Poseidon(secret, department, year, validUntil)` using EdDSA BabyJubjub/Poseidon. The browser proves signature possession and the required public attributes with the committed Circom/Groth16 artifacts. Only the proof and nine public signals reach the API: nullifier, session binding, issuer coordinates, department, year, room scope, challenge and signed expiry. The random ten-minute challenge belongs to one room/session and is consumed transactionally on successful admission. The circuit binds it through `Poseidon(secret, challenge)`, independently of the stable per-room nullifier. Verification binds every public signal to the room's pinned requirement.
 
-Coordinates and accuracy are stored on the membership so the organizer can see whether a participant was inside and how far away they were. The browser requests a location only when joining, entering, or refreshing an expired reading. This is presence at the moment of the request, not proof of residence. Because the server must evaluate the distance, the participant's approximate coordinates reach the server; unlike submission contents, they are not end-to-end encrypted.
+The per-room nullifier `Poseidon(secret, roomScope(roomId))` enforces one credential per room across browser sessions. Revoking access does not release that credential's seat. Nullifiers differ across rooms, but browser sessions, network addresses and timing still permit correlation. The credential file is a bearer secret; someone who copies it can impersonate its holder subject to the one-seat rule. A copied proof fails in another browser session or after the challenge is consumed. The signed expiry continues to apply to already-admitted room and file access.
 
-## Database and access boundaries
+Admission rules freeze after the first admission, including after revocation. If a gate is added while requests are pending, those participants must prove their credentials; manual approval cannot bypass the gate.
 
-`sessions` contains hashed browser credentials and their expiry. `rooms` belongs to one organizer session and has a unique random join address. `memberships` links one browser session to one room with a pending, approved, denied, or revoked status. `schema_migrations` records applied SQL and checksums. Foreign keys, uniqueness, checks and indexes are defined in `server/migrations/001_initial.sql`.
+Demo commands:
 
-The public join page exposes only title, description, effective status and deadline, plus the caller's own membership state. Private room entry requires approved membership. Only the room owner can edit metadata, change lifecycle, inspect requests or decide membership. Approval and lifecycle changes lock the room in a transaction so concurrent requests cannot bypass closure. Revoked and denied sessions cannot request access again to that room. A new browser session can request again, so this prototype does not implement a human-level ban.
+```bash
+npm run zk:issue -- --dept CSE --year 2026 --out credentials/student1.json
+npx tsx scripts/issuer.ts verify --credential credentials/student1.json
+npm run zk:prove -- --credential credentials/student1.json --room <room-uuid> --challenge <challenge-from-api>
+```
 
-Writes require the configured Origin and a CSRF token derived from the session secret. Cookies are HttpOnly and SameSite=Strict, and gain Secure plus the `__Host-` prefix in production. API responses use no-store caching, JSON payloads have a size limit, input objects reject unknown fields, SQL uses parameters, and request limits use browser sessions rather than grouping every workshop participant under one Wi-Fi address.
+Generated credentials default to `credentials/credential-<DEPT>-<YEAR>.json` when `--out` is omitted. Parent folders are created automatically. The `credentials/` folder is excluded from Git and Docker builds; use a distinct filename for each student. Existing files are never overwritten.
 
-## API
+`npx tsx scripts/issuer.ts keygen --out <private-key-path> --public <public-key-path>` generates an issuer. Keep its private file outside the repository and configure the API with the public JSON via `ISSUER_PUBLIC_KEY`. Existing rooms retain their pinned issuer. The bundled `fixtures/dev-issuer.json` is public: anyone can mint demo credentials. `npm run zk:build` regenerates all prover/verifier artifacts together using a **development-only** setup. It is not a multi-party ceremony.
 
-Start with `POST /api/session` and an `Origin` header equal to `APP_ORIGIN`. Preserve its cookie and use the returned `csrfToken` as `X-CSRF-Token` on subsequent writes. All remaining room routes require a valid session.
+The issuer CLI supports signed expiry and signed room-scoped revocations through `/api/issuer/revocations`. The supplied institution-side revocation worker and timer apply scoped revocations across active and newly created rooms. Institutions must connect private issuance/delivery and the worker to their actual roster/portal and accept the scheduled delivery latency. The server rejects development ceremony artifacts and the known demo issuer in production unless demo mode is explicit. External ceremony import verifies the contribution chain and circuit match and emits checked hash manifests. No independent security audit or actual institutional ceremony has been performed. See [DEPLOYMENT.md](DEPLOYMENT.md) for the operator workflow.
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| GET | `/api/health` | Database readiness |
-| POST | `/api/session` | Start or reuse a browser session |
-| GET | `/api/rooms` | List the caller's owned/requested rooms |
-| POST | `/api/rooms` | Create a draft |
-| POST | `/api/rooms/:id/duplicate` | Create an owner-only draft from a room template |
-| GET | `/api/rooms/:id` | Read owner or approved-participant room details |
-| PATCH | `/api/rooms/:id` | Replace title, description and expiry |
-| POST | `/api/rooms/:id/open` | Open a draft |
-| POST | `/api/rooms/:id/close` | Close a draft or open room |
-| POST | `/api/rooms/:id/submission-cleanup` | Owner enables irreversible automatic cleanup with an empty JSON object |
-| GET | `/api/join/:code` | Read public room details and own admission state |
-| POST | `/api/join/:code` | Request access with `{ "label": "Team Cedar" }` and, for a restricted room, `{ lat, lng, accuracyM, timestamp }` |
-| GET | `/api/geo/search` | Search places for a room area with `?q=Warangal` |
-| POST | `/api/rooms/:id/geo` | Owner sets a draft room's area with `{ lat, lng, radiusM, label?, source? }` |
-| DELETE | `/api/rooms/:id/geo` | Owner clears a draft room's area |
-| GET | `/api/rooms/:id/members` | List requests for the owner |
-| GET | `/api/rooms/:id/activity` | Read paginated organizer-only activity |
-| PATCH | `/api/rooms/:id/members/:memberId` | Decide `{ "status": "approved" }`, `denied`, or `revoked` |
-| GET | `/api/rooms/:id/submissions/keys` | Read public recipient keys for the owner or approved participant |
-| POST | `/api/rooms/:id/submissions/owner-key` | Register the immutable organizer public key |
-| POST | `/api/rooms/:id/submissions/submitter-key` | Register the current browser's immutable submitter public key |
-| POST/PUT | `/api/rooms/:id/submissions` and `/api/rooms/:id/submissions/:submissionId/metadata` | Start an encrypted upload and set its encrypted descriptor and recipient envelopes |
-| PUT/POST | `/api/rooms/:id/submissions/:submissionId/chunks/:index` and `/complete` | Store immutable encrypted chunks and finalize a verified receipt |
-| GET | `/api/rooms/:id/submissions` | Read a private, paginated list of completed submissions |
-| GET | `/api/rooms/:id/submissions/:submissionId/chunks/:index` | Retrieve one authorized encrypted chunk |
-| DELETE | `/api/rooms/:id/submissions/:submissionId` | Discard an incomplete upload |
+## Retention, activity and access
 
-Creation and metadata edits accept `title`, `description`, and an ISO timestamp `expiresAt` with an offset. Errors have an `error` object containing `code` and `message`. Important responses are 401 for missing/expired sessions, 403 for forbidden actions, 409 for invalid transitions, 410 for terminal rooms, and 422 for invalid input.
+At room expiry, a cleanup pass deletes all room files, envelopes and chunks and sets `files_purged_at`. Cleanup runs at startup and roughly every minute with bounded batches; backlog/downtime can delay physical deletion. Closing early blocks access but does not purge before expiry. Stale incomplete uploads are removed after 24 hours. This is logical deletion in the active database, not erasure of backups or downloaded copies.
 
-The duplicate endpoint requires a fresh `expiresAt`. Optional `title` and `description` override the original values; omitted values are copied. It applies the same deadline/session limits as ordinary room creation.
+Organizer-only activity records lifecycle, membership, credential admission, key registration, publication and cleanup. Action/history writes commit together. `GET /api/rooms/:id/activity?before=<cursor>` returns up to 20 events. The UI polls every five seconds and supports older pages. This is an operational history, not a tamper-proof log.
 
-## Study order and verification
+Writes require the configured Origin and session-derived `X-CSRF-Token`. Cookies use HttpOnly/SameSite=Strict and Secure/`__Host-` in production. API responses use `no-store`. PostgreSQL-backed atomic windows coordinate limits across API instances: ordinary requests allow 120/minute/session, file chunk requests have a separate 600/minute/session budget, and new session creation is bounded to 30/minute/IP to prevent resetting budgets by requesting fresh cookies. Reusing a valid session does not consume the creation budget. Set `TRUST_PROXY_HOPS` only for a controlled proxy path; zero hops are trusted by default.
 
-Read `shared/rooms.ts`, then the SQL migration, `server/sessions.ts`, `server/rooms.ts`, and the frontend components. `server/app.ts` assembles middleware and routes; `server/database.ts` separates database drivers from room logic.
+A server serving malicious JavaScript can steal browser plaintext, private keys and credential secrets. Room metadata, labels, sizes, timing, membership relationships and network addresses are not concealed. The protocol does not prevent copying downloaded files.
 
-Run `npm test` for API integration tests against real embedded PostgreSQL, `npm run build` for strict type checking and the frontend build, and `npm run test:e2e` for the browser workflow. Browser tests use installed Microsoft Edge on Windows; on other platforms first run `npx playwright install chromium`. They start isolated API/frontend servers on ports 3002/5174 and use `.data/e2e-private-inbox` rather than your development database. Desktop and mobile screenshots are saved in the parent workspace's `outputs` directory.
+## API map
 
-Anonymous membership proofs and secure device pairing are not implemented. Key verification relies on an organizer-delivered invitation or an explicit out-of-band fingerprint comparison; the app does not provide an independent identity authority.
+All endpoints are under `/api`. Start/reuse a session with `POST /session`; preserve the cookie and use the returned CSRF token on writes. Errors contain `{ error: { code, message } }`.
+
+| Endpoint | Operations |
+| --- | --- |
+| `/health`, `/session` | GET readiness; POST session |
+| `/rooms` | GET workspace; POST draft |
+| `/rooms/:id` | GET authorized room; PATCH metadata |
+| `/rooms/:id/duplicate` | POST fresh owner-only draft |
+| `/rooms/:id/open`, `/rooms/:id/close` | POST lifecycle transition |
+| `/join/:code` | GET public details/own status; POST request/proof |
+| `/rooms/:id/credential` | PUT requirement; DELETE gate before first admission |
+| `/geo/search`, `/rooms/:id/geo` | GET place search; POST/DELETE area before first admission |
+| `/rooms/:id/position` | POST fresh participant location |
+| `/rooms/:id/members`, `/rooms/:id/members/:memberId` | GET owner list; PATCH admission decision |
+| `/rooms/:id/activity` | GET owner history with optional `before` |
+| `/rooms/:id/keys/owner`, `/rooms/:id/keys/participant` | POST immutable public key |
+| `/rooms/:id/keys/room-access` | POST immutable shared room public key (owner only) |
+| `/rooms/:id/files/room-access` | POST shared envelopes for earlier publications (owner only) |
+| `/rooms/:id/files/keys` | GET authorized recipient key information |
+| `/rooms/:id/files` | POST owner upload with `fileId`; GET authorized list with optional `before` |
+| `/rooms/:id/files/:fileId/metadata` | PUT encrypted descriptor/envelopes |
+| `/rooms/:id/files/:fileId/chunks/:index` | PUT owner ciphertext; GET authorized ciphertext |
+| `/rooms/:id/files/:fileId/complete` | POST chunk count/manifest |
+| `/rooms/:id/files/:fileId` | DELETE owner upload or published file; `?incompleteOnly=true` restricts cleanup to incomplete attempts |
+| `/join/:code/challenge` | POST a ten-minute proof challenge for this browser session |
+| `/issuer/revocations` | POST an issuer-signed room/nullifier revocation |
+| `/rooms/:id/keys/rotate` | POST replacement key and every existing file envelope |
+| `/rooms/:id/files/grants` | POST organizer-authorized earlier-file envelopes |
+| `/rooms/:id/recovery`, `/rooms/recover` | POST create/rotate code; POST redeem once |
+| `/rooms/:id/files/:fileId/upload` | GET owner upload/chunk progress |
+| `/ops/metrics` | GET token-protected backlog/storage metrics |
+
+## Verification and remaining work
+
+```bash
+npm test
+npm run build
+npx playwright install chromium
+npm run test:e2e
+npm run test:compat
+npm run test:production
+npm run test:large
+```
+
+API tests use an isolated embedded database, including real credential proofs, authorization, retention, quotas and rate-limit regressions. Browser tests start isolated servers (main suite 3002/5174, compatibility 3004/5175, large-file 3005/5176, HTTPS smoke 3003/5443) and generate real proofs, perform encrypted file transfers and test organizer/participant backup restoration. Their persistent test data is separate from the development database; screenshots go to `../outputs`.
+
+See [AUDIT.md](AUDIT.md) for fixes, validation and prioritized remaining work. The original completion-snapshot report and presentation PDFs live under `docs/` and the parent workspace `../docs`. Their generator and evidence sources are versioned; use this README and `docs/CODE_GUIDE.md` for the later automatic-access changes. The 250 MiB benchmark, load probe and restore evidence live under `benchmark-results/`.
+
+## Upgrade note
+
+Credential protocol v2 requires newly issued v2 credentials and coordinated prover/verifier assets. Migration 010 returns approved legacy v1 credential admissions to pending so they can prove again; denied/revoked browsers remain blocked. Back up before applying migrations. Browser private storage is not included in server backups. Participant uploads remain excluded.
+
+For the presentation, see [docs/CODE_GUIDE.md](docs/CODE_GUIDE.md) for the custom source-file inventory, code walkthrough and library boundaries.

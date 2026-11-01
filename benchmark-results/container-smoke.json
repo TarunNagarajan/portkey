@@ -1,0 +1,9 @@
+{
+  "health": 200,
+  "frontend": 200,
+  "secureHostCookie": true,
+  "nonRootUser": "node",
+  "imageId": "sha256:b964e2b7ba56444e73ca7a72a33bbb45f0eb565b59d246d1834726f72af7ff25",
+  "csp": "default-src 'self';base-uri 'self';font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;object-src 'none';script-src 'self' 'wasm-unsafe-eval';script-src-attr 'none';style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests;worker-src 'self' blob:",
+  "measuredAt": "2026-11-01T16:07:58.001Z"
+}

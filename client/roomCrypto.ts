@@ -15,7 +15,9 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const DB_NAME = 'portkey-private-keys';
 const KEY_STORE = 'room-keys';
-const UPLOAD_STORE = 'uploads';
+// A historical protocol label that is bound into every encrypted descriptor,
+// envelope info and chunk AAD. It must not change, or ciphertext published by
+// earlier builds could no longer be decrypted.
 const PROTOCOL = 'portkey-private-submission-v1';
 const bufferSource = (value: Uint8Array): ArrayBuffer =>
   Uint8Array.from(value).buffer;
@@ -55,15 +57,13 @@ function database(): Promise<IDBDatabase> {
     opening.onupgradeneeded = () => {
       if (!opening.result.objectStoreNames.contains(KEY_STORE))
         opening.result.createObjectStore(KEY_STORE);
-      if (!opening.result.objectStoreNames.contains(UPLOAD_STORE))
-        opening.result.createObjectStore(UPLOAD_STORE);
     };
     opening.onsuccess = () => resolve(opening.result);
     opening.onerror = () => reject(opening.error);
   });
 }
 
-async function storeKey(roomId: string, value: RecipientKeyPair) {
+export async function storeKey(roomId: string, value: RecipientKeyPair) {
   const db = await database();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(KEY_STORE, 'readwrite');
@@ -137,238 +137,6 @@ export async function retainConfirmedKey(
   }
 }
 
-export const retainPendingKey = retainConfirmedKey;
-
-export interface UploadPlan {
-  roomId: string;
-  objectId: string;
-  fileSize: number;
-  chunkSizes: number[];
-  sourceDigests: (string | null)[];
-  cipherDigests: (string | null)[];
-  chunkStates: ('new' | 'encrypting' | 'sealed')[];
-  fileKey: string;
-  keySalt: string;
-  noncePrefix: string;
-  descriptor: string;
-  ownerEnvelope: Envelope;
-  submitterEnvelope: Envelope;
-}
-
-const uploadPlanSchema = z
-  .object({
-    roomId: z.string().uuid(),
-    objectId: z.string().uuid(),
-    fileSize: z.number().int().min(0).max(262144000),
-    chunkSizes: z.array(z.number().int().min(0).max(1048576)).min(1).max(250),
-    sourceDigests: z
-      .array(
-        z
-          .string()
-          .regex(/^[a-f0-9]{64}$/)
-          .nullable(),
-      )
-      .max(250),
-    cipherDigests: z
-      .array(
-        z
-          .string()
-          .regex(/^[a-f0-9]{64}$/)
-          .nullable(),
-      )
-      .max(250),
-    chunkStates: z.array(z.enum(['new', 'encrypting', 'sealed'])).max(250),
-    fileKey: z.string().max(100),
-    keySalt: z.string().max(100),
-    noncePrefix: z.string().max(50),
-    descriptor: z.string().max(22000),
-    ownerEnvelope: z.object({
-      enc: z.string().max(100),
-      ciphertext: z.string().max(500),
-    }),
-    submitterEnvelope: z.object({
-      enc: z.string().max(100),
-      ciphertext: z.string().max(500),
-    }),
-  })
-  .strict();
-
-async function saveUploadPlan(plan: UploadPlan) {
-  const db = await database();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(UPLOAD_STORE, 'readwrite');
-    tx.objectStore(UPLOAD_STORE).put(plan, `plan:${plan.objectId}`);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () =>
-      reject(
-        tx.error ?? new Error('Local browser storage transaction was aborted.'),
-      );
-  }).finally(() => db.close());
-}
-
-export async function loadUploadPlans(roomId: string) {
-  const db = await database();
-  const plans = await new Promise<UploadPlan[]>((resolve, reject) => {
-    const values: UploadPlan[] = [];
-    const tx = db.transaction(UPLOAD_STORE);
-    const request = tx.objectStore(UPLOAD_STORE).openCursor();
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (!cursor) return;
-      if (String(cursor.key).startsWith('plan:')) {
-        const parsed = uploadPlanSchema.safeParse(cursor.value);
-        if (parsed.success && parsed.data.roomId === roomId)
-          values.push(parsed.data);
-      }
-      cursor.continue();
-    };
-    tx.oncomplete = () => resolve(values);
-    request.onerror = () => reject(request.error);
-  }).finally(() => db.close());
-  return plans;
-}
-
-async function loadCipherChunk(
-  objectId: string,
-  index: number,
-): Promise<{
-  ciphertext: Uint8Array;
-  sourceDigest: string;
-  cipherDigest: string;
-} | null> {
-  const db = await database();
-  const value = await new Promise<
-    | { ciphertext: ArrayBuffer; sourceDigest: string; cipherDigest: string }
-    | undefined
-  >((resolve, reject) => {
-    const request = db
-      .transaction(UPLOAD_STORE)
-      .objectStore(UPLOAD_STORE)
-      .get(`chunk:${objectId}:${index}`);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  }).finally(() => db.close());
-  return value
-    ? {
-        ciphertext: new Uint8Array(value.ciphertext),
-        sourceDigest: value.sourceDigest,
-        cipherDigest: value.cipherDigest,
-      }
-    : null;
-}
-
-async function reserveChunk(
-  objectId: string,
-  index: number,
-  sourceDigest: string,
-): Promise<'reserved' | 'sealed' | 'lost'> {
-  const db = await database();
-  let result: 'reserved' | 'sealed' | 'lost' = 'lost';
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(UPLOAD_STORE, 'readwrite');
-    const store = tx.objectStore(UPLOAD_STORE);
-    const request = store.get(`plan:${objectId}`);
-    request.onsuccess = () => {
-      const parsed = uploadPlanSchema.safeParse(request.result);
-      if (!parsed.success) {
-        tx.abort();
-        return;
-      }
-      const plan = parsed.data;
-      if (plan.sourceDigests[index] !== sourceDigest) {
-        result = 'lost';
-        tx.abort();
-        return;
-      }
-      if (plan.chunkStates[index] === 'sealed') {
-        result = 'sealed';
-        return;
-      }
-      if (plan.chunkStates[index] === 'encrypting') {
-        result = 'lost';
-        tx.abort();
-        return;
-      }
-      plan.sourceDigests[index] = sourceDigest;
-      plan.chunkStates[index] = 'encrypting';
-      store.put(plan, `plan:${objectId}`);
-      result = 'reserved';
-    };
-    request.onerror = () => reject(request.error);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => resolve();
-  }).finally(() => db.close());
-  return result;
-}
-
-async function saveCipherChunk(
-  objectId: string,
-  index: number,
-  ciphertext: Uint8Array,
-  sourceDigest: string,
-  cipherDigest: string,
-) {
-  const db = await database();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(UPLOAD_STORE, 'readwrite');
-    const store = tx.objectStore(UPLOAD_STORE);
-    const request = store.get(`plan:${objectId}`);
-    request.onsuccess = () => {
-      const parsed = uploadPlanSchema.safeParse(request.result);
-      if (
-        !parsed.success ||
-        parsed.data.chunkStates[index] !== 'encrypting' ||
-        parsed.data.sourceDigests[index] !== sourceDigest
-      ) {
-        tx.abort();
-        return;
-      }
-      const plan = parsed.data;
-      plan.chunkStates[index] = 'sealed';
-      plan.cipherDigests[index] = cipherDigest;
-      store.put(plan, `plan:${objectId}`);
-      store.add(
-        { ciphertext: bufferSource(ciphertext), sourceDigest, cipherDigest },
-        `chunk:${objectId}:${index}`,
-      );
-    };
-    request.onerror = () => reject(request.error);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () =>
-      reject(
-        tx.error ?? new Error('Local browser storage transaction was aborted.'),
-      );
-  }).finally(() => db.close());
-}
-
-export async function clearUpload(objectId: string) {
-  const db = await database();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(UPLOAD_STORE, 'readwrite');
-    const store = tx.objectStore(UPLOAD_STORE);
-    const request = store.openCursor();
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (!cursor) return;
-      if (
-        String(cursor.key) === `plan:${objectId}` ||
-        String(cursor.key).startsWith(`chunk:${objectId}:`)
-      )
-        cursor.delete();
-      cursor.continue();
-    };
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () =>
-      reject(
-        tx.error ?? new Error('Local browser storage transaction was aborted.'),
-      );
-  }).finally(() => db.close());
-}
-
 export async function digest(value: Uint8Array) {
   return Array.from(
     new Uint8Array(await crypto.subtle.digest('SHA-256', bufferSource(value))),
@@ -397,9 +165,16 @@ export async function hpkeOpen(
   envelope: Envelope,
   info: Uint8Array,
 ) {
-  const privateKey = await suite.kem.deserializePrivateKey(pair.privateKey);
+  // Import both coordinates with the private scalar. Some engines cannot
+  // reconstruct an EC public key from a scalar-only PKCS#8 import.
+  const b64url = (value: Uint8Array) => base64(value).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  const privateKey = await suite.kem.importKey('jwk', {
+    kty: 'EC', crv: 'P-256', x: b64url(pair.publicKey.slice(1, 33)),
+    y: b64url(pair.publicKey.slice(33)), d: b64url(pair.privateKey),
+  }, false);
+  const publicKey = await suite.kem.deserializePublicKey(pair.publicKey);
   const recipient = await suite.createRecipientContext({
-    recipientKey: privateKey,
+    recipientKey: { privateKey, publicKey },
     enc: unbase64(envelope.enc),
     info,
   });
@@ -469,36 +244,50 @@ function chunkContext(
   );
 }
 
-export async function prepareSubmission(
+export interface DistributionRecipient {
+  id: string;
+  publicKey: Uint8Array;
+}
+
+export interface DistributionPlan {
+  roomId: string;
+  fileId: string;
+  file: File;
+  fileSize: number;
+  sourceMissing?: boolean;
+  chunkSizes: number[];
+  fileKey: Uint8Array;
+  keySalt: string;
+  noncePrefix: string;
+  descriptor: string;
+  envelopes: { recipientId: string; enc: string; ciphertext: string }[];
+  recipientFingerprints: Record<string, string>;
+  roomEnvelope?: Envelope & { fingerprint: string };
+}
+
+// Encrypts a file once for many recipients. The file key is sealed with HPKE
+// to each approved participant's registered public key, so the server only
+// ever stores ciphertext and per-recipient envelopes.
+export async function prepareDistribution(
   file: File,
   roomId: string,
-  objectId: string,
-  ownerPublic: Uint8Array,
-  ownerFingerprint: string,
-  submitter: RecipientKeyPair,
-): Promise<UploadPlan> {
+  fileId: string,
+  recipients: DistributionRecipient[],
+  roomPublicKey?: Uint8Array,
+): Promise<DistributionPlan> {
+  const count = Math.max(1, Math.ceil(file.size / (1024 * 1024)));
+  if (count > 250)
+    throw new Error('The file exceeds the 250 MiB distribution limit.');
+  if (recipients.length < 1)
+    throw new Error('There are no approved participants to receive this file.');
   const fileKey = crypto.getRandomValues(new Uint8Array(32));
   const keySalt = crypto.getRandomValues(new Uint8Array(32));
   const noncePrefix = crypto.getRandomValues(new Uint8Array(8));
   const metadataNonce = crypto.getRandomValues(new Uint8Array(12));
   const metadataKey = await deriveAes(fileKey, keySalt, 'metadata');
-  const count = Math.max(1, Math.ceil(file.size / (1024 * 1024)));
-  if (count > 250)
-    throw new Error('The file exceeds the 250 MiB upload limit.');
   const sizes = Array.from({ length: count }, (_, index) =>
     Math.max(0, Math.min(1024 * 1024, file.size - index * 1024 * 1024)),
   );
-  const sourceDigests: string[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const part = new Uint8Array(
-      await file
-        .slice(index * 1024 * 1024, index * 1024 * 1024 + sizes[index])
-        .arrayBuffer(),
-    );
-    if (part.length !== sizes[index])
-      throw new Error('The source file could not be read completely.');
-    sourceDigests.push(await digest(part));
-  }
   const descriptor = {
     protocol: PROTOCOL,
     filename: file.name,
@@ -513,7 +302,7 @@ export async function prepareSubmission(
     JSON.stringify({
       protocol: PROTOCOL,
       roomId,
-      objectId,
+      objectId: fileId,
       purpose: 'encrypted-descriptor',
     }),
   );
@@ -529,32 +318,28 @@ export async function prepareSubmission(
       encoder.encode(JSON.stringify(descriptor)),
     ),
   );
-  const keyBytes = fileKey;
-  const ownerInfo = keyContext(
-    roomId,
-    objectId,
-    ownerFingerprint,
-    'submission-file-key',
+  const envelopes = await Promise.all(
+    recipients.map(async (recipient) => {
+      const recipientFingerprint = await digest(recipient.publicKey);
+      const seal = await hpkeSeal(
+        recipient.publicKey,
+        fileKey,
+        keyContext(roomId, fileId, recipientFingerprint, 'submission-file-key'),
+      );
+      return {
+        recipientId: recipient.id,
+        enc: base64(seal.enc),
+        ciphertext: base64(seal.ciphertext),
+      };
+    }),
   );
-  const submitterInfo = keyContext(
+  return {
     roomId,
-    objectId,
-    submitter.fingerprint,
-    'submission-file-key',
-  );
-  const [ownerEnvelope, submitterEnvelope] = await Promise.all([
-    hpkeSeal(ownerPublic, keyBytes, ownerInfo),
-    hpkeSeal(submitter.publicKey, keyBytes, submitterInfo),
-  ]);
-  const plan: UploadPlan = {
-    roomId,
-    objectId,
+    fileId,
+    file,
     fileSize: file.size,
     chunkSizes: sizes,
-    sourceDigests,
-    cipherDigests: sizes.map(() => null),
-    chunkStates: sizes.map(() => 'new'),
-    fileKey: base64(fileKey),
+    fileKey,
     keySalt: base64(keySalt),
     noncePrefix: base64(noncePrefix),
     descriptor: base64(
@@ -566,82 +351,32 @@ export async function prepareSubmission(
         encryptedDescriptor,
       ),
     ),
-    ownerEnvelope: {
-      enc: base64(ownerEnvelope.enc),
-      ciphertext: base64(ownerEnvelope.ciphertext),
-    },
-    submitterEnvelope: {
-      enc: base64(submitterEnvelope.enc),
-      ciphertext: base64(submitterEnvelope.ciphertext),
-    },
+    envelopes,
+    roomEnvelope: roomPublicKey ? await sealRoomFileKey(roomId, fileId, fileKey, roomPublicKey) : undefined,
+    recipientFingerprints: Object.fromEntries(await Promise.all(recipients.map(async recipient => [recipient.id, await digest(recipient.publicKey)]))),
   };
-  await saveUploadPlan(plan);
-  return plan;
 }
 
-export async function encryptUploadChunk(
-  file: File | null,
-  plan: UploadPlan,
+export async function encryptDistributionChunk(
+  plan: DistributionPlan,
   index: number,
 ) {
-  const cached = await loadCipherChunk(plan.objectId, index);
-  if (cached) {
-    if (file) {
-      const expectedLength = plan.chunkSizes[index];
-      const source = new Uint8Array(
-        await file
-          .slice(index * 1024 * 1024, index * 1024 * 1024 + expectedLength)
-          .arrayBuffer(),
-      );
-      if ((await digest(source)) !== cached.sourceDigest)
-        throw new Error(
-          'The selected file differs from the interrupted upload. Start a new upload to use this file.',
-        );
-    }
-    return cached.ciphertext;
-  }
-  if (!file)
-    throw new Error(
-      'Choose the original file to continue this interrupted upload.',
-    );
-  if (file.size !== plan.fileSize)
-    throw new Error(
-      'The selected file size does not match the interrupted upload.',
-    );
   const plainLength = plan.chunkSizes[index];
   const plaintext = new Uint8Array(
-    await file
+    await plan.file
       .slice(index * 1024 * 1024, index * 1024 * 1024 + plainLength)
       .arrayBuffer(),
   );
   if (plaintext.length !== plainLength)
-    throw new Error('The selected file could not be read completely.');
-  const sourceDigest = await digest(plaintext);
-  const reservation = await reserveChunk(plan.objectId, index, sourceDigest);
-  if (reservation === 'sealed') {
-    const sealed = await loadCipherChunk(plan.objectId, index);
-    if (!sealed || sealed.sourceDigest !== sourceDigest)
-      throw new Error(
-        'The sealed encrypted chunk is missing or belongs to another file. Start a new upload.',
-      );
-    return sealed.ciphertext;
-  }
-  if (reservation !== 'reserved')
-    throw new Error(
-      'This chunk was already reserved for encryption but its immutable ciphertext is missing. Start a new upload.',
-    );
-  const contentKey = await deriveAes(
-    unbase64(plan.fileKey),
-    unbase64(plan.keySalt),
-    'content',
-  );
+    throw new Error('The source file could not be read completely.');
+  const contentKey = await deriveAes(plan.fileKey, unbase64(plan.keySalt), 'content');
   const ciphertext = bytes(
     await crypto.subtle.encrypt(
       {
         name: 'AES-GCM',
         iv: bufferSource(chunkNonce(unbase64(plan.noncePrefix), index)),
         additionalData: bufferSource(
-          chunkContext(plan.roomId, plan.objectId, index, plaintext.length),
+          chunkContext(plan.roomId, plan.fileId, index, plaintext.length),
         ),
         tagLength: 128,
       },
@@ -649,31 +384,23 @@ export async function encryptUploadChunk(
       bufferSource(plaintext),
     ),
   );
-  await saveCipherChunk(
-    plan.objectId,
-    index,
-    ciphertext,
-    sourceDigest,
-    await digest(ciphertext),
-  );
-  return ciphertext;
+  return { ciphertext, sha256: await digest(ciphertext) };
 }
 
-export async function uploadManifest(plan: UploadPlan) {
-  const hashes: Uint8Array[] = [];
-  for (let index = 0; index < plan.chunkSizes.length; index += 1) {
-    const chunk = await loadCipherChunk(plan.objectId, index);
-    if (!chunk)
-      throw new Error(
-        'An encrypted chunk is missing from the local retry store.',
-      );
-    hashes.push(
-      Uint8Array.from(chunk.cipherDigest.match(/../g) ?? [], (value) =>
-        Number.parseInt(value, 16),
+export async function distributionManifest(
+  plan: DistributionPlan,
+  chunkDigests: string[],
+) {
+  return digest(
+    concat(
+      unbase64(plan.descriptor),
+      ...chunkDigests.map((value) =>
+        Uint8Array.from(value.match(/../g) ?? [], (char) =>
+          Number.parseInt(char, 16),
+        ),
       ),
-    );
-  }
-  return digest(concat(unbase64(plan.descriptor), ...hashes));
+    ),
+  );
 }
 
 export async function decryptDescriptor(
@@ -763,7 +490,7 @@ function safeFilename(value: string) {
     value
       .replace(/[\\/\u0000-\u001f]/g, '_')
       .replace(/[^\p{L}\p{N} ._()-]/gu, '_')
-      .slice(0, 255) || 'submission'
+      .slice(0, 255) || 'room-file'
   );
 }
 
@@ -776,16 +503,18 @@ type DownloadDirectory = FileSystemDirectoryHandle & {
 };
 const localDownloadUrls = new Map<string, string>();
 
+export async function privateDirectory(): Promise<FileSystemDirectoryHandle | null> {
+  if (!navigator.storage?.getDirectory) return null;
+  try { return await navigator.storage.getDirectory(); }
+  catch (error) {
+    if (error instanceof DOMException && ['NotAllowedError', 'NotSupportedError', 'UnknownError', 'SecurityError'].includes(error.name)) return null;
+    throw error;
+  }
+}
 async function downloadDirectory() {
-  const storage = navigator.storage as StorageManager & {
-    getDirectory?: () => Promise<FileSystemDirectoryHandle>;
-  };
-  if (!storage.getDirectory) return null;
-  return (await (
-    await storage.getDirectory()
-  ).getDirectoryHandle('portkey-verified-downloads', {
-    create: true,
-  })) as DownloadDirectory;
+  const root = await privateDirectory();
+  if (!root) return null;
+  return await root.getDirectoryHandle('portkey-verified-downloads', { create: true }) as DownloadDirectory;
 }
 
 export async function clearLocalDownloadCopies() {
@@ -803,14 +532,15 @@ export async function clearLocalDownloadCopies() {
   return removed;
 }
 
-export async function decryptSubmissionToDownload(
+export async function decryptRoomFileToDownload(
   roomId: string,
-  submission: {
+  file: {
     id: string;
     descriptor: string;
     envelope: Envelope;
     chunkCount: number;
     manifestSha256: string;
+    envelopeKind?: 'room' | 'personal';
   },
   pair: RecipientKeyPair,
   readCipherChunk: CipherChunkReader,
@@ -818,20 +548,20 @@ export async function decryptSubmissionToDownload(
 ) {
   const info = keyContext(
     roomId,
-    submission.id,
+    file.id,
     pair.fingerprint,
-    'submission-file-key',
+    file.envelopeKind === 'room' ? 'room-file-key' : 'submission-file-key',
   );
-  const fileKey = await hpkeOpen(pair, submission.envelope, info);
+  const fileKey = await hpkeOpen(pair, file.envelope, info);
   if (fileKey.length !== 32)
     throw new Error('The encrypted file key has an invalid length.');
   const descriptor = await decryptDescriptor(
-    submission.descriptor,
+    file.descriptor,
     fileKey,
     roomId,
-    submission.id,
+    file.id,
   );
-  if (descriptor.chunkSizes.length !== submission.chunkCount)
+  if (descriptor.chunkSizes.length !== file.chunkCount)
     throw new Error(
       'The encrypted file manifest has the wrong number of chunks.',
     );
@@ -870,7 +600,7 @@ export async function decryptSubmissionToDownload(
   let total = 0;
   let keepLocalCopy = false;
   try {
-    for (let index = 0; index < submission.chunkCount; index += 1) {
+    for (let index = 0; index < file.chunkCount; index += 1) {
       const chunk = await readCipherChunk(index);
       const actualDigest = await digest(chunk.bytes);
       if (actualDigest !== chunk.sha256)
@@ -888,7 +618,7 @@ export async function decryptSubmissionToDownload(
         descriptor.keySalt,
         descriptor.noncePrefix,
         roomId,
-        submission.id,
+        file.id,
         index,
         descriptor.chunkSizes[index],
       );
@@ -898,9 +628,14 @@ export async function decryptSubmissionToDownload(
       onProgress(total, descriptor.size);
     }
     const manifest = await digest(
-      concat(decodeBase64(submission.descriptor), ...hashes),
+      concat(
+        Uint8Array.from(atob(file.descriptor), (character) =>
+          character.charCodeAt(0),
+        ),
+        ...hashes,
+      ),
     );
-    if (total !== descriptor.size || manifest !== submission.manifestSha256)
+    if (total !== descriptor.size || manifest !== file.manifestSha256)
       throw new Error(
         'The downloaded file does not match its authenticated manifest.',
       );
@@ -947,6 +682,7 @@ export async function exportEncryptedBackup(
   roomId: string,
   pair: RecipientKeyPair,
   password: string,
+  roomAccess?: RecipientKeyPair,
 ) {
   if (password.length < 12 || password.length > 256)
     throw new Error('Use a backup passphrase between 12 and 256 characters.');
@@ -973,6 +709,7 @@ export async function exportEncryptedBackup(
       publicKey: base64(pair.publicKey),
       privateKey: base64(pair.privateKey),
       fingerprint: pair.fingerprint,
+      ...(roomAccess ? { roomAccess: encodeRoomAccess(roomAccess) } : {}),
     }),
   );
   const aad = encoder.encode('portkey-key-backup-v1');
@@ -1000,6 +737,7 @@ export async function restoreEncryptedBackup(
   backupText: string,
   password: string,
   expectedFingerprint: string,
+  options: { storageId?: string; roomAccessFingerprint?: string | null } = {},
 ) {
   if (
     backupText.length > 32_768 ||
@@ -1061,6 +799,7 @@ export async function restoreEncryptedBackup(
       publicKey: z.string().max(200),
       privateKey: z.string().max(700),
       fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+      roomAccess: z.string().max(1000).optional(),
     })
     .strict()
     .parse(JSON.parse(decoder.decode(plaintext)));
@@ -1077,7 +816,7 @@ export async function restoreEncryptedBackup(
     pair.fingerprint !== expectedFingerprint ||
     (await digest(pair.publicKey)) !== expectedFingerprint
   )
-    throw new Error('The backup key does not match this room’s pinned key.');
+    throw new Error('The backup key does not match this room’s registered key.');
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const context = encoder.encode(
     `backup-restore:${roomId}:${expectedFingerprint}`,
@@ -1092,10 +831,85 @@ export async function restoreEncryptedBackup(
     throw new Error(
       'The backup did not restore the registered decryption key.',
     );
-  await retainConfirmedKey(roomId, pair);
+  const shared = value.roomAccess ? await decodeRoomAccess(value.roomAccess) : null;
+  if (shared && options.roomAccessFingerprint && shared.fingerprint !== options.roomAccessFingerprint) throw new Error('The room access backup does not match the registered room.');
+  await retainConfirmedKey(options.storageId ?? roomId, pair);
+  if (shared) await retainConfirmedKey(roomAccessStorageId(roomId), shared);
   return pair;
 }
 
-export const encode = (value: string) => encoder.encode(value);
 export const decodeBase64 = unbase64;
 export const encodeBase64 = base64;
+
+export async function replaceStoredKey(roomId: string, pair: RecipientKeyPair) {
+  const db = await database();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(KEY_STORE, 'readwrite');
+      tx.objectStore(KEY_STORE).put({ publicKey: base64(pair.publicKey), privateKey: base64(pair.privateKey), fingerprint: pair.fingerprint }, roomId);
+      tx.oncomplete = () => resolve(); tx.onabort = tx.onerror = () => reject(tx.error);
+    });
+  } finally { db.close(); }
+}
+export async function loadRegisteredKey(roomId: string, fingerprint: string) {
+  const current = await loadKey(roomId);
+  if (current?.fingerprint === fingerprint) return current;
+  const candidate = await loadKey(`${roomId}:key:${fingerprint}`);
+  if (candidate) { await replaceStoredKey(roomId, candidate); return candidate; }
+  return current;
+}
+export async function rewrapFileKey(roomId: string, item: { id: string; envelope: Envelope; envelopeKind?: 'room' | 'personal' }, pair: RecipientKeyPair, publicKey: Uint8Array) {
+  const key = await hpkeOpen(pair, item.envelope, keyContext(roomId, item.id, pair.fingerprint, item.envelopeKind === 'room' ? 'room-file-key' : 'submission-file-key'));
+  if (key.length !== 32) throw new Error('The file key has invalid bounds.');
+  const sealed = await hpkeSeal(publicKey, key, keyContext(roomId, item.id, await digest(publicKey), 'submission-file-key'));
+  return { enc: base64(sealed.enc), ciphertext: base64(sealed.ciphertext) };
+}
+export async function roomFileName(roomId: string, item: { id: string; envelope: Envelope; descriptor: string; envelopeKind?: 'room' | 'personal' }, pair: RecipientKeyPair) {
+  const key = await hpkeOpen(pair, item.envelope, keyContext(roomId, item.id, pair.fingerprint, item.envelopeKind === 'room' ? 'room-file-key' : 'submission-file-key'));
+  return (await decryptDescriptor(item.descriptor, key, roomId, item.id)).filename;
+}
+
+
+export const roomAccessStorageId = (roomId: string) => `${roomId}:room-access`;
+export function encodeRoomAccess(pair: RecipientKeyPair) {
+  return base64(encoder.encode(JSON.stringify([base64(pair.publicKey), base64(pair.privateKey)]))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+export async function decodeRoomAccess(token: string): Promise<RecipientKeyPair> {
+  if (!/^[A-Za-z0-9_-]{1,1000}$/.test(token)) throw new Error('The room invitation is invalid. Ask the organizer for a fresh invitation.');
+  const raw = token.replaceAll('-', '+').replaceAll('_', '/');
+  const values = z.tuple([z.string().max(100), z.string().max(100)]).parse(JSON.parse(decoder.decode(unbase64(raw))));
+  const publicKey = unbase64(values[0]), privateKey = unbase64(values[1]);
+  if (publicKey.length !== 65 || publicKey[0] !== 4 || privateKey.length !== 32) throw new Error('The room invitation key is invalid.');
+  const pair = { publicKey, privateKey, fingerprint: await digest(publicKey) };
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const context = encoder.encode('portkey-room-access-invitation-v1');
+  const envelope = await hpkeSeal(publicKey, challenge, context);
+  const opened = await hpkeOpen(pair, { enc: base64(envelope.enc), ciphertext: base64(envelope.ciphertext) }, context);
+  if (base64(opened) !== base64(challenge)) throw new Error('The room invitation keypair is invalid.');
+  return pair;
+}
+export async function deriveRoomAccessKey(owner: RecipientKeyPair, roomId: string): Promise<RecipientKeyPair> {
+  const { p256 } = await import('@noble/curves/nist.js');
+  const material = await crypto.subtle.importKey('raw', bufferSource(owner.privateKey), 'HKDF', false, ['deriveBits']);
+  // Derive the scalar and public point without scalar-only WebCrypto imports:
+  // Firefox cannot reliably export those imported keys. Noble supplies P-256
+  // point multiplication; HPKE/WebCrypto still handle file-key encryption.
+  for (let counter = 0; counter < 256; counter++) {
+    const info = counter === 0 ? 'portkey-room-access-v1' : `portkey-room-access-v1:${counter}`;
+    const privateKey = new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: encoder.encode(roomId), info: encoder.encode(info) }, material, 256));
+    if (!p256.utils.isValidSecretKey(privateKey)) continue;
+    const publicKey = p256.getPublicKey(privateKey, false);
+    return { publicKey, privateKey, fingerprint: await digest(publicKey) };
+  }
+  throw new Error('Unable to derive a room receiving key.');
+}
+export async function sealRoomFileKey(roomId: string, fileId: string, fileKey: Uint8Array, publicKey: Uint8Array) {
+  const fingerprint = await digest(publicKey);
+  const envelope = await hpkeSeal(publicKey, fileKey, keyContext(roomId, fileId, fingerprint, 'room-file-key'));
+  return { fingerprint, enc: base64(envelope.enc), ciphertext: base64(envelope.ciphertext) };
+}
+export async function shareExistingFile(roomId: string, item: { id: string; envelope: Envelope; envelopeKind?: 'room' | 'personal' }, owner: RecipientKeyPair, roomPublicKey: Uint8Array) {
+  const key = await hpkeOpen(owner, item.envelope, keyContext(roomId, item.id, owner.fingerprint, 'submission-file-key'));
+  if (key.length !== 32) throw new Error('The stored file key is invalid.');
+  return sealRoomFileKey(roomId, item.id, key, roomPublicKey);
+}

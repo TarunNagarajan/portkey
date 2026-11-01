@@ -65,3 +65,8 @@ export function medianFix(fixes: GeoFix[]): GeoFix {
     accuracyM: median(fixes.map((fix) => fix.accuracyM)),
   };
 }
+
+export function locationAccuracyMessage(accuracyM: number, requiredM: number) {
+  const accuracy = accuracyM >= 1000 ? `${(accuracyM / 1000).toFixed(1)} km` : `${Math.round(accuracyM)} m`;
+  return `Your location is only accurate to about ${accuracy}. This room needs ${requiredM} m or better. Enable precise location for your browser, then retry near a window or outdoors.`;
+}

@@ -5,3 +5,9 @@ dist/
 coverage/
 test-results/
 playwright-report/
+circuits/build/
+credential-*.json
+credentials/
+
+.backups/
+*.dump

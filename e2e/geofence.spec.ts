@@ -19,7 +19,7 @@ test('a room restricted to an area only admits devices inside it', async ({ brow
 
   await owner.getByRole('button', { name: 'Set an area' }).click();
   await owner.getByRole('button', { name: 'Use my current location' }).click();
-  await expect(owner.getByText('My current location')).toBeVisible();
+  await expect(owner.getByText('My current location', { exact: true })).toBeVisible();
   await owner.getByRole('button', { name: 'Apply area' }).click();
   await expect(owner.getByText(/Restricted to/)).toBeVisible();
 
@@ -28,13 +28,19 @@ test('a room restricted to an area only admits devices inside it', async ({ brow
   expect(invite).toMatch(/\/join\//);
 
   const insideContext = await browser.newContext({
-    geolocation: { latitude: 17.96895, longitude: 79.59415, accuracy: 10 },
+    geolocation: { latitude: 17.96895, longitude: 79.59415, accuracy: 2500 },
     permissions: ['geolocation'],
   });
   const inside = await insideContext.newPage();
   await inside.goto(invite!);
   await inside.getByLabel('Your label').fill('Inside student');
   await inside.getByRole('button', { name: 'Share location & request access' }).click();
+  await expect(inside.getByRole('button', { name: 'Getting precise location…' })).toBeVisible();
+  // An approximate phone fix must not be submitted or clamped into an
+  // apparently accurate reading. Wait for the browser to improve it.
+  const pending = await insideContext.request.get(new URL('/api/join/' + new URL(invite!).pathname.split('/').pop(), invite!).href);
+  expect((await pending.json()).membershipStatus).toBeNull();
+  await insideContext.setGeolocation({ latitude: 17.96895, longitude: 79.59415, accuracy: 10 });
   await expect(
     inside.getByText('Waiting for organizer approval. This page updates automatically.'),
   ).toBeVisible();

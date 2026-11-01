@@ -1,0 +1,8 @@
+[Unit]
+Description=Apply institution credential revocations to current and future rooms
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+{
+  "protocol": "portkey-credential-v2",
+  "setup": "development",
+  "ceremony": null,
+  "generatedAt": "2026-11-01T15:36:02.331Z",
+  "hashes": {
+    "circuit": "28b9f6d4c0b47f866e9d91e66d66ae13e8cd9ff0c48b422c3d588b0dd5f5640c",
+    "wasm": "f3c15f246acbf19834da7e80546d73ed39f76af5a4826726e08e40adcb4dfa62",
+    "zkey": "c2144ea31d17a866754420eddf0c05710c0f754d01d671e4834533d72d070f2f",
+    "verificationKey": "c244d67f7d465856e63e621f7815ce90b756be4de711d8e09e96a50bee5ac081",
+    "ptau": "c6a0ce205eefd018d0e211d979a269a407ccbd4b024189073b56bd09ac8e30b7"
+  }
+}

@@ -2,8 +2,11 @@ import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import { Icon } from './ui.js';
 
-export function ShareRoom({ code, fingerprint }: { code: string; fingerprint?: string | null }) {
-  const link = `${window.location.origin}/join/${code}${fingerprint ? `#key=${fingerprint}` : ''}`;
+export function ShareRoom({ code, fingerprint, roomAccess }: { code: string; fingerprint?: string | null; roomAccess?: string | null }) {
+  const fragment = new URLSearchParams();
+  if (fingerprint) fragment.set('key', fingerprint);
+  if (roomAccess) fragment.set('access', roomAccess);
+  const link = `${window.location.origin}/join/${code}${fragment.size ? `#${fragment}` : ''}`;
   const [image, setImage] = useState('');
   const [message, setMessage] = useState('');
 
@@ -26,24 +29,23 @@ export function ShareRoom({ code, fingerprint }: { code: string; fingerprint?: s
       await navigator.clipboard.writeText(link);
       setMessage('Link copied.');
     } catch {
-      setMessage('Select and copy the link below.');
+      setMessage('Open the invitation and copy its address.');
     }
   }
 
   return (
-    <section className="panel share-room" aria-labelledby="share-title">
+    <section className="panel share-room" data-ui aria-labelledby="share-title">
       <div className="qr-frame">
         {image && (
           <img src={image} alt="QR code for this room’s join link" width="156" height="156" />
         )}
-        <span>SCAN TO REQUEST ACCESS</span>
+        <span>Scan to request access</span>
       </div>
       <div>
         <h2 id="share-title">Invite participants</h2>
-        <p>Share this address through a channel participants can trust. Each browser still needs your approval.</p>
-        {fingerprint && <p className="muted">Inbox key fingerprint: <code>{fingerprint}</code></p>}
+        <p>Share this address through a channel participants can trust. Each browser still needs approval or a valid credential proof.</p>
         <a className="join-link" href={link}>
-          {link}
+          Open room invitation
         </a>
         <button type="button" className="secondary" onClick={() => void copy()}>
           <Icon name="copy" />

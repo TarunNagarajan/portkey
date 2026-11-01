@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import supertest from 'supertest';
 import type { Express } from 'express';
 import { createApp } from '../server/app.js';
-import { openDatabase, type Database } from '../server/database.js';
+import { openDatabase, type Database } from './database.js';
 import { migrate } from '../server/migrations.js';
 import type { Room } from '../shared/rooms.js';
 import type { ActivityPage } from '../shared/activity.js';
@@ -153,6 +153,7 @@ test('the join address reveals public details but never owner or membership reco
   const room = await createRoom(owner);
   const response = await visitor.get(`/join/${room.joinCode}`).expect(200);
   assert.deepEqual(Object.keys(response.body).sort(), [
+    'credential',
     'description',
     'expiresAt',
     'geo',
@@ -164,8 +165,6 @@ test('the join address reveals public details but never owner or membership reco
     'organizerKeyFingerprint',
     'organizerPublicKey',
     'status',
-    'submissionCleanupEnabled',
-    'submissionsPurgedAt',
     'title',
   ]);
   await visitor.get(`/rooms/${room.id}/members`).expect(403);
