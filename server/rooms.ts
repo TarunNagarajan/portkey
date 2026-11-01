@@ -22,6 +22,7 @@ import { requireCondition } from "./errors.js";
 import type { Geocoder } from "./geocoding.js";
 import { activityQuery, readActivity, recordActivity } from "./activity.js";
 import type { ActivityKind, RoomField } from "../shared/activity.js";
+import { requireRoomLocation } from "./roomAccess.js";
 
 interface RoomRow {
   id: string;
@@ -139,7 +140,6 @@ function memberView(row: MemberRow) {
   };
 }
 
-const ENTRY_FRESH_MS = 5 * 60 * 1000;
 const FIX_FRESH_MS = 60 * 1000;
 const ACCURACY_CAP_M = 75;
 
@@ -614,36 +614,7 @@ export function roomRoutes(database: Database, geocoder: Geocoder) {
         "Organizer approval is required.",
       );
       requireOpen(row);
-      const geo = geoOf(row);
-      if (geo) {
-        const [membership] = await database.query<{
-          last_inside: boolean | null;
-          last_checked_at: Date | null;
-        }>(
-          "SELECT last_inside, last_checked_at FROM memberships WHERE room_id = $1 AND session_id = $2",
-          [id, request.session!.id],
-        );
-        requireCondition(
-          membership?.last_checked_at,
-          403,
-          "GEO_STALE",
-          "Share a fresh location to enter this room.",
-        );
-        const age =
-          Date.now() - new Date(membership.last_checked_at as Date).getTime();
-        requireCondition(
-          age <= ENTRY_FRESH_MS,
-          403,
-          "GEO_STALE",
-          "Share a fresh location to enter this room.",
-        );
-        requireCondition(
-          membership.last_inside === true,
-          403,
-          "GEO_OUTSIDE",
-          "You are outside this room\u2019s area.",
-        );
-      }
+      await requireRoomLocation(database, id, request.session!.id);
     }
     response.json(roomView(row, request.ownerId ?? ""));
   });

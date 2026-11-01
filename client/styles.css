@@ -1570,3 +1570,45 @@ footer {
     width: calc(100% - 24px);
   }
 }
+.room-files {
+  padding: 22px;
+  margin-block: 24px;
+}
+.room-files > :first-child {
+  margin-top: 0;
+}
+.room-files > :last-child {
+  margin-bottom: 0;
+}
+.room-files .file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--line, #ddd);
+  padding: 12px 0;
+}
+.room-files .file-row span {
+  flex: 1 1 12rem;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.room-files .file-row button {
+  max-width: 100%;
+}
+.room-files .file-select {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.room-files .file-select input[type='file'] {
+  max-width: 100%;
+}
+@media (max-width: 700px) {
+  .room-files {
+    padding: 16px;
+    margin-block: 18px;
+  }
+}

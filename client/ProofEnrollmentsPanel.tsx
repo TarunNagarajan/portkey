@@ -15,7 +15,7 @@ interface IssuedEnrollment extends EnrollmentInfo {
   token: string;
 }
 
-export function ProofEnrollmentsPanel({ room, fingerprint }: { room: Room; fingerprint: string | null }) {
+export function ProofEnrollmentsPanel({ room, fingerprint, filesKey }: { room: Room; fingerprint: string | null; filesKey?: string | null }) {
   const [enrollments, setEnrollments] = useState<EnrollmentInfo[]>([]);
   const [counts, setCounts] = useState({ enrolled: 0, available: 0, revoked: 0 });
   const [batch, setBatch] = useState<IssuedEnrollment[] | null>(null);
@@ -30,7 +30,7 @@ export function ProofEnrollmentsPanel({ room, fingerprint }: { room: Room; finge
   const selected = batch?.find((item) => item.id === selectedId) ?? batch?.[0] ?? null;
   const current = selected ? enrollments.find((item) => item.id === selected.id) : null;
   const selectedUrl = selected && current?.status === 'available' && !terminal
-    ? buildWorkshopEnrollmentUrl(getPublicOrigin(), room.joinCode, fingerprint, selected.token)
+    ? buildWorkshopEnrollmentUrl(getPublicOrigin(), room.joinCode, fingerprint, selected.token, filesKey)
     : '';
 
   async function refresh() {
@@ -106,7 +106,7 @@ export function ProofEnrollmentsPanel({ room, fingerprint }: { room: Room; finge
 
   function downloadCsv() {
     if (!batch) return;
-    const rows = [['Enrollment', 'Link'], ...batch.map((item) => [String(item.number), buildWorkshopEnrollmentUrl(getPublicOrigin(), room.joinCode, fingerprint, item.token)])];
+    const rows = [['Enrollment', 'Link'], ...batch.map((item) => [String(item.number), buildWorkshopEnrollmentUrl(getPublicOrigin(), room.joinCode, fingerprint, item.token, filesKey)])];
     const csv = rows.map((row) => row.map((cell) => `"${cell.replaceAll('"', '""')}"`).join(',')).join('\r\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const anchor = document.createElement('a');

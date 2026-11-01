@@ -29,6 +29,7 @@ interface KeyInfo {
 }
 interface Submission {
   id: string;
+  createdAt: string;
   descriptor: string;
   envelope: { enc: string; ciphertext: string };
   chunkCount: number;
@@ -117,6 +118,12 @@ export function PrivateInbox({
     total: number;
   } | null>(null);
   const transferController = useRef<AbortController | null>(null);
+  const pollController = useRef<AbortController | null>(null);
+  const pollBusy = useRef(false);
+  const generation = useRef(0);
+  const [connectionState, setConnectionState] = useState<'connected' | 'retrying'>('connected');
+  const [accessUnavailable, setAccessUnavailable] = useState(false);
+  const lifecycle = useRef(0);
   const [invitationHash, setInvitationHash] = useState(window.location.hash);
 
   useEffect(() => {
@@ -130,22 +137,89 @@ export function PrivateInbox({
 
   useEffect(() => () => transferController.current?.abort(), []);
   useEffect(() => {
-    if (room.status !== 'open')
+    lifecycle.current += 1;
+    return () => { lifecycle.current += 1; pollController.current?.abort(); };
+  }, [room.id, room.role, invitationHash]);
+  useEffect(() => {
+    if (room.status !== 'open') {
+      generation.current += 1;
+      setSubmissions([]); setNextCursor(null); setAccessUnavailable(true);
+      pollController.current?.abort();
       transferController.current?.abort(
         new DOMException('The room is no longer open.', 'AbortError'),
       );
+    }
   }, [room.status]);
 
-  async function refreshSubmissions(cursor?: string | null) {
+  async function refreshSubmissions(
+    cursor?: string | null,
+    signal?: AbortSignal,
+    requestGeneration = generation.current,
+    lifecycleGeneration = lifecycle.current,
+  ) {
     const query = cursor ? `?before=${encodeURIComponent(cursor)}` : '';
     const page = await api<SubmissionPage>(
       `/rooms/${room.id}/submissions${query}`,
+      'GET', undefined, signal,
     );
-    setSubmissions((current) =>
-      cursor ? [...current, ...page.submissions] : page.submissions,
-    );
-    setNextCursor(page.nextCursor);
+    if (
+      requestGeneration !== generation.current ||
+      lifecycleGeneration !== lifecycle.current ||
+      signal?.aborted
+    )
+      return;
+    setSubmissions((current) => {
+      const merged = new Map(current.map((item) => [item.id, item]));
+      for (const item of page.submissions) merged.set(item.id, item);
+      return [...merged.values()].sort(
+        (a, b) =>
+          b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id),
+      );
+    });
+    if (!cursor) setNextCursor((current) => current ?? page.nextCursor);
+    else setNextCursor(page.nextCursor);
+    setConnectionState('connected');
   }
+
+  useEffect(() => {
+    const currentGeneration = lifecycle.current;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const eligible = room.status === 'open' && !!keys && !!pair && trusted;
+    const refresh = async () => {
+      if (disposed || !eligible || document.visibilityState !== 'visible' || !navigator.onLine) return;
+      if (pollBusy.current) {
+        timer = setTimeout(refresh, 250);
+        return;
+      }
+      pollBusy.current = true;
+      const controller = new AbortController(); pollController.current = controller;
+      try {
+        await refreshSubmissions(null, controller.signal, generation.current, currentGeneration);
+        if (!controller.signal.aborted && currentGeneration === lifecycle.current) setAccessUnavailable(false);
+      }
+      catch (e) {
+        if (controller.signal.aborted || disposed || currentGeneration !== lifecycle.current) return;
+        if (e instanceof ApiError && [401, 403, 410].includes(e.status)) {
+          setSubmissions([]); setNextCursor(null); setAccessUnavailable(true);
+          transferController.current?.abort(new DOMException('Room access changed.', 'AbortError'));
+        } else setConnectionState('retrying');
+      }
+      finally {
+        pollBusy.current = false;
+        if (!disposed && document.visibilityState === 'visible')
+          timer = setTimeout(refresh, 5000);
+      }
+    };
+    const wake = () => {
+      clearTimeout(timer);
+      if (document.visibilityState !== 'visible') { pollController.current?.abort(); return; }
+      void refresh();
+    };
+    document.addEventListener('visibilitychange', wake); window.addEventListener('focus', wake); window.addEventListener('online', wake);
+    if (eligible || room.status === 'open') void refresh();
+    return () => { disposed = true; clearTimeout(timer); pollController.current?.abort(); document.removeEventListener('visibilitychange', wake); window.removeEventListener('focus', wake); window.removeEventListener('online', wake); };
+  }, [room.id, room.role, room.status, keys, pair, trusted]);
 
   async function ensureParticipantKey(
     keyInfo: KeyInfo,
@@ -180,6 +254,8 @@ export function PrivateInbox({
   }
 
   async function loadState() {
+    const currentGeneration = ++generation.current;
+    const currentLifecycle = lifecycle.current;
     setLoading(true);
     setError('');
     setTrusted(room.role === 'owner');
@@ -190,6 +266,7 @@ export function PrivateInbox({
     onOwnerFingerprint?.(null);
     try {
       const keyInfo = await api<KeyInfo>(`/rooms/${room.id}/submissions/keys`);
+      if (currentLifecycle !== lifecycle.current || currentGeneration !== generation.current) return;
       setKeys(keyInfo);
       const apiFingerprint = await digest(decodeBase64(keyInfo.ownerPublicKey));
       if (apiFingerprint !== keyInfo.ownerFingerprint)
@@ -197,6 +274,7 @@ export function PrivateInbox({
           'The organizer’s public key does not match its fingerprint.',
         );
       const saved = await loadKey(room.id);
+      if (currentLifecycle !== lifecycle.current || currentGeneration !== generation.current) return;
       let isTrusted = room.role === 'owner';
       if (
         saved &&
@@ -248,9 +326,10 @@ export function PrivateInbox({
             (saved?.fingerprint === keyInfo.submitterFingerprint ||
               !keyInfo.submitterFingerprint))
       ) {
-        await refreshSubmissions();
+        await refreshSubmissions(undefined, undefined, currentGeneration, currentLifecycle);
       }
     } catch (cause) {
+      if (currentLifecycle !== lifecycle.current || currentGeneration !== generation.current) return;
       if (
         !(
           cause instanceof ApiError &&
@@ -268,13 +347,13 @@ export function PrivateInbox({
         onOwnerFingerprint?.(null);
       }
     } finally {
-      setLoading(false);
+      if (currentLifecycle === lifecycle.current && currentGeneration === generation.current) setLoading(false);
     }
   }
 
   useEffect(() => {
     void loadState();
-  }, [room.id, room.role, invitationHash]);
+  }, [room.id, room.role, room.status, invitationHash]);
 
   async function enableInbox() {
     setBusy(true);
@@ -365,6 +444,7 @@ export function PrivateInbox({
   }
 
   async function transfer(plan: UploadPlan, source: File | null) {
+    if (accessUnavailable || room.status !== 'open') return;
     if (!trusted || !pair || room.status !== 'open') return;
     const controller = new AbortController();
     transferController.current = controller;
@@ -474,7 +554,7 @@ export function PrivateInbox({
   }
 
   async function startUpload() {
-    if (!file || !keys || !pair) return;
+    if (!file || !keys || !pair || accessUnavailable || room.status !== 'open') return;
     if (file.size > 262144000) {
       setError('The file exceeds the 250 MiB limit.');
       return;
@@ -523,7 +603,7 @@ export function PrivateInbox({
   }
 
   async function download(item: Submission) {
-    if (!pair || room.status !== 'open') return;
+    if (!pair || accessUnavailable || room.status !== 'open') return;
     const controller = new AbortController();
     transferController.current = controller;
     setBusy(true);
@@ -628,7 +708,7 @@ export function PrivateInbox({
           </p>
           <button
             className="secondary"
-            disabled={busy}
+                    disabled={busy || accessUnavailable}
             onClick={() => void removeDownloadCopies()}
           >
             Remove local download copies
@@ -732,10 +812,11 @@ export function PrivateInbox({
             Choose a file (up to 250 MiB)
             <input
               type="file"
+              disabled={accessUnavailable}
               onChange={(event) => setFile(event.target.files?.[0] ?? null)}
             />
           </label>
-          <button disabled={busy || !file} onClick={() => void startUpload()}>
+          <button disabled={busy || !file || accessUnavailable} onClick={() => void startUpload()}>
             {busy ? 'Encrypting and uploading…' : 'Submit file privately'}
           </button>
         </div>
@@ -755,7 +836,7 @@ export function PrivateInbox({
                 {plan.chunkSizes.length} chunks
               </span>
               <button
-                disabled={busy || !trusted || !pair || room.status !== 'open'}
+                disabled={busy || !trusted || !pair || room.status !== 'open' || accessUnavailable}
                 onClick={() => void transfer(plan, file)}
               >
                 {file
@@ -784,7 +865,7 @@ export function PrivateInbox({
       {pair && (owner || trusted) && (
         <div className="submission-list">
           <h3>{owner ? 'Received submissions' : 'Your submissions'}</h3>
-          {owner && room.status === 'open' && (
+            {owner && room.status === 'open' && (
             <button
               className="secondary"
               disabled={busy}
@@ -797,6 +878,8 @@ export function PrivateInbox({
               Refresh inbox
             </button>
           )}
+          {owner && room.status === 'open' && connectionState === 'retrying' && <p role="status">Inbox connection interrupted. Retrying automatically.</p>}
+          {accessUnavailable && room.status === 'open' && <p role="status">Room access needs to be refreshed. Retry or share your location again.</p>}
           {submissions.length === 0 ? (
             <p>No completed submissions yet.</p>
           ) : (
@@ -810,7 +893,7 @@ export function PrivateInbox({
                   </span>
                   <button
                     className="secondary"
-                    disabled={busy}
+                    disabled={busy || accessUnavailable}
                     onClick={() => void download(item)}
                   >
                     Decrypt and download

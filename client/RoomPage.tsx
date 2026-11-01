@@ -6,6 +6,8 @@ import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
 import { PrivateInbox } from './PrivateInbox.js';
+import { RoomFiles } from './RoomFiles.js';
+import { roomFileBase64 } from './roomFileCrypto.js';
 import { PassesPanel } from './PassesPanel.js';
 import { ProofEnrollmentsPanel } from './ProofEnrollmentsPanel.js';
 import { RoomProofRuleEditor } from './RoomProofRuleEditor.js';
@@ -18,6 +20,8 @@ export function RoomPage({ id }: { id: string }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [inboxFingerprint, setInboxFingerprint] = useState<string | null>(null);
+  const [filesKey, setFilesKey] = useState<string | null>(null);
+  const onFilesKeyReady = useCallback((key: Uint8Array | null) => setFilesKey(key ? roomFileBase64(key) : null), []);
   const [reusableRule, setReusableRule] = useState<boolean | null>(null);
   const [reusableRuleNames, setReusableRuleNames] = useState<string[]>([]);
   const [proofRuleReady, setProofRuleReady] = useState(false);
@@ -121,10 +125,10 @@ export function RoomPage({ id }: { id: string }) {
         <h2>Submission storage</h2>
         <p>
           {room.submissionsPurgedAt
-            ? 'The server removed this room’s encrypted submissions after its deadline.'
+            ? 'The server removed this room’s encrypted private submissions and shared files after its deadline.'
             : room.submissionCleanupEnabled
-              ? 'Completed encrypted submissions are scheduled for removal after the room deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
-              : 'Automatic room deadline cleanup is disabled. Incomplete uploads are still removed after 24 hours.'}
+              ? 'Completed encrypted private submissions and shared files are scheduled for removal after the room deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
+              : 'Automatic room deadline cleanup is disabled. Incomplete private submissions and shared file uploads are still removed after 24 hours.'}
         </p>
         {room.submissionsPurgedAt && <p>Completed {formatDate(room.submissionsPurgedAt)}.</p>}
         {owner && !room.submissionCleanupEnabled && (
@@ -133,9 +137,9 @@ export function RoomPage({ id }: { id: string }) {
             onClick={() => {
               const alreadyExpired = Date.parse(room.expiresAt) <= Date.now();
               const timing = alreadyExpired
-                ? 'This room is already past its deadline, so submissions become eligible on the next cleanup pass.'
-                : 'Submissions will be removed after the room deadline.';
-              if (window.confirm('Enable automatic submission deletion? This cannot be undone. ' + timing + ' Local copies, browser keys, backups, room history and membership metadata are not erased.'))
+                ? 'This room is already past its deadline, so private submissions and shared files become eligible on the next cleanup pass.'
+                : 'Private submissions and shared files will be removed after the room deadline.';
+              if (window.confirm('Enable automatic room storage deletion? This cannot be undone. ' + timing + ' Local copies, browser keys, backups, room history and membership metadata are not erased.'))
                 void act(() => api('/rooms/' + id + '/submission-cleanup', 'POST', {}));
             }}
           >
@@ -214,10 +218,11 @@ export function RoomPage({ id }: { id: string }) {
               />
             </section>
           )}
-          {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} />}
+          {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} filesKey={filesKey} />}
           {room.admissionPolicy === 'proof' && <RoomProofRuleEditor room={room} onRuleState={onProofRuleState} />}
-          {room.admissionPolicy === 'proof' && reusableRule === false && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} />}
-          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} passMode={room.admissionPolicy === 'pass'} proofMode={room.admissionPolicy === 'proof'} />}
+          {room.admissionPolicy === 'proof' && reusableRule === false && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} filesKey={filesKey} />}
+          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} filesKey={filesKey} passMode={room.admissionPolicy === 'pass'} proofMode={room.admissionPolicy === 'proof'} />}
+          <RoomFiles room={room} onKeyReady={onFilesKeyReady} />
           <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
           {room.status === 'draft' && (
             <div className="notice">
@@ -368,6 +373,7 @@ export function RoomPage({ id }: { id: string }) {
             <p>{room.admissionPolicy === 'proof' ? 'A valid membership proof admitted this browser. Your workshop credential remains in browser storage; clearing site data loses it. The server can still observe browser and network activity.' : room.admissionPolicy === 'pass' ? 'Your one use pass admitted this browser. You can return from this browser until the room closes or your access is removed.' : 'Your organizer-approved access is active for this browser.'}</p>
           </section>
           <PrivateInbox room={room} />
+          <RoomFiles room={room} onKeyReady={onFilesKeyReady} />
         </>
       )}
     </>

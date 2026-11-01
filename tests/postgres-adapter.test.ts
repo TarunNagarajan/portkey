@@ -89,6 +89,39 @@ test('PostgreSQL adapter applies real migrations and preserves transaction guara
     );
     assert.equal(claimCount.count, 1, 'Only one browser may consume the one-use pass.');
 
+    await owner.post(`/rooms/${room.id}/files/key`, { fingerprint: 'a'.repeat(64) }).expect(201);
+    const reservationBytes = [
+      ...Array(20).fill(262148000),
+      125749104,
+    ] as number[];
+    for (const encryptedBytes of reservationBytes) {
+      await database.query(
+        'INSERT INTO private_submissions(id,room_id,submitter_id,encrypted_bytes) VALUES($1,$2,$3,$4)',
+        [randomUUID(), room.id, owner.id, encryptedBytes],
+      );
+    }
+    const makeSharedReservation = () => owner.post(`/rooms/${room.id}/files`, {
+      id: randomUUID(),
+      keyFingerprint: 'a'.repeat(64),
+      descriptor: Buffer.from('opaque PostgreSQL quota fixture').toString('base64'),
+      chunkCount: 1,
+      encryptedBytes: 16,
+    });
+    const reservationResults = await Promise.all([
+      makeSharedReservation(),
+      makeSharedReservation(),
+    ]);
+    assert.deepEqual(
+      reservationResults.map(result => result.status).sort(),
+      [201, 413],
+      'Concurrent room file starts must reserve against the same private and shared quota under the room lock.',
+    );
+    const [sharedReservations] = await database.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM room_files WHERE room_id=$1 AND status='uploading'",
+      [room.id],
+    );
+    assert.equal(sharedReservations.count, 1);
+
     const legacyUrl = new URL(connectionString);
     legacyUrl.searchParams.set('options', `-c search_path=${legacySchema}`);
     legacyDatabase = await openDatabase({ url: legacyUrl.toString() });
@@ -108,8 +141,13 @@ test('PostgreSQL adapter applies real migrations and preserves transaction guara
     await Promise.all([migrate(legacyDatabase), migrate(legacyDatabase)]);
     const [preserved] = await legacyDatabase.query<{ title: string }>('SELECT title FROM rooms WHERE id=$1', [roomId]);
     assert.equal(preserved.title, 'Preserved legacy room', 'Concurrent forward migrations must preserve existing room data.');
-    const [newMigration] = await legacyDatabase.query<{ count: number }>("SELECT count(*)::int AS count FROM schema_migrations WHERE name='011_organizer_accounts.sql'");
-    assert.equal(newMigration.count, 1, 'The forward migration must be recorded once.');
+    const [newMigration] = await legacyDatabase.query<{ count: number }>("SELECT count(*)::int AS count FROM schema_migrations WHERE name='012_room_files.sql'");
+    assert.equal(newMigration.count, 1, 'The room-files migration must be recorded once.');
+    const [preservedMigrations] = await legacyDatabase.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM schema_migrations WHERE name=ANY($1::text[])',
+      [oldMigrations],
+    );
+    assert.equal(preservedMigrations.count, 10, 'All legacy migrations 001 through 010 must remain recorded.');
   } finally {
     await legacyDatabase?.close();
     await database?.close();

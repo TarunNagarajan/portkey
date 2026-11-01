@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { createHash } from 'node:crypto';
 
 test('encrypted submissions require a pinned organizer key and round-trip privately', async ({
   page,
@@ -62,7 +63,7 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   const fixture = {
     name: 'draft notes.txt',
     mimeType: 'text/plain',
-    buffer: Buffer.from('private contents with no server-side filename'),
+    buffer: Buffer.from('private contents with no server-side filename\n'.repeat(50_000)),
   };
   await participant
     .getByLabel('Choose a file (up to 250 MiB)')
@@ -117,10 +118,10 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   await expect(participant.getByText(/Submission accepted at/)).toBeVisible({
     timeout: 30_000,
   });
-  await page.getByRole('button', { name: 'Refresh inbox' }).click();
+  expect(lostCompletion).toBe(true);
   await expect(
     page.getByRole('button', { name: 'Decrypt and download' }),
-  ).toBeVisible();
+  ).toHaveCount(1, { timeout: 20_000 });
 
   await page
     .getByLabel('Backup passphrase')
@@ -176,13 +177,13 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   });
   await page.evaluate(() => {
     const target = window as Window & {
-      __savedFile?: number[];
+      __savedFile?: { chunks: Uint8Array[]; closed: boolean };
       showSaveFilePicker?: (options: unknown) => Promise<unknown>;
     };
     Object.defineProperty(target, '__savedFile', {
       configurable: true,
       writable: true,
-      value: undefined,
+      value: { chunks: [], closed: false },
     });
     Object.defineProperty(target, 'showSaveFilePicker', {
       configurable: true,
@@ -190,8 +191,9 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
         createWritable: async () =>
           new WritableStream({
             write: (chunk: Uint8Array) => {
-              target.__savedFile = [...(target.__savedFile ?? []), ...chunk];
+              target.__savedFile?.chunks.push(chunk.slice());
             },
+            close: () => { if (target.__savedFile) target.__savedFile.closed = true; },
           }),
       }),
     });
@@ -212,20 +214,24 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   );
   expect(
     await page.evaluate(
-      () => (window as Window & { __savedFile?: number[] }).__savedFile,
+      () => (window as Window & { __savedFile?: { chunks: Uint8Array[]; closed: boolean } }).__savedFile,
     ),
-  ).toBeUndefined();
+  ).toEqual({ chunks: [], closed: false });
   await page.unroute('**/api' + ownerRoomPath + '/submissions/*/chunks/*');
   await page.getByRole('button', { name: 'Decrypt and download' }).click();
   await expect
     .poll(() =>
-      page.evaluate(
-        () => (window as Window & { __savedFile?: number[] }).__savedFile,
-      ),
+      page.evaluate(async () => {
+        const saved = (window as Window & { __savedFile?: { chunks: Uint8Array[]; closed: boolean } }).__savedFile;
+        if (!saved?.closed) return null;
+        const bytes = new Uint8Array(saved.chunks.reduce((total, chunk) => total + chunk.length, 0));
+        let offset = 0;
+        for (const chunk of saved.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        return { size: bytes.length, digest: Array.from(new Uint8Array(digest)) };
+      }),
     )
-    .toEqual(
-      Array.from(Buffer.from('private contents with no server-side filename')),
-    );
+    .toEqual({ size: fixture.buffer.length, digest: [...createHash('sha256').update(fixture.buffer).digest()] });
   await page.evaluate(() =>
     Object.defineProperty(window, 'showSaveFilePicker', {
       configurable: true,
