@@ -1,22 +1,20 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
 
-export default defineConfig({
-  plugins: [react()],
-  optimizeDeps: {
-    include: [
-      "@semaphore-protocol/group",
-      "@semaphore-protocol/identity",
-      "@semaphore-protocol/proof",
-    ],
-  },
-  server: {
-    port: 5173,
-    strictPort: true,
-    proxy: {
-      "/api": process.env.API_ORIGIN ?? "http://127.0.0.1:3001",
-      "/v1": process.env.API_ORIGIN ?? "http://127.0.0.1:3001",
+export default defineConfig(({ mode }) => {
+  // The API reads PORT and APP_ORIGIN from the same .env, so the dev proxy must
+  // follow it too; otherwise a changed PORT leaves the frontend calling a port
+  // that nothing (or something else) is listening on.
+  const env = loadEnv(mode, process.cwd(), '');
+  const apiOrigin =
+    process.env.API_ORIGIN ?? env.API_ORIGIN ?? `http://127.0.0.1:${env.PORT ?? '3001'}`;
+  return {
+    plugins: [react()],
+    server: {
+      port: 5173,
+      strictPort: true,
+      proxy: { '/api': apiOrigin },
     },
-  },
-  build: { outDir: "dist/client" },
+    build: { outDir: 'dist/client' },
+  };
 });

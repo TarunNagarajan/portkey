@@ -1,8 +1,45 @@
 import { useEffect, useState } from 'react';
-import type { Room, RoomInput } from '../shared/rooms.js';
-import { api, getPublicOrigin, isLocalOrigin } from './api.js';
+import type { Room, RoomCreateInput } from '../shared/rooms.js';
+import { api } from './api.js';
 import { RoomForm } from './RoomForm.js';
-import { Icon, StatusBadge, formatDate } from './ui.js';
+import { Icon, Lifetime, StatusBadge } from './ui.js';
+
+/* Every room is one line: its name, its invitation, and the window it has left. */
+function RoomRow({ room }: { room: Room }) {
+  const open =
+    room.role === 'owner' || room.membershipStatus === 'approved'
+      ? `/rooms/${room.id}`
+      : `/join/${room.joinCode}`;
+  return (
+    <li>
+      <div className="rooms-main">
+        <a className="room-title" href={open}>
+          {room.title}
+        </a>
+        <p className="rooms-meta">
+          <code>{room.joinCode}</code>
+          <span>
+            {room.role === 'owner' ? 'You organize this room' : `Access ${room.membershipStatus}`}
+          </span>
+        </p>
+        <Lifetime from={room.createdAt} to={room.expiresAt} />
+      </div>
+      <div className="rooms-aside">
+        <StatusBadge status={room.status} />
+        {room.role === 'owner' && (
+          <a
+            className="text-link"
+            aria-label={`Use ${room.title} as a template`}
+            href={`/?template=${room.id}#new-room`}
+          >
+            <Icon name="copy" />
+            Template
+          </a>
+        )}
+      </div>
+    </li>
+  );
+}
 
 export function Home() {
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -12,7 +49,6 @@ export function Home() {
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('all');
   const templateId = new URLSearchParams(window.location.search).get('template');
-  const localOnly = isLocalOrigin(getPublicOrigin());
 
   useEffect(() => {
     let active = true;
@@ -38,7 +74,7 @@ export function Home() {
     };
   }, [templateId]);
 
-  async function create(input: RoomInput) {
+  async function create(input: RoomCreateInput) {
     const path = template ? `/rooms/${template.id}/duplicate` : '/rooms';
     const room = await api<Room>(path, 'POST', input);
     window.location.assign(`/rooms/${room.id}`);
@@ -51,185 +87,244 @@ export function Home() {
         .toLocaleLowerCase()
         .includes(search.trim().toLocaleLowerCase()),
   );
-  const counts = [
-    ['Total rooms', rooms.length],
-    ['Open now', rooms.filter((room) => room.status === 'open').length],
-    ['Drafts', rooms.filter((room) => room.status === 'draft').length],
-    [
-      'Closed / expired',
-      rooms.filter((room) => ['closed', 'expired'].includes(room.status)).length,
-    ],
-  ];
 
   return (
     <>
-      <header className="page-heading">
-        <div>
-          <p className="eyebrow">YOUR WORKSPACE</p>
-          <h1>Your rooms</h1>
-          <p>Manage your workshop rooms and participant access.</p>
+      <section className="hero span-5" aria-labelledby="home-title">
+        <h1 id="home-title" className="headline-reveal">
+          Your rooms
+        </h1>
+        <p className="lede">
+          A room opens with an invitation and no account. Seven days is the longest it can last.
+        </p>
+        <div className="hero-actions">
+          <a className="button" href="#new-room">
+            <Icon name="plus" />
+            New room
+          </a>
+          {rooms.length > 0 && (
+            <a className="text-link" href="#rooms">
+              See the rooms
+              <Icon name="arrow" />
+            </a>
+          )}
         </div>
-        <a className="button" href="#new-room">
-          <Icon name="plus" />
-          New room
-        </a>
-      </header>
-      <dl className="workspace-stats">
-        {counts.map(([label, count]) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd>{loading ? '—' : count}</dd>
+      </section>
+
+      <section
+        className="panel rooms span-6 start-7"
+        id="rooms"
+        data-ui
+        aria-labelledby="directory-title"
+      >
+        <div className="rooms-head">
+          <h2 id="directory-title">Rooms in this browser</h2>
+          <span className="count-label">
+            {loading ? 'Reading…' : `${filtered.length} of ${rooms.length}`}
+          </span>
+        </div>
+        <div className="rooms-tools">
+          <label className="search-field">
+            <span className="sr-only">Search rooms</span>
+            <Icon name="search" />
+            <input
+              type="search"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search rooms"
+            />
+          </label>
+          <label>
+            <span className="sr-only">Filter rooms by status</span>
+            <select value={status} onChange={(event) => setStatus(event.target.value)}>
+              <option value="all">All statuses</option>
+              <option value="draft">Draft</option>
+              <option value="open">Open</option>
+              <option value="closed">Closed</option>
+              <option value="expired">Expired</option>
+            </select>
+          </label>
+        </div>
+        {loading && (
+          <p className="muted" role="status">
+            Reading this browser’s rooms…
+          </p>
+        )}
+        {!loading && rooms.length === 0 && (
+          <div className="empty-state">
+            <h3>Your first room starts here</h3>
+            <p>
+              Create a draft, then share its invitation. Each browser asks for access, and you
+              approve it by name.
+            </p>
           </div>
-        ))}
-      </dl>
-      {localOnly && <p className="muted">This local address is for this computer. Phone sharing needs a public HTTPS address.</p>}
+        )}
+        {!loading && rooms.length > 0 && filtered.length === 0 && (
+          <div className="empty-state">
+            <h3>No matching rooms</h3>
+            <p>Try another word, or show every status.</p>
+            <button
+              className="text-button"
+              onClick={() => {
+                setSearch('');
+                setStatus('all');
+              }}
+            >
+              Clear the filters
+            </button>
+          </div>
+        )}
+        {filtered.length > 0 && (
+          <ul className="rooms-list">
+            {filtered.map((room) => (
+              <RoomRow key={room.id} room={room} />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <figure className="media span-4">
+        <div className="crossfade">
+          <img
+            src="/photos/set-old-keys-hanging-wall.webp"
+            alt="Bunches of old iron keys hanging on a dark wooden wall"
+            width="1024"
+            height="683"
+          />
+          <img
+            src="/photos/entrance-to-the-east-block-of-the.jpg"
+            alt="A stone doorway of studded wooden doors under a carved arch"
+            width="1920"
+            height="2880"
+            loading="lazy"
+          />
+          <img
+            src="/photos/igreja-do-curral-das-freiras-azulejo-tiles.jpg"
+            alt="Blue and white patterned tiles lining a church wall above dark wooden pews"
+            width="1920"
+            height="2560"
+            loading="lazy"
+          />
+        </div>
+        <figcaption>
+          <strong>One key per room</strong>
+          <span>Markus Spiske</span>
+        </figcaption>
+      </figure>
+
+      <section
+        className="panel create-room span-7 start-6"
+        id="new-room"
+        data-ui
+        aria-labelledby="create-title"
+      >
+        <div className="panel-heading">
+          <div>
+            <h2 id="create-title">{template ? 'Reuse a room' : 'Create a room'}</h2>
+            <p>
+              {template
+                ? 'A fresh draft with a new invitation. Participants and approvals stay behind.'
+                : 'Set the title and the deadline now. Open it when you are ready to receive requests.'}
+            </p>
+          </div>
+        </div>
+        {template && (
+          <div className="template-notice">
+            <Icon name="copy" />
+            <div>
+              <strong>{template.title}</strong>
+              <p>Participants and approvals are not copied.</p>
+              <a href="/#new-room">Start from scratch</a>
+            </div>
+          </div>
+        )}
+        {!loading && (
+          <RoomForm
+            key={template?.id ?? 'new'}
+            initial={
+              template
+                ? {
+                    title: template.title,
+                    description: template.description,
+                    expiresAt: new Date(Date.now() + 86400_000).toISOString(),
+                    credential: template.credential
+                      ? { dept: template.credential.dept, year: template.credential.year }
+                      : null,
+                  }
+                : undefined
+            }
+            submitLabel="Create draft"
+            onSubmit={create}
+          />
+        )}
+      </section>
+
+      <section className="note span-12">
+        <h2>What stays where</h2>
+        <ul>
+          <li>
+            <Icon name="key" />
+            <span>
+              Keys are made in this browser. The server never holds a room’s files or notes in the
+              clear, and it cannot read what it stores for you.
+            </span>
+          </li>
+          <li>
+            <Icon name="rooms" />
+            <span>
+              Files are encrypted before they upload, and the server drops them the moment the
+              deadline passes.
+            </span>
+          </li>
+          <li>
+            <Icon name="clock" />
+            <span>
+              A room cannot outlive its deadline, and its invitation only opens while the room
+              itself is open.
+            </span>
+          </li>
+        </ul>
+      </section>
+
+      <figure className="media band span-8">
+        <img
+          src="/photos/entrance-to-the-east-block-of-the.jpg"
+          alt="A stone doorway of studded wooden doors under a carved arch"
+          width="1920"
+          height="2880"
+          loading="lazy"
+        />
+        <figcaption>
+          <strong>One door per room</strong>
+          <span>Hayden Soloviev</span>
+        </figcaption>
+      </figure>
+
+      <figure className="media lock-clip span-4 start-9">
+        <video
+          autoPlay
+          muted
+          loop
+          playsInline
+          preload="metadata"
+          poster="/photos/einsteckschloss-animation-poster.jpg"
+          width="480"
+          height="480"
+          aria-hidden="true"
+        >
+          <source src="/photos/einsteckschloss-animation.webm" type="video/webm" />
+        </video>
+        <figcaption>
+          <strong>The lock, open</strong>
+          <span>Andreas Gortan</span>
+        </figcaption>
+      </figure>
+
       {error && (
         <p role="alert" className="error">
           {error}
         </p>
       )}
-      <div className="home-layout">
-        <section className="panel room-directory" aria-labelledby="directory-title">
-          <div className="panel-heading">
-            <div>
-              <h2 id="directory-title">Room directory</h2>
-              <p>Manage your events and revisit your invitations.</p>
-            </div>
-            <span className="count-label">{filtered.length} rooms</span>
-          </div>
-          <div className="directory-toolbar">
-            <label className="search-field">
-              <span className="sr-only">Search rooms</span>
-              <Icon name="search" />
-              <input
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search by title or description"
-              />
-            </label>
-            <label>
-              <span className="sr-only">Filter rooms by status</span>
-              <select value={status} onChange={(event) => setStatus(event.target.value)}>
-                <option value="all">All statuses</option>
-                <option value="draft">Draft</option>
-                <option value="open">Open</option>
-                <option value="closed">Closed</option>
-                <option value="expired">Expired</option>
-              </select>
-            </label>
-          </div>
-          {loading ? (
-            <p className="empty-state" role="status">
-              Loading rooms…
-            </p>
-          ) : filtered.length === 0 ? (
-            <div className="empty-state">
-              <span className="empty-symbol">
-                <Icon name={rooms.length ? 'search' : 'rooms'} />
-              </span>
-              <h3>{rooms.length ? 'No matching rooms' : 'Your first room starts here'}</h3>
-              <p>
-                {rooms.length
-                  ? 'Try a different search or status.'
-                  : 'Create a draft, open it when you’re ready, and invite your participants.'}
-              </p>
-              {rooms.length > 0 && (
-                <button
-                  className="text-button"
-                  onClick={() => {
-                    setSearch('');
-                    setStatus('all');
-                  }}
-                >
-                  Clear filters
-                </button>
-              )}
-            </div>
-          ) : (
-            <ul className="room-list">
-              {filtered.map((room) => (
-                <li key={room.id}>
-                  <div className="room-list-main">
-                    <span className="room-symbol">
-                      <Icon name="rooms" />
-                    </span>
-                    <div className="room-list-details">
-                      <a
-                        className="room-title"
-                        href={
-                          room.role === 'owner' || room.membershipStatus === 'approved'
-                            ? `/rooms/${room.id}`
-                            : `/join/${room.joinCode}`
-                        }
-                      >
-                        {room.title}
-                      </a>
-                      <p>
-                        {room.role === 'owner' ? 'Organizer' : room.membershipStatus} <span>·</span>{' '}
-                        Ends {formatDate(room.expiresAt)}
-                      </p>
-                    </div>
-                    <StatusBadge status={room.status} />
-                  </div>
-                  {room.role === 'owner' && (
-                    <a
-                      className="template-link"
-                      aria-label={`Use ${room.title} as template`}
-                      href={`/?template=${room.id}#new-room`}
-                    >
-                      <Icon name="copy" />
-                      Use as template
-                    </a>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-          <div className="panel-footnote">
-            Showing {filtered.length} of {rooms.length} rooms in this browser.
-          </div>
-        </section>
-        <section className="panel create-room" id="new-room" aria-labelledby="create-title">
-          <div className="panel-heading">
-            <div>
-              <h2 id="create-title">{template ? 'Reuse a room' : 'Create a room'}</h2>
-              <p>
-                {template
-                  ? 'A fresh draft with a new invitation.'
-                  : 'Set the details now. Open it when ready.'}
-              </p>
-            </div>
-          </div>
-          {template && (
-            <div className="template-notice">
-              <Icon name="copy" />
-              <div>
-                <strong>{template.title}</strong>
-                <p>Participants, passes, and redemption history won’t be copied.</p>
-                <a href="/#new-room">Start from scratch</a>
-              </div>
-            </div>
-          )}
-          {!loading && (
-            <RoomForm
-              key={template?.id ?? 'new'}
-              initial={
-                template
-                  ? {
-                      title: template.title,
-                      description: template.description,
-                      expiresAt: new Date(Date.now() + 86400_000).toISOString(),
-                      admissionPolicy: template.admissionPolicy,
-                    }
-                  : undefined
-              }
-              submitLabel="Create draft"
-              onSubmit={create}
-            />
-          )}
-        </section>
-      </div>
     </>
   );
 }

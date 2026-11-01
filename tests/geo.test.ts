@@ -3,7 +3,7 @@ import { after, before, test } from 'node:test';
 import supertest from 'supertest';
 import type { Express } from 'express';
 import { createApp } from '../server/app.js';
-import { openDatabase, type Database } from '../server/database.js';
+import { openDatabase, type Database } from './database.js';
 import { migrate } from '../server/migrations.js';
 import {
   deriveRadius,
@@ -212,9 +212,58 @@ test('an owner can clear the area while the room is a draft', async () => {
   assert.equal(cleared.geoLabel, null);
 });
 
-test('the area locks once the room opens', async () => {
+test('the area can change after opening but locks once a participant is admitted', async () => {
   const owner = await browser();
+  const participant = await browser();
   const created = (await owner.post('/rooms', input()).expect(201)).body as Room;
-  await owner.post(`/rooms/${created.id}/open`).expect(200);
-  await owner.post(`/rooms/${created.id}/geo`, { ...anchor, radiusM: 500 }).expect(409);
+  const room = (await owner.post(`/rooms/${created.id}/open`).expect(200)).body as Room;
+
+  // Still adjustable after opening, while nobody has been admitted.
+  await owner
+    .post(`/rooms/${created.id}/geo`, {
+      ...anchor,
+      radiusM: 500,
+      label: 'Opening area',
+    })
+    .expect(200);
+
+  await participant
+    .post(`/join/${room.joinCode}`, {
+      label: 'Nearby',
+      ...fix(anchor.lat, anchor.lng),
+    })
+    .expect(200);
+  const members = await owner.get(`/rooms/${created.id}/members`).expect(200);
+  await owner
+    .patch(`/rooms/${created.id}/members/${members.body[0].id}`, {
+      status: 'approved',
+    })
+    .expect(200);
+
+  // The fence is fixed for the participant who was admitted under it.
+  await owner
+    .post(`/rooms/${created.id}/geo`, { ...anchor, radiusM: 600 })
+    .expect(409);
+  await owner.delete(`/rooms/${created.id}/geo`).expect(409);
+});
+
+test('kilometre-scale phone readings get GEO_INACCURATE guidance rather than schema errors', async () => {
+  const owner = await browser(), participant = await browser();
+  const room = await createAreaRoom(owner);
+  for (const accuracyM of [2500, 50_000]) {
+    const rejected = await participant.post(`/join/${room.joinCode}`, {
+      label: 'Approximate location', ...fix(anchor.lat, anchor.lng, accuracyM),
+    }).expect(422);
+    assert.equal(rejected.body.error.code, 'GEO_INACCURATE');
+    assert.match(rejected.body.error.message, /75 m.*Enable precise location/);
+  }
+  const joined = (await participant.post(`/join/${room.joinCode}`, {
+    label: 'Precise location', ...fix(anchor.lat, anchor.lng),
+  }).expect(200)).body;
+  await owner.patch(`/rooms/${room.id}/members/${joined.id}`, { status: 'approved' }).expect(200);
+  const refresh = await participant.post(`/rooms/${room.id}/position`, fix(anchor.lat, anchor.lng, 2500)).expect(422);
+  assert.equal(refresh.body.error.code, 'GEO_INACCURATE');
+  await participant.get(`/rooms/${room.id}`).expect(200);
+  const members = (await owner.get(`/rooms/${room.id}/members`).expect(200)).body;
+  assert.equal(members[0].accuracyM, 10);
 });

@@ -1,13 +1,17 @@
 node_modules/
 dist/
-/sdk-package/dist/
 .data/
-public/zk/*.wasm
-public/zk/*.zkey
-public/zk/*.tmp
 .env
 coverage/
 test-results/
 playwright-report/
-*.tgz
-/work/
+circuits/build/
+credential-*.json
+credentials/
+
+.backups/
+*.dump
+
+# Local design inspections and benchmark output
+.taste-skill/
+benchmark-results/

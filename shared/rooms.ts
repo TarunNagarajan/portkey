@@ -1,17 +1,26 @@
 import { z } from 'zod';
+import {
+  credentialProofPayload,
+  credentialRequirement,
+  type CredentialRule,
+} from './credentials.js';
 
 export const roomInput = z
   .object({
     title: z.string().trim().min(1).max(100),
     description: z.string().trim().max(500).default(''),
     expiresAt: z.iso.datetime({ offset: true }),
-    admissionPolicy: z.enum(['approval', 'pass', 'proof']).optional(),
   })
+  .strict();
+
+export const roomCreateInput = roomInput
+  .extend({ credential: credentialRequirement.nullish() })
   .strict();
 
 export const roomTemplateInput = roomInput.extend({
   title: roomInput.shape.title.optional(),
   description: roomInput.shape.description.removeDefault().optional(),
+  credential: credentialRequirement.nullish(),
 });
 
 export const roomId = z.uuid();
@@ -23,9 +32,11 @@ export const memberDecision = z
   .strict();
 
 export type RoomInput = z.infer<typeof roomInput>;
+export type RoomCreateInput = z.infer<typeof roomCreateInput>;
 export type RoomStatus = 'draft' | 'open' | 'closed' | 'expired';
 export type MembershipStatus = 'pending' | 'approved' | 'denied' | 'revoked';
 
+export const maxEntryAccuracyM = 75;
 export const minRadiusM = 50;
 export const maxRadiusM = 50000;
 
@@ -59,7 +70,7 @@ export const positionReport = z
   .object({
     lat: z.number().min(-90).max(90),
     lng: z.number().min(-180).max(180),
-    accuracyM: z.number().min(0).max(1000),
+    accuracyM: z.number().min(0),
     timestamp: z.iso.datetime({ offset: true }),
   })
   .strict();
@@ -69,8 +80,9 @@ export const joinRequest = z
     label: z.string().trim().min(1).max(50),
     lat: z.number().min(-90).max(90).optional(),
     lng: z.number().min(-180).max(180).optional(),
-    accuracyM: z.number().min(0).max(1000).optional(),
+    accuracyM: z.number().min(0).optional(),
     timestamp: z.iso.datetime({ offset: true }).optional(),
+    credentialProof: credentialProofPayload.optional(),
   })
   .strict();
 
@@ -88,11 +100,9 @@ export interface Room {
   role: 'owner' | 'participant';
   membershipStatus: MembershipStatus | null;
   joinCode: string;
-  submissionCleanupEnabled: boolean;
-  submissionsPurgedAt: string | null;
   geo: GeoRule | null;
   geoLabel: string | null;
-  admissionPolicy: 'approval' | 'pass' | 'proof';
+  credential: CredentialRule | null;
 }
 
 export interface PublicRoom {
@@ -105,12 +115,10 @@ export interface PublicRoom {
   isOwner: boolean;
   organizerKeyFingerprint: string | null;
   organizerPublicKey: string | null;
-  submissionCleanupEnabled: boolean;
-  submissionsPurgedAt: string | null;
   geo: GeoRule | null;
   geoLabel: string | null;
   needsLocation: boolean;
-  admissionPolicy: 'approval' | 'pass' | 'proof';
+  credential: CredentialRule | null;
 }
 
 export interface Member {
@@ -122,6 +130,7 @@ export interface Member {
   distanceM: number | null;
   accuracyM: number | null;
   checkedAt: string | null;
+  credentialVerified: boolean;
 }
 
 export interface PlaceSuggestion {

@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import supertest from 'supertest';
 import type { Express } from 'express';
 import { createApp } from '../server/app.js';
-import { openDatabase, type Database } from '../server/database.js';
+import { openDatabase, type Database } from './database.js';
 import { migrate } from '../server/migrations.js';
 import type { Room } from '../shared/rooms.js';
 import type { ActivityPage } from '../shared/activity.js';
@@ -65,9 +65,6 @@ async function requestAdmission(participant: Browser, room: Room) {
 
 test('health checks the database and API requires a session', async () => {
   await supertest(app).get('/api/health').expect(200);
-  const config = await supertest(app).get('/api/config').set('Host', 'attacker.example').set('X-Forwarded-Host', 'attacker.example').expect(200);
-  assert.deepEqual(config.body, { publicOrigin: origin });
-  assert.equal(config.headers['cache-control'], 'no-store');
   await supertest(app).get('/api/rooms').expect(401);
 });
 
@@ -156,7 +153,7 @@ test('the join address reveals public details but never owner or membership reco
   const room = await createRoom(owner);
   const response = await visitor.get(`/join/${room.joinCode}`).expect(200);
   assert.deepEqual(Object.keys(response.body).sort(), [
-    'admissionPolicy',
+    'credential',
     'description',
     'expiresAt',
     'geo',
@@ -168,8 +165,6 @@ test('the join address reveals public details but never owner or membership reco
     'organizerKeyFingerprint',
     'organizerPublicKey',
     'status',
-    'submissionCleanupEnabled',
-    'submissionsPurgedAt',
     'title',
   ]);
   await visitor.get(`/rooms/${room.id}/members`).expect(403);

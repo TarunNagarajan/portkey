@@ -2,16 +2,13 @@ import { useCallback, useEffect, useState } from 'react';
 import type { Member, Room, RoomInput } from '../shared/rooms.js';
 import { ApiError, api, requestFix } from './api.js';
 import { RoomArea } from './RoomArea.js';
+import { RoomCredential } from './RoomCredential.js';
 import { RoomForm } from './RoomForm.js';
 import { ShareRoom } from './ShareRoom.js';
 import { ActivityLog } from './ActivityLog.js';
-import { PrivateInbox } from './PrivateInbox.js';
+import { OwnerRecovery } from './Recovery.js';
 import { RoomFiles } from './RoomFiles.js';
-import { roomFileBase64 } from './roomFileCrypto.js';
-import { PassesPanel } from './PassesPanel.js';
-import { ProofEnrollmentsPanel } from './ProofEnrollmentsPanel.js';
-import { RoomProofRuleEditor } from './RoomProofRuleEditor.js';
-import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
+import { Icon, Lifetime, StatusBadge, formatDate, formatDistance } from './ui.js';
 
 export function RoomPage({ id }: { id: string }) {
   const [room, setRoom] = useState<Room | null>(null);
@@ -19,25 +16,13 @@ export function RoomPage({ id }: { id: string }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [inboxFingerprint, setInboxFingerprint] = useState<string | null>(null);
-  const [filesKey, setFilesKey] = useState<string | null>(null);
-  const onFilesKeyReady = useCallback((key: Uint8Array | null) => setFilesKey(key ? roomFileBase64(key) : null), []);
-  const [reusableRule, setReusableRule] = useState<boolean | null>(null);
-  const [reusableRuleNames, setReusableRuleNames] = useState<string[]>([]);
-  const [proofRuleReady, setProofRuleReady] = useState(false);
-  const [proofRuleDirty, setProofRuleDirty] = useState(false);
-  const onProofRuleState = useCallback((configured: boolean, names: string[], ready: boolean, dirty: boolean) => {
-    setReusableRule(configured);
-    setReusableRuleNames(names);
-    setProofRuleReady(ready);
-    setProofRuleDirty(dirty);
-  }, []);
+  const [roomAccess, setRoomAccess] = useState<string | null>(null);
+  const [ownerFingerprint, setOwnerFingerprint] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
       const current = await api<Room>(`/rooms/${id}`);
       setRoom(current);
-      if (current.admissionPolicy !== 'proof') { setReusableRule(false); setReusableRuleNames([]); setProofRuleReady(true); setProofRuleDirty(false); }
       if (current.role === 'owner') setMembers(await api<Member[]>(`/rooms/${id}/members`));
       setError('');
     } catch (error) {
@@ -100,78 +85,31 @@ export function RoomPage({ id }: { id: string }) {
 
   return (
     <>
-      <a href="/" className="back-link">
-        ← Back to rooms
-      </a>
-      <header className="page-heading">
-        <div>
-          <p className="eyebrow">{owner ? 'ORGANIZER' : 'PARTICIPANT'} VIEW</p>
+      <div className="room-intro span-7">
+        <a href="/" className="back-link">
+          <Icon name="arrow" />
+          Back to rooms
+        </a>
+        <header className="room-head">
+          <p className="room-key">
+            <Icon name="key" />
+            Invitation {room.joinCode}
+          </p>
           <h1>{room.title}</h1>
-          <p>{room.description || 'No description added.'}</p>
-        </div>
-        <StatusBadge status={room.status} />
-      </header>
-      <div className="room-summary">
-        <span>
-          <Icon name="clock" />
-          Access ends <strong>{formatDate(room.expiresAt)}</strong>
-        </span>
-        <span>
-          <Icon name="shield" />
-          {room.admissionPolicy === 'proof' ? 'Workshop credential proof' : room.admissionPolicy === 'pass' ? 'Single use admission pass' : 'Organizer approval required'}
-        </span>
-      </div>
-      <section className="panel storage-panel">
-        <h2>Submission storage</h2>
-        <p>
-          {room.submissionsPurgedAt
-            ? 'The server removed this room’s encrypted private submissions and shared files after its deadline.'
-            : room.submissionCleanupEnabled
-              ? 'Completed encrypted private submissions and shared files are scheduled for removal after the room deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
-              : 'Automatic room deadline cleanup is disabled. Incomplete private submissions and shared file uploads are still removed after 24 hours.'}
-        </p>
-        {room.submissionsPurgedAt && <p>Completed {formatDate(room.submissionsPurgedAt)}.</p>}
-        {owner && !room.submissionCleanupEnabled && (
-          <button
-            disabled={busy}
-            onClick={() => {
-              const alreadyExpired = Date.parse(room.expiresAt) <= Date.now();
-              const timing = alreadyExpired
-                ? 'This room is already past its deadline, so private submissions and shared files become eligible on the next cleanup pass.'
-                : 'Private submissions and shared files will be removed after the room deadline.';
-              if (window.confirm('Enable automatic room storage deletion? This cannot be undone. ' + timing + ' Local copies, browser keys, backups, room history and membership metadata are not erased.'))
-                void act(() => api('/rooms/' + id + '/submission-cleanup', 'POST', {}));
-            }}
-          >
-            Enable automatic deletion
-          </button>
-        )}
-        <p className="muted">
-          Room records, activity, memberships and public recipient keys remain. Database backups,
-          browser keys and copies already downloaded follow their own retention.
-        </p>
-      </section>
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-      {!owner && room.geo && (
-        <p className="area-summary">
-          <Icon name="shield" />
-          Restricted to {formatDistance(room.geo.radiusM)} around{' '}
-          {room.geoLabel ?? 'the organizer’s area'}. Your device must be inside the area to enter.
-        </p>
-      )}
-      {owner && <RoomArea room={room} onChanged={reload} onError={setError} />}
-      {owner && (
-        <>
+          <p className="room-lede">{room.description || 'No description added.'}</p>
+          <p className="room-meta">
+            <StatusBadge status={room.status} />
+            <span>{owner ? 'You organize this room' : 'Participant view'}</span>
+            <span>
+              Access ends <strong>{formatDate(room.expiresAt)}</strong>
+            </span>
+          </p>
+          <Lifetime from={room.createdAt} to={room.expiresAt} />
+        </header>
+        {owner && (
           <div className="actions">
             {room.status === 'draft' && (
-              <button
-                disabled={busy || (room.admissionPolicy === 'proof' && (!proofRuleReady || proofRuleDirty))}
-                onClick={() => void act(() => api(`/rooms/${id}/open`, 'POST'))}
-              >
+              <button disabled={busy} onClick={() => void act(() => api(`/rooms/${id}/open`, 'POST'))}>
                 Open room
               </button>
             )}
@@ -201,180 +139,231 @@ export function RoomPage({ id }: { id: string }) {
               </button>
             )}
           </div>
-          {editing && (
-            <section className="panel edit-panel">
-              <h2>Edit room details</h2>
-              <RoomForm
-                isCreate={false}
-                initial={{
-                  title: room.title,
-                  description: room.description,
-                  expiresAt: room.expiresAt,
-                  admissionPolicy: room.admissionPolicy,
-                }}
-                admissionPolicyLocked={room.status !== 'draft'}
-                submitLabel="Save details"
-                onSubmit={save}
-              />
-            </section>
+        )}
+      </div>
+
+      <figure className="media tall span-4 start-9">
+        <img
+          src="/photos/igreja-do-curral-das-freiras-azulejo-tiles.jpg"
+          alt="Blue and white patterned tiles lining a church wall above dark wooden pews"
+          width="1920"
+          height="2560"
+          loading="lazy"
+        />
+        <figcaption>
+          <strong>Tiles, older than the room</strong>
+          <span>Celsoazevedo</span>
+        </figcaption>
+      </figure>
+
+      {error && (
+        <p role="alert" className="error">
+          {error}
+        </p>
+      )}
+
+      {editing && (
+        <section className="panel edit-panel span-12">
+          <h2>Edit room details</h2>
+          <RoomForm
+            isCreate={false}
+            initial={{
+              title: room.title,
+              description: room.description,
+              expiresAt: room.expiresAt,
+            }}
+            submitLabel="Save details"
+            onSubmit={save}
+          />
+        </section>
+      )}
+
+      <div className="room-body span-12">
+        <div className="room-col">
+          {owner && room.status === 'open' && (
+            roomAccess ? <ShareRoom code={room.joinCode} fingerprint={ownerFingerprint} roomAccess={roomAccess} /> : <p role="status">Preparing the room invitation…</p>
           )}
-          {room.admissionPolicy === 'pass' && <PassesPanel room={room} fingerprint={inboxFingerprint} filesKey={filesKey} />}
-          {room.admissionPolicy === 'proof' && <RoomProofRuleEditor room={room} onRuleState={onProofRuleState} />}
-          {room.admissionPolicy === 'proof' && reusableRule === false && <ProofEnrollmentsPanel room={room} fingerprint={inboxFingerprint} filesKey={filesKey} />}
-          {room.status === 'open' && <ShareRoom code={room.joinCode} fingerprint={inboxFingerprint} filesKey={filesKey} passMode={room.admissionPolicy === 'pass'} proofMode={room.admissionPolicy === 'proof'} />}
-          <RoomFiles room={room} onKeyReady={onFilesKeyReady} />
-          <PrivateInbox room={room} onOwnerFingerprint={setInboxFingerprint} />
-          {room.status === 'draft' && (
+          {owner && <RoomFiles room={room} onOwnerFingerprint={setOwnerFingerprint} onRoomAccess={setRoomAccess} />}
+          {!owner && !error && (
+            <>
+              <section className="panel participant-welcome">
+                <h2>You’re in.</h2>
+                <p>
+                  {room.credential
+                    ? 'Your credential proof admitted this browser. The organizer can still remove access.'
+                    : 'Your organizer-approved access is active for this browser.'}
+                </p>
+              </section>
+              {!room.geo && (
+                <p className="muted">
+                  Files published to this room are encrypted here, in this browser, and removed from
+                  the server after the deadline.
+                </p>
+              )}
+              <RoomFiles room={room} />
+            </>
+          )}
+          {owner && <ActivityLog roomId={id} />}
+        </div>
+        <div className="room-col">
+          {owner && (
+            <RoomCredential
+              room={room}
+              hasAdmitted={members.some((member) => ['approved', 'revoked'].includes(member.status))}
+              onChanged={reload}
+              onError={setError}
+            />
+          )}
+          {owner && (
+            <RoomArea
+              room={room}
+              hasAdmitted={members.some((member) => ['approved', 'revoked'].includes(member.status))}
+              onChanged={reload}
+              onError={setError}
+            />
+          )}
+          {!owner && room.geo && (
+            <p className="area-summary">
+              <Icon name="shield" />
+              Restricted to {formatDistance(room.geo.radiusM)} around{' '}
+              {room.geoLabel ?? 'the organizer’s area'}. Your device must be inside the area to
+              enter.
+            </p>
+          )}
+          {owner && room.status === 'draft' && (
             <div className="notice">
               <Icon name="rooms" />
-                <p>{room.admissionPolicy === 'proof' ? 'Open the room when you are ready to enroll credentials and admit proofs.' : room.admissionPolicy === 'pass' ? 'Open the room when you are ready to admit pass holders.' : 'Open the room when you are ready to receive join requests.'}</p>
+              <p>Open the room when you are ready to receive join requests.</p>
             </div>
           )}
-          {room.admissionPolicy === 'proof' && reusableRule && reusableRuleNames.length > 0 && <p className="muted">Reusable rule: a credential from {reusableRuleNames.join(' or ')}. New rooms can reuse these group credentials; room access stays scoped to this room.</p>}
-          {!active && (
+          {owner && !active && (
             <div className="notice">
               <Icon name="shield" />
               <p>This room has closed. New admission is disabled.</p>
             </div>
           )}
-          <section className="panel members">
-            <div className="panel-heading">
-              <div>
-                <h2>Participant access</h2>
-                <p>
-                  {room.admissionPolicy === 'pass'
-                    ? 'Pass holders appear here after redemption. You can remove their access at any time.'
-                    : room.admissionPolicy === 'proof'
-                      ? 'Attendees appear here after a valid membership proof. Remove access for a browser from this list.'
-                      : 'Match the participant’s label before approving.'}
-                </p>
-              </div>
-              <span className="count-label">
-                {room.admissionPolicy === 'pass' || room.admissionPolicy === 'proof'
-                  ? `${members.filter((member) => member.status === 'approved').length} admitted`
-                  : <>{members.filter((member) => member.status === 'pending').length} pending ·{' '}
-                    {members.filter((member) => member.status === 'approved').length} approved</>}
-              </span>
+        </div>
+      </div>
+
+      {owner && <div className="span-12"><OwnerRecovery roomId={id} /></div>}
+      {owner && (
+        <section className="panel members span-12" data-ui>
+          <div className="panel-heading">
+            <div>
+              <h2>Participant access</h2>
+              <p>{room.credential ? 'Participants must prove eligibility; you can decline requests or remove access.' : 'Match the participant’s label before approving.'}</p>
             </div>
-            {members.length === 0 ? (
-              <div className="empty-state">
-                <span className="empty-symbol">
-                  <Icon name="shield" />
-                </span>
-                <h3>{room.admissionPolicy === 'pass' || room.admissionPolicy === 'proof' ? 'No participants yet' : 'No requests yet'}</h3>
-                <p>
-                  {room.admissionPolicy === 'proof'
-                    ? 'People will appear here after proving workshop membership.'
-                    : room.admissionPolicy === 'pass'
-                    ? 'People will appear here after redeeming a pass.'
-                    : 'Join requests will appear here after you share the room.'}
-                </p>
-              </div>
-            ) : (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Participant</th>
-                      <th>Requested</th>
-                      <th>Nearby</th>
-                      <th>Status</th>
-                      <th>Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {members.map((member) => (
-                      <tr key={member.id}>
-                        <td>
-                          <span className="participant-label">
-                            <span className="avatar">{member.label.slice(0, 2).toUpperCase()}</span>
-                            {member.label}
-                          </span>
-                        </td>
-                        <td>
-                          {new Date(member.requestedAt).toLocaleTimeString(undefined, {
-                            hour: 'numeric',
-                            minute: '2-digit',
-                          })}
-                        </td>
-                        <td>
-                          {member.inside == null
-                            ? '—'
-                            : member.inside
-                              ? `Inside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`
-                              : `Outside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`}
-                        </td>
-                        <td>
-                          <StatusBadge status={member.status} />
-                        </td>
-                        <td>
-                          {room.status === 'open' &&
-                            (member.status === 'pending' ? (
-                              <div className="actions">
-                                <button
-                                  disabled={busy}
-                                  onClick={() =>
-                                    void act(() =>
-                                      api(`/rooms/${id}/members/${member.id}`, 'PATCH', {
-                                        status: 'approved',
-                                      }),
-                                    )
-                                  }
-                                >
-                                  Approve
-                                </button>
-                                <button
-                                  disabled={busy}
-                                  className="secondary"
-                                  onClick={() =>
-                                    void act(() =>
-                                      api(`/rooms/${id}/members/${member.id}`, 'PATCH', {
-                                        status: 'denied',
-                                      }),
-                                    )
-                                  }
-                                >
-                                  Decline
-                                </button>
-                              </div>
-                            ) : member.status === 'approved' ? (
+            <span className="count-label">
+              {members.filter((member) => member.status === 'pending').length} pending ·{' '}
+              {members.filter((member) => member.status === 'approved').length} approved
+            </span>
+          </div>
+          {members.length === 0 ? (
+            <div className="empty-state">
+              <h3>No requests yet</h3>
+              <p>Join requests will appear here after you share the room.</p>
+            </div>
+          ) : (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Participant</th>
+                    <th>Requested</th>
+                    <th>Nearby</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {members.map((member) => (
+                    <tr key={member.id}>
+                      <td>
+                        <span className="participant-label">
+                          <span className="avatar">{member.label.slice(0, 2).toUpperCase()}</span>
+                          {member.label}
+                          {member.credentialVerified && (
+                            <span
+                              className="credential-flag"
+                              title="Admitted by a zero-knowledge credential proof"
+                            >
+                              proved
+                            </span>
+                          )}
+                        </span>
+                      </td>
+                      <td>
+                        {new Date(member.requestedAt).toLocaleTimeString(undefined, {
+                          hour: 'numeric',
+                          minute: '2-digit',
+                        })}
+                      </td>
+                      <td>
+                        {member.inside == null
+                          ? '—'
+                          : member.inside
+                            ? `Inside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`
+                            : `Outside${member.distanceM != null ? ` · ${Math.round(member.distanceM)} m` : ''}`}
+                      </td>
+                      <td>
+                        <StatusBadge status={member.status} />
+                      </td>
+                      <td>
+                        {room.status === 'open' &&
+                          (member.status === 'pending' ? (
+                            <div className="actions">
+                              <button
+                                disabled={busy || (Boolean(room.credential) && !member.credentialVerified)}
+                                title={room.credential && !member.credentialVerified ? 'This participant must prove eligibility first.' : undefined}
+                                onClick={() =>
+                                  void act(() =>
+                                    api(`/rooms/${id}/members/${member.id}`, 'PATCH', {
+                                      status: 'approved',
+                                    }),
+                                  )
+                                }
+                              >
+                                Approve
+                              </button>
                               <button
                                 disabled={busy}
                                 className="secondary"
                                 onClick={() =>
                                   void act(() =>
                                     api(`/rooms/${id}/members/${member.id}`, 'PATCH', {
-                                      status: 'revoked',
+                                      status: 'denied',
                                     }),
                                   )
                                 }
                               >
-                                Remove access
+                                Decline
                               </button>
-                            ) : (
-                              '—'
-                            ))}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-          <ActivityLog roomId={id} />
-        </>
-      )}
-      {!owner && !error && (
-        <>
-          <section className="panel participant-welcome">
-            <span className="empty-symbol"><Icon name="shield" /></span>
-            <h2>You’re in.</h2>
-            <p>{room.admissionPolicy === 'proof' ? 'A valid membership proof admitted this browser. Your workshop credential remains in browser storage; clearing site data loses it. The server can still observe browser and network activity.' : room.admissionPolicy === 'pass' ? 'Your one use pass admitted this browser. You can return from this browser until the room closes or your access is removed.' : 'Your organizer-approved access is active for this browser.'}</p>
-          </section>
-          <PrivateInbox room={room} />
-          <RoomFiles room={room} onKeyReady={onFilesKeyReady} />
-        </>
+                            </div>
+                          ) : member.status === 'approved' ? (
+                            <button
+                              disabled={busy}
+                              className="secondary"
+                              onClick={() =>
+                                void act(() =>
+                                  api(`/rooms/${id}/members/${member.id}`, 'PATCH', {
+                                    status: 'revoked',
+                                  }),
+                                )
+                              }
+                            >
+                              Remove access
+                            </button>
+                          ) : (
+                            '—'
+                          ))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
       )}
     </>
   );

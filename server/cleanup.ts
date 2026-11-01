@@ -1,100 +1,70 @@
-import type { Database } from "./database.js";
-import { recordActivity } from "./activity.js";
-import { reclaimStaleUploads, STALE_UPLOAD_AGE } from "./staleUploads.js";
+import type { Database } from './database.js';
+import { recordActivity } from './activity.js';
+import { reclaimStaleFileUploads, STALE_UPLOAD_AGE } from './staleUploads.js';
 
 export interface CleanupCounts {
   roomsCompleted: number;
-  submissionsDeleted: number;
-  sharedFilesDeleted: number;
+  filesDeleted: number;
   staleUploadsDeleted: number;
   staleBytesReclaimed: number;
 }
 
-export async function runSubmissionCleanupPass(
-  database: Database,
-): Promise<CleanupCounts> {
+export async function runFileCleanupPass(database: Database): Promise<CleanupCounts> {
   const counts: CleanupCounts = {
     roomsCompleted: 0,
-    submissionsDeleted: 0,
-    sharedFilesDeleted: 0,
+    filesDeleted: 0,
     staleUploadsDeleted: 0,
     staleBytesReclaimed: 0,
   };
+  await database.query("DELETE FROM request_budgets WHERE reset_at < clock_timestamp() - interval '1 day'");
+  await database.query('DELETE FROM credential_challenges WHERE expires_at < clock_timestamp()');
+  // Keep proximity coordinates for at most one day, independently of room expiry.
+  await database.query("UPDATE memberships SET last_lat = NULL, last_lng = NULL, last_accuracy_m = NULL, last_distance_m = NULL, last_inside = NULL, last_checked_at = NULL WHERE last_checked_at < clock_timestamp() - interval '1 day'");
   const rooms = await database.query<{ id: string }>(
-    `SELECT id FROM rooms WHERE submission_cleanup_enabled
-     AND submissions_purged_at IS NULL AND expires_at <= clock_timestamp()
+    `SELECT id FROM rooms WHERE files_purged_at IS NULL
+     AND expires_at <= clock_timestamp()
      ORDER BY expires_at, id LIMIT 50`,
   );
 
   for (const { id } of rooms) {
     await database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM rooms WHERE id = $1 FOR UPDATE", [id]);
+      await tx.query('SELECT id FROM rooms WHERE id = $1 FOR UPDATE', [id]);
       const [room] = await tx.query<{ eligible: boolean }>(
-        `SELECT submission_cleanup_enabled AND submissions_purged_at IS NULL
+        `SELECT files_purged_at IS NULL
          AND expires_at <= clock_timestamp() AS eligible FROM rooms WHERE id = $1`,
         [id],
       );
       if (!room?.eligible) return;
       const [deleted] = await tx.query<{ count: number }>(
         `WITH removed AS (
-           DELETE FROM private_submissions WHERE room_id = $1 RETURNING id
+           DELETE FROM room_files WHERE room_id = $1 RETURNING id
          ) SELECT count(*)::int AS count FROM removed`,
         [id],
       );
-      const [shared] = await tx.query<{ count: number }>(
-        `WITH removed AS (DELETE FROM room_files WHERE room_id = $1 RETURNING id)
-         SELECT count(*)::int AS count FROM removed`,
-        [id],
-      );
       const [updated] = await tx.query<{ id: string }>(
-        `UPDATE rooms SET submissions_purged_at = clock_timestamp()
-         WHERE id = $1 AND submissions_purged_at IS NULL RETURNING id`,
+        `UPDATE rooms SET files_purged_at = clock_timestamp()
+         WHERE id = $1 AND files_purged_at IS NULL RETURNING id`,
         [id],
       );
       if (!updated) return;
-      await recordActivity(tx, id, "submissions_purged");
+      await recordActivity(tx, id, 'files_purged');
       counts.roomsCompleted++;
-      counts.submissionsDeleted += deleted.count;
-      counts.sharedFilesDeleted += shared.count;
+      counts.filesDeleted += deleted.count;
     });
   }
 
-  const stale = await database.query<{ id: string; room_id: string }>(
-    `SELECT id, room_id FROM private_submissions
+  const staleFiles = await database.query<{ id: string; room_id: string }>(
+    `SELECT id, room_id FROM room_files
      WHERE status = 'uploading'
        AND created_at < ${STALE_UPLOAD_AGE}
      ORDER BY created_at, id LIMIT 100`,
   );
-  for (const submission of stale) {
+  for (const file of staleFiles) {
     await database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM rooms WHERE id = $1 FOR UPDATE", [
-        submission.room_id,
-      ]);
-      const removed = await reclaimStaleUploads(
-        tx,
-        submission.room_id,
-        1,
-        submission.id,
-      );
+      await tx.query('SELECT id FROM rooms WHERE id = $1 FOR UPDATE', [file.room_id]);
+      const removed = await reclaimStaleFileUploads(tx, file.room_id, 1, file.id);
       counts.staleUploadsDeleted += removed.count;
       counts.staleBytesReclaimed += removed.bytes;
-    });
-  }
-  const staleShared = await database.query<{ id: string; room_id: string }>(
-    `SELECT id,room_id FROM room_files WHERE status='uploading'
-     AND created_at < clock_timestamp()-interval '24 hours' ORDER BY created_at,id LIMIT 100`,
-  );
-  for (const file of staleShared) {
-    await database.transaction(async (tx) => {
-      await tx.query("SELECT id FROM rooms WHERE id=$1 FOR UPDATE", [
-        file.room_id,
-      ]);
-      const removed = await tx.query<{ id: string }>(
-        `DELETE FROM room_files WHERE id=$1 AND room_id=$2
-        AND status='uploading' AND created_at < clock_timestamp()-interval '24 hours' RETURNING id`,
-        [file.id, file.room_id],
-      );
-      counts.sharedFilesDeleted += removed.length;
     });
   }
   return counts;
@@ -120,8 +90,8 @@ export function startCleanupScheduler(
     active = work()
       .then(() => undefined)
       .catch((error: unknown) => {
-        console.error("Submission cleanup pass failed", {
-          name: error instanceof Error ? error.name : "UnknownError",
+        console.error('File cleanup pass failed', {
+          name: error instanceof Error ? error.name : 'UnknownError',
         });
       })
       .finally(() => {

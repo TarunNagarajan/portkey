@@ -1,58 +1,21 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { PublicRoom } from '../shared/rooms.js';
-import { api, ApiError, requestFix } from './api.js';
+import { departmentLabel, type CredentialFile } from '../shared/credentials.js';
+import { api, requestFix } from './api.js';
+import { credentialMatches, proveCredential, readCredential } from './credentialProof.js';
 import { Icon, StatusBadge, formatDate, formatDistance } from './ui.js';
-import { ReusableAdmission } from './ReusableAdmission.js';
-
-function readPassFragment(): { token: string | null; invalid: boolean } {
-  const values = new URLSearchParams(window.location.hash.slice(1)).getAll('pass');
-  if (values.length === 0) return { token: null, invalid: false };
-  const token = values[0];
-  if (values.length !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(token))
-    return { token: null, invalid: true };
-  try {
-    const decoded = atob(token.replaceAll('-', '+').replaceAll('_', '/') + '=');
-    const canonical = btoa(decoded).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
-    return canonical === token && decoded.length === 32
-      ? { token, invalid: false }
-      : { token: null, invalid: true };
-  } catch {
-    return { token: null, invalid: true };
-  }
-}
-
-function removePassFragment() {
-  const fragment = new URLSearchParams(window.location.hash.slice(1));
-  fragment.delete('pass');
-  const hash = fragment.size ? `#${fragment.toString()}` : '';
-  window.history.replaceState(
-    null,
-    '',
-    `${window.location.pathname}${window.location.search}${hash}`,
-  );
-}
-
-function roomKeyFragment() { const params=new URLSearchParams();const key=new URLSearchParams(window.location.hash.slice(1)).get('key');const files=new URLSearchParams(window.location.hash.slice(1)).getAll('files');if(key&&/^[a-f0-9]{64}$/.test(key))params.set('key',key);if(files.length===1&&/^[A-Za-z0-9_-]{43}$/.test(files[0]))params.set('files',files[0]);return params.size?`#${params}`:''; }
 
 export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
   const [label, setLabel] = useState('');
   const [busy, setBusy] = useState(false);
-  const [loadError, setLoadError] = useState('');
-  const [actionError, setActionError] = useState('');
-  const [passToken, setPassToken] = useState(() => readPassFragment().token);
-  const [invalidPass, setInvalidPass] = useState(() => readPassFragment().invalid);
-
-  useEffect(() => {
-    function updatePassFromFragment() {
-      const pass = readPassFragment();
-      setPassToken(pass.token);
-      setInvalidPass(pass.invalid);
-      if (pass.token) setActionError('');
-    }
-    window.addEventListener('hashchange', updatePassFromFragment);
-    return () => window.removeEventListener('hashchange', updatePassFromFragment);
-  }, []);
+  const [proving, setProving] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [credential, setCredential] = useState<CredentialFile | null>(null);
+  const [credentialName, setCredentialName] = useState('');
+  const [error, setError] = useState('');
+  // Errors raised by an action must survive the 5-second status poll.
+  const actionError = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -62,10 +25,11 @@ export function JoinPage({ code }: { code: string }) {
         const value = await api<PublicRoom>(`/join/${code}`);
         if (active) {
           setRoom(value);
-          setLoadError('');
+          if (!actionError.current) setError('');
         }
       } catch (error) {
-        if (active) setLoadError(error instanceof Error ? error.message : 'Unable to load room.');
+        if (active && !actionError.current)
+          setError(error instanceof Error ? error.message : 'Unable to load room.');
       }
       if (active) timer = setTimeout(() => void poll(), 5000);
     }
@@ -76,163 +40,172 @@ export function JoinPage({ code }: { code: string }) {
     };
   }, [code]);
 
-  useEffect(() => {
-    if (room && (room.isOwner || room.membershipStatus === 'approved') && passToken) {
-      removePassFragment();
-      setPassToken(null);
+  async function chooseCredential(file: File | undefined) {
+    actionError.current = false;
+    if (!file) {
+      setCredential(null);
+      setCredentialName('');
+      return;
     }
-  }, [room, passToken]);
+    try {
+      if (file.size > 16_384) throw new Error('The credential file is too large.');
+      const parsed = readCredential(await file.text());
+      if (room?.credential) credentialMatches(parsed, room.credential);
+      setCredential(parsed);
+      setCredentialName(file.name);
+      setError('');
+    } catch (error) {
+      actionError.current = true;
+      setCredential(null);
+      setCredentialName('');
+      setError(error instanceof Error ? error.message : 'Unable to read that credential.');
+    }
+  }
 
   async function join(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
-    setActionError('');
+    actionError.current = false;
+    setError('');
     try {
       const body: Record<string, unknown> = { label };
-      if (room?.geo) Object.assign(body, await requestFix());
-      if (room?.admissionPolicy === 'pass') {
-        if (!passToken)
-          throw new Error(
-            'Ask the organizer for a pass link. This room does not accept ordinary access requests.',
-          );
-        const member = await api<{ status: string }>(`/join/${code}/redeem`, 'POST', {
-          ...body,
-          token: passToken,
-        });
-        if (member.status === 'approved') {
-          removePassFragment();
-          setPassToken(null);
-          setInvalidPass(false);
-        }
-      } else {
-        await api(`/join/${code}`, 'POST', body);
+      if (room?.geo) {
+        setLocating(true);
+        try { Object.assign(body, await requestFix()); }
+        finally { setLocating(false); }
       }
+      if (room?.credential) {
+        if (!credential) throw new Error('Choose your credential file first.');
+        credentialMatches(credential, room.credential);
+        setProving(true);
+        const { challenge } = await api<{ challenge: string }>(`/join/${code}/challenge`, 'POST');
+        body.credentialProof = await proveCredential(credential, room.id, challenge);
+      }
+      await api(`/join/${code}`, 'POST', body);
       setRoom(await api<PublicRoom>(`/join/${code}`));
+      setError('');
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'ADMISSION_PASS_INVALID') {
-        removePassFragment();
-        setPassToken(null);
-        setInvalidPass(true);
-      }
-      setActionError(error instanceof Error ? error.message : 'Unable to request access.');
+      actionError.current = true;
+      setError(error instanceof Error ? error.message : 'Unable to request access.');
     } finally {
+      setProving(false);
       setBusy(false);
     }
   }
 
-  if (!room) return <p role={loadError || actionError ? 'alert' : 'status'}>{actionError || loadError || 'Finding room…'}</p>;
+  if (!room) return <p role={error ? 'alert' : 'status'}>{error || 'Finding room…'}</p>;
   return (
-    <section className="panel join-page">
-      <div className="join-heading">
-        <span className="empty-symbol">
-          <Icon name="rooms" />
-        </span>
-        <StatusBadge status={room.status} />
-      </div>
-      <p className="eyebrow">YOU’RE INVITED</p>
-      <h1>{room.title}</h1>
-      <p>{room.description}</p>
-      <h2 className="join-action-label">
-        {room.admissionPolicy === 'approval'
-          ? 'Request access'
-          : room.admissionPolicy === 'pass'
-            ? 'Redeem an admission pass'
-            : 'Prove credential eligibility'}
-      </h2>
-      <p className="join-deadline">
-        <Icon name="clock" />
-        Access ends {formatDate(room.expiresAt)}
-      </p>
-      <p className="muted">
-        {room.submissionCleanupEnabled
-          ? room.submissionsPurgedAt
-            ? 'The server has removed encrypted private submissions and shared files for this room.'
-            : 'Completed encrypted private submissions and shared files are scheduled for removal after this deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
-          : 'Automatic room deadline cleanup is disabled. Incomplete private submissions and shared file uploads are still removed after 24 hours.'}
-      </p>
-      {loadError && (
-        <p role="alert" className="error">
-          {loadError}
+    <>
+      <section className="panel join-page span-7">
+        <div className="join-heading">
+          <StatusBadge status={room.status} />
+        </div>
+        <h1>{room.title}</h1>
+        <p className="join-lede">
+          You’ve been invited.{room.description ? ` ${room.description}` : ''}
         </p>
-      )}
-      {actionError && (
-        <p role="alert" className="error">
-          {actionError}
+        <p className="join-deadline">
+          <Icon name="clock" />
+          Access ends {formatDate(room.expiresAt)}
         </p>
-      )}
-      {room.status !== 'open' ? (
-        <p>
-          {room.status === 'draft'
-            ? 'The organizer has not opened this room yet.'
-            : 'This room has closed.'}
+        <p className="muted">
+          After this deadline passes, the server removes the room’s shared files automatically.
         </p>
-      ) : room.isOwner || room.membershipStatus === 'approved' ? (
-        <a className="button" href={`/rooms/${room.id}${roomKeyFragment()}`}>
-          Enter room
-        </a>
-      ) : room.membershipStatus === 'pending' && room.admissionPolicy === 'approval' ? (
-        <p role="status">Waiting for organizer approval. This page updates automatically.</p>
-      ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
-        <p role="status">
-          Access is unavailable for this browser. Contact the organizer if you think this was a mistake.
-        </p>
-      ) : room.admissionPolicy === 'proof' ? (
-        <ReusableAdmission
-          room={room}
-          code={code}
-          onAdmitted={() => {
-            window.location.assign(`/rooms/${room.id}${roomKeyFragment()}`);
-          }}
+        {error && (
+          <p role="alert" className="error">
+            {error}
+          </p>
+        )}
+        {room.status !== 'open' ? (
+          <p>
+            {room.status === 'draft'
+              ? 'The organizer has not opened this room yet.'
+              : 'This room has closed.'}
+          </p>
+        ) : room.isOwner || room.membershipStatus === 'approved' ? (
+          <a className="button" href={`/rooms/${room.id}${window.location.hash}`}>
+            Enter room
+          </a>
+        ) : room.membershipStatus === 'pending' && !room.credential ? (
+          <p role="status">Waiting for organizer approval. This page updates automatically.</p>
+        ) : room.membershipStatus === 'revoked' || room.membershipStatus === 'denied' ? (
+          <p>The organizer has declined access for this browser.</p>
+        ) : (
+          <form onSubmit={join}>
+            <label>
+              Your label
+              <input
+                required
+                maxLength={50}
+                value={label}
+                onChange={(event) => setLabel(event.target.value)}
+                placeholder="A nickname or team label"
+              />
+            </label>
+            {room.credential && (
+              <div className="credential-upload">
+                <p className="muted">
+                  <Icon name="shield" /> This room admits{' '}
+                  <strong>{departmentLabel(room.credential.dept)}</strong>, class of{' '}
+                  <strong>{room.credential.year}</strong>. Bring the credential file your
+                  institution issued you; a valid proof admits you immediately.
+                </p>
+                <label>
+                  Credential file
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={(event) => void chooseCredential(event.target.files?.[0])}
+                  />
+                </label>
+                <p className="muted">
+                  {credential
+                    ? `${credentialName} · ${departmentLabel(credential.attributes.dept)} · class of ${credential.attributes.year}`
+                    : 'The proof is generated in this browser. The file, its secret and the issuer signature never leave this device.'}
+                </p>
+              </div>
+            )}
+            {room.geo ? (
+              <p className="muted">
+                <Icon name="shield" /> This room is restricted to {formatDistance(room.geo.radiusM)}{' '}
+                around {room.geoLabel ?? 'a set area'}. Your device location is required and checked
+                on every visit; you cannot request access without it.
+              </p>
+            ) : (
+              <p className="muted">
+                Use a label the organizer can recognize. No email, roll number, or external ID is
+                required.
+              </p>
+            )}
+            <button disabled={busy || (Boolean(room.credential) && !credential)}>
+              {locating
+                ? 'Getting precise location…'
+                : proving
+                ? 'Generating proof…'
+                : busy
+                  ? 'Requesting…'
+                  : room.credential
+                    ? 'Prove eligibility & request access'
+                    : room.geo
+                      ? 'Share location & request access'
+                      : 'Request access'}
+            </button>
+          </form>
+        )}
+      </section>
+      <figure className="media tall span-5 start-8">
+        <img
+          src="/photos/set-old-keys-hanging-wall.webp"
+          alt="Bunches of old iron keys hanging on a dark wooden wall"
+          width="1024"
+          height="683"
+          loading="lazy"
         />
-      ) : room.admissionPolicy === 'pass' && !passToken ? (
-        <p>
-          {invalidPass
-            ? 'This pass could not be used. Ask the organizer for a new pass.'
-            : 'Ask the organizer for a single use admission pass. This public room link does not grant access.'}
-        </p>
-      ) : (
-        <form onSubmit={join}>
-          <label>
-            Your label
-            <input
-              required
-              maxLength={50}
-              value={label}
-              onChange={(event) => setLabel(event.target.value)}
-              placeholder="A nickname or team label"
-            />
-          </label>
-          {room.geo ? (
-            <p className="muted">
-              <Icon name="shield" /> This room is restricted to{' '}
-              {formatDistance(room.geo.radiusM)} around {room.geoLabel ?? 'a set area'}. Your device
-              location is required and checked on every visit; you cannot request access without it.
-            </p>
-          ) : (
-            <p className="muted">
-              Use a label the organizer can recognize. No email, roll number, or external ID is
-              required.
-            </p>
-          )}
-          {room.admissionPolicy === 'pass' && (
-            <p className="muted">
-              This pass link can be used once and then belongs to this browser. Anyone with the link can
-              use it first; ask the organizer for a new link if it has already been redeemed.
-            </p>
-          )}
-          <button disabled={busy}>
-            {busy
-              ? room.admissionPolicy === 'pass' ? 'Redeeming…' : 'Requesting…'
-              : room.geo
-                ? room.admissionPolicy === 'pass'
-                  ? 'Share location & redeem pass'
-                  : 'Share location & request access'
-                : room.admissionPolicy === 'pass'
-                  ? 'Redeem pass'
-                  : 'Request access'}
-          </button>
-        </form>
-      )}
-    </section>
+        <figcaption>
+          <strong>One key per invitation</strong>
+          <span>Markus Spiske</span>
+        </figcaption>
+      </figure>
+    </>
   );
 }

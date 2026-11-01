@@ -25,14 +25,17 @@ function sliderFromRadius(radiusM: number) {
 
 export function RoomArea({
   room,
+  hasAdmitted,
   onChanged,
   onError,
 }: {
   room: Room;
+  hasAdmitted: boolean;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
 }) {
-  const editable = room.status === 'draft';
+  const active = room.status === 'draft' || room.status === 'open';
+  const editable = active && !hasAdmitted;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<PlaceSuggestion[]>([]);
@@ -54,7 +57,7 @@ export function RoomArea({
   async function useCurrentLocation() {
     setSearching(true);
     try {
-      const fix = await requestFix();
+      const fix = await requestFix({ maxAccuracyM: 1000 });
       setDraft({
         lat: fix.lat,
         lng: fix.lng,
@@ -107,17 +110,11 @@ export function RoomArea({
   }
 
   return (
-    <section className="panel area-panel">
+    <section className="panel area-panel" data-ui>
       <div className="panel-heading">
         <div>
           <h2>Location restriction</h2>
-          <p>
-            {room.admissionPolicy === 'proof'
-              ? 'Only devices physically inside the chosen area can prove workshop membership and enter.'
-              : room.admissionPolicy === 'pass'
-              ? 'Only devices physically inside the chosen area can redeem a pass or enter.'
-              : 'Only devices physically inside the chosen area can request access or enter.'}
-          </p>
+          <p>Only devices physically inside the chosen area can request access or enter.</p>
         </div>
       </div>
       {room.geo ? (
@@ -127,17 +124,11 @@ export function RoomArea({
           {room.geoLabel ?? `${room.geo.lat.toFixed(3)}, ${room.geo.lng.toFixed(3)}`}.
         </p>
       ) : (
-        <p className="muted">
-          {room.admissionPolicy === 'proof'
-            ? 'No area restriction. A valid workshop membership proof is still required.'
-            : room.admissionPolicy === 'pass'
-            ? 'No area restriction. A valid admission pass is still required.'
-            : 'No area restriction. Anyone with the link can request access.'}
-        </p>
+        <p className="muted">No area restriction. Anyone with the link can request access.</p>
       )}
       {editable && !open && (
         <div className="actions">
-          <button disabled={busy} onClick={() => setOpen(true)}>
+          <button className="secondary" disabled={busy} onClick={() => setOpen(true)}>
             {room.geo ? 'Change area' : 'Set an area'}
           </button>
           {room.geo && (
@@ -147,7 +138,11 @@ export function RoomArea({
           )}
         </div>
       )}
-      {!editable && <p className="muted">The area is fixed once the room opens.</p>}
+      {active && hasAdmitted && (
+        <p className="muted">
+          The area is fixed once a participant has been admitted.
+        </p>
+      )}
       {editable && open && (
         <div className="area-editor">
           <label className="search-field">

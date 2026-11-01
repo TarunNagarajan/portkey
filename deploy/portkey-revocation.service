@@ -1,0 +1,13 @@
+[Unit]
+Description=Portkey institution-side scoped revocation delivery
+After=network-online.target
+[Service]
+Type=oneshot
+User=portkey-issuer
+WorkingDirectory=/opt/portkey
+EnvironmentFile=/etc/portkey/revocation.env
+ExecStart=/usr/bin/node --import tsx scripts/revocationWorker.ts
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

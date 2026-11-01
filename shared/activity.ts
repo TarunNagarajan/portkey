@@ -8,18 +8,13 @@ export type ActivityKind =
   | 'member_approved'
   | 'member_denied'
   | 'member_revoked'
-  | 'submission_cleanup_enabled'
-  | 'submissions_purged'
-  | 'admission_passes_issued'
-  | 'pass_revoked'
-  | 'pass_redeemed'
-  | 'proof_enrollments_issued'
-  | 'proof_enrollment_revoked'
-  | 'proof_admitted'
-  | 'proof_rule_updated'
-  | 'proof_rule_cleared';
+  | 'key_registered'
+  | 'file_published'
+  | 'files_purged'
+  | 'credential_proved'
+  | 'key_rotated' | 'file_access_granted' | 'ownership_recovered' | 'file_deleted';
 
-export type RoomField = 'title' | 'description' | 'expiresAt' | 'admissionPolicy';
+export type RoomField = 'title' | 'description' | 'expiresAt' | 'credential';
 
 export interface ActivityEvent {
   id: string;

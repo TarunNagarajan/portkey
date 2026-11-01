@@ -1,749 +1,971 @@
-import { createHash } from "node:crypto";
-import express from "express";
-import { Router } from "express";
-import { z } from "zod";
-import type { Database, Queries } from "./database.js";
-import { requireCondition } from "./errors.js";
-import { roomId } from "../shared/rooms.js";
-import { requireRoomLocation } from "./roomAccess.js";
-const MiB = 1024 * 1024,
-  MAX = 250 * MiB,
-  CHUNK = MiB,
-  QUOTA = 5 * 1024 * 1024 * 1024;
+import { createHash } from 'node:crypto';
+import express from 'express';
+import { Router } from 'express';
+import { z } from 'zod';
+import type { Database, Queries } from './database.js';
+import { requireCondition } from './errors.js';
+import { recordActivity } from './activity.js';
+import { roomId } from '../shared/rooms.js';
+import { requireParticipantAccess } from './participantAccess.js';
+import { reclaimStaleFileUploads } from './staleUploads.js';
+
+const MAX_ROOM_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_FILE_BYTES = 250 * 1024 * 1024;
+const MAX_CHUNKS = 250;
+const CHUNK_BYTES = 1024 * 1024;
+const MAX_RECIPIENTS = 1000;
 const b64 = z
   .string()
   .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
-const canonicalB64 = (value: string) =>
-  Buffer.from(value, "base64").toString("base64") === value;
-const hash = (b: Buffer) => createHash("sha256").update(b).digest("hex");
-type Policy = {
+const fingerprint = (value: Buffer) =>
+  createHash('sha256').update(value).digest('hex');
+
+interface RoomPolicy {
   id: string;
   owner_id: string;
   status: string;
-  expired: boolean;
-};
-type FileReceipt = {
-  id: string;
-  acceptedAt: Date | string;
-  encryptedBytes: number;
-  manifestSha256: string;
-};
-async function getRoom(q: Queries, id: string): Promise<Policy> {
-  const [r] = await q.query<Policy>(
-    `SELECT id,owner_id,status,expires_at <= clock_timestamp() AS expired FROM rooms WHERE id=$1`,
+  expires_at: Date;
+  is_expired: boolean;
+}
+
+async function roomPolicy(queries: Queries, id: string) {
+  const [room] = await queries.query<RoomPolicy>(
+    'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1',
     [id],
   );
-  requireCondition(r, 404, "ROOM_NOT_FOUND", "Room not found.");
-  return r;
+  requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+  requireCondition(
+    room.status === 'open' && !room.is_expired,
+    410,
+    'ROOM_CLOSED',
+    'This room is no longer exchanging files.',
+  );
+  return room;
 }
-async function admit(
-  q: Queries,
-  r: Policy,
-  ownerId: string | null,
+
+// Refresh the deadline at the point this policy is checked. Transactional
+// mutation callers invoke this after acquiring the room lock.
+async function refreshPolicy(queries: Queries, room: RoomPolicy) {
+  const [fresh] = await queries.query<{ expired: boolean; status: string }>(
+    'SELECT expires_at <= clock_timestamp() AS expired, status FROM rooms WHERE id = $1',
+    [room.id],
+  );
+  room.status = fresh.status;
+  room.is_expired = fresh.expired;
+}
+
+async function requireOwner(
+  queries: Queries,
+  room: RoomPolicy,
   sessionId: string,
 ) {
-  const [fresh] = await q.query<{
-    status: string;
-    expired: boolean;
-  }>(
-    "SELECT status,expires_at <= clock_timestamp() AS expired FROM rooms WHERE id=$1",
-    [r.id],
-  );
+  await refreshPolicy(queries, room);
   requireCondition(
-    fresh.status === "open" && !fresh.expired,
+    room.status === 'open' && !room.is_expired,
     410,
-    "ROOM_CLOSED",
-    "This room is no longer accepting shared files.",
-  );
-  if (r.owner_id === ownerId) return { uploader: r.owner_id, owner: true };
-  requireCondition(
-    r.owner_id !== sessionId,
-    403,
-    "ORGANIZER_REQUIRED",
-    "Sign in to your organizer account to access this room.",
-  );
-  const [m] = await q.query<{
-    status: string;
-  }>(
-    "SELECT m.status FROM memberships m JOIN sessions s ON s.id=m.session_id WHERE m.room_id=$1 AND m.session_id=$2 AND s.expires_at>clock_timestamp()",
-    [r.id, sessionId],
+    'ROOM_CLOSED',
+    'This room is no longer exchanging files.',
   );
   requireCondition(
-    m?.status === "approved",
+    room.owner_id === sessionId,
     403,
-    "ADMISSION_REQUIRED",
-    "Organizer approval is required.",
+    'OWNER_REQUIRED',
+    'Only the organizer can publish files.',
   );
-  await requireRoomLocation(q, r.id, sessionId);
-  return { uploader: sessionId, owner: false };
 }
-async function locked(q: Queries, id: string) {
-  const [r] = await q.query<Policy>(
-    "SELECT id,owner_id,status,expires_at <= clock_timestamp() AS expired FROM rooms WHERE id=$1 FOR UPDATE",
-    [id],
+
+async function requireVisible(
+  queries: Queries,
+  room: RoomPolicy,
+  sessionId: string,
+) {
+  if (room.owner_id === sessionId) return 'owner';
+  await requireParticipantAccess(queries, room.id, sessionId);
+  return 'recipient';
+}
+
+async function eligibleRecipients(
+  queries: Queries,
+  room: RoomPolicy,
+): Promise<Set<string>> {
+  const rows = await queries.query<{ session_id: string }>(
+    `SELECT m.session_id FROM memberships m JOIN sessions s ON s.id = m.session_id
+     WHERE m.room_id = $1 AND m.status = 'approved' AND s.expires_at > clock_timestamp()`,
+    [room.id],
   );
-  requireCondition(r, 404, "ROOM_NOT_FOUND", "Room not found.");
-  return r;
+  return new Set([room.owner_id, ...rows.map((row) => row.session_id)]);
 }
-const fileShape = z
-  .object({
-    id: roomId,
-    keyFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
-    descriptor: b64,
-    chunkCount: z.number().int().min(1).max(250),
-    encryptedBytes: z
-      .number()
-      .int()
-      .min(16)
-      .max(MAX + 4000),
-  })
-  .strict();
-export function roomFilesRoutes(db: Database) {
+
+export function roomFileRoutes(database: Database) {
   const router = Router();
-  router.use("/rooms/:roomId/files/:fileId/chunks/:index", (req, res, next) => {
-    if (req.method !== "PUT") return next();
-    void (async () => {
-      const rid = roomId.parse(req.params.roomId),
-        fid = roomId.parse(req.params.fileId),
-        r = await getRoom(db, rid);
-      const who = await admit(db, r, req.ownerId, req.session!.id);
-      const [f] = await db.query<{
-        uploader_id: string;
-        status: string;
-      }>(
-        "SELECT uploader_id,status FROM room_files WHERE id=$1 AND room_id=$2",
-        [fid, rid],
-      );
-      requireCondition(
-        f && f.uploader_id === who.uploader,
-        404,
-        "FILE_NOT_FOUND",
-        "File not found.",
-      );
-      requireCondition(
-        f.status === "uploading",
-        409,
-        "UPLOAD_COMPLETE",
-        "File upload is complete.",
-      );
-      express.raw({ type: "application/octet-stream", limit: CHUNK + 16 })(
-        req,
-        res,
-        next,
-      );
-    })().catch(next);
-  });
-  router.get("/rooms/:id/files/key", async (req, res) => {
-    const id = roomId.parse(req.params.id),
-      r = await getRoom(db, id);
-    if (r.owner_id !== req.ownerId)
-      await admit(db, r, req.ownerId, req.session!.id);
-    else
-      requireCondition(
-        !r.expired && r.status !== "closed",
-        410,
-        "ROOM_CLOSED",
-        "This room has closed.",
-      );
-    const [k] = await db.query<{
-      fingerprint: string;
-      epoch: number;
-      history_envelope: string | null;
-    }>("SELECT fingerprint,epoch,history_envelope FROM room_file_keys WHERE room_id=$1", [id]);
-    res.json({ fingerprint: k?.fingerprint ?? null, epoch: k?.epoch ?? 0, historyEnvelope: k?.history_envelope ?? null });
-  });
-  router.post("/rooms/:id/files/key/rotate", async (req, res) => {
-    const id = roomId.parse(req.params.id);
-    const { expectedFingerprint, newFingerprint, historyEnvelope } = z
-      .object({
-        expectedFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
-        newFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
-        historyEnvelope: z
-          .string()
-          .max(7000)
-          .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/),
-      })
-      .strict()
-      .parse(req.body);
-    requireCondition(
-      canonicalB64(historyEnvelope) &&
-        Buffer.from(historyEnvelope, "base64").length >= 28,
-      422,
-      "INVALID_HISTORY",
-      "The encrypted key history is invalid.",
-    );
-    const result = await db.transaction(async (tx) => {
-      const r = await locked(tx, id);
-      requireCondition(
-        r.owner_id === req.ownerId,
-        403,
-        "OWNER_REQUIRED",
-        "Only the organizer can rotate the shared file key.",
-      );
-      requireCondition(
-        r.status === "open" && !r.expired,
-        410,
-        "ROOM_CLOSED",
-        "This room is no longer accepting shared files.",
-      );
-      const [key] = await tx.query<{
-        fingerprint: string;
-        epoch: number;
-        history_envelope: string | null;
-      }>(
-        "SELECT fingerprint,epoch,history_envelope FROM room_file_keys WHERE room_id=$1 FOR UPDATE",
-        [id],
-      );
-      requireCondition(
-        key,
-        409,
-        "KEY_NOT_REGISTERED",
-        "Shared files do not have a key to rotate.",
-      );
-      if (key.fingerprint === newFingerprint && key.history_envelope === historyEnvelope)
-        return { fingerprint: key.fingerprint, epoch: key.epoch };
-      requireCondition(
-        key.fingerprint === expectedFingerprint,
-        409,
-        "KEY_ROTATION_CONFLICT",
-        "The room key changed in another rotation.",
-      );
-      requireCondition(
-        key.epoch < 32,
-        409,
-        "KEY_HISTORY_LIMIT",
-        "This room has reached its key history limit.",
-      );
-      requireCondition(
-        newFingerprint !== expectedFingerprint,
-        422,
-        "INVALID_ROTATION",
-        "Choose a new shared file key.",
-      );
-      await tx.query(
-        "UPDATE room_file_keys SET fingerprint=$2,epoch=epoch+1,history_envelope=$3 WHERE room_id=$1",
-        [id, newFingerprint, historyEnvelope],
-      );
-      await tx.query("DELETE FROM room_files WHERE room_id=$1 AND status='uploading'", [id]);
-      return { fingerprint: newFingerprint, epoch: key.epoch + 1 };
-    });
-    res.json(result);
-  });
-  router.post("/rooms/:id/files/key", async (req, res) => {
-    const id = roomId.parse(req.params.id),
-      { fingerprint } = z
-        .object({ fingerprint: z.string().regex(/^[0-9a-f]{64}$/) })
-        .strict()
-        .parse(req.body);
-    await db.transaction(async (tx) => {
-      const r = await locked(tx, id);
-      requireCondition(
-        r.owner_id === req.ownerId,
-        403,
-        "OWNER_REQUIRED",
-        "Only the organizer can register the room key.",
-      );
-      const [fresh] = await tx.query<{ status: string; expired: boolean }>(
-        "SELECT status,expires_at <= clock_timestamp() AS expired FROM rooms WHERE id=$1",
-        [id],
-      );
-      requireCondition(
-        fresh.status !== "closed" && !fresh.expired,
-        410,
-        "ROOM_CLOSED",
-        "This room has closed.",
-      );
-      const [old] = await tx.query<{
-        fingerprint: string;
-      }>("SELECT fingerprint FROM room_file_keys WHERE room_id=$1 FOR UPDATE", [
-        id,
-      ]);
-      requireCondition(
-        !old || old.fingerprint === fingerprint,
-        409,
-        "KEY_IMMUTABLE",
-        "The room key cannot be replaced.",
-      );
-      if (!old)
-        await tx.query(
-          "INSERT INTO room_file_keys(room_id,fingerprint) VALUES($1,$2)",
-          [id, fingerprint],
+  router.use(
+    '/rooms/:roomId/files/:fileId/chunks/:index',
+    (request, response, next) => {
+      if (request.method !== 'PUT') return next();
+      void (async () => {
+        const pathRoom = roomId.parse(request.params.roomId);
+        const fileId = roomId.parse(request.params.fileId);
+        const [room] = await database.query<RoomPolicy>(
+          'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1',
+          [pathRoom],
         );
-    });
-    res.status(201).json({ fingerprint });
-  });
-  router.post("/rooms/:id/files", async (req, res) => {
-    const rid = roomId.parse(req.params.id),
-      v = fileShape.parse(req.body),
-      desc = Buffer.from(v.descriptor, "base64"),
-      plain = v.encryptedBytes - v.chunkCount * 16;
-    requireCondition(
-      canonicalB64(v.descriptor) &&
-        desc.length > 0 &&
-        desc.length <= 8192 &&
-        plain >= 0 &&
-        plain <= MAX &&
-        v.chunkCount === Math.max(1, Math.ceil(plain / CHUNK)),
-      422,
-      "INVALID_FILE",
-      "Shared file metadata is invalid.",
-    );
-    const result = await db.transaction(
-      async (
-        tx,
-      ): Promise<{
-        id: string;
-        complete: boolean;
-        uploadedChunks: number[];
-        receipt?: FileReceipt;
-      }> => {
-        const r = await locked(tx, rid),
-          who = await admit(tx, r, req.ownerId, req.session!.id),
-          [key] = await tx.query<{
-            fingerprint: string;
-          }>("SELECT fingerprint FROM room_file_keys WHERE room_id=$1", [rid]);
-        const [old] = await tx.query<{
-          id: string;
-          room_id: string;
-          uploader_id: string;
-          descriptor: Buffer;
-          chunk_count: number;
-          encrypted_bytes: string;
+        requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+        await requireOwner(database, room, request.session!.id);
+        const [file] = await database.query<{
+          owner_id: string;
           status: string;
-          key_fingerprint: string;
+          encrypted_descriptor: Buffer | null;
         }>(
-          "SELECT id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes::text,status,key_fingerprint FROM room_files WHERE id=$1 FOR UPDATE",
-          [v.id],
-        );
-        if (old) {
-          requireCondition(
-            old.room_id === rid &&
-              old.uploader_id === who.uploader &&
-              Buffer.from(old.descriptor).equals(desc) &&
-              old.chunk_count === v.chunkCount &&
-              Number(old.encrypted_bytes) === v.encryptedBytes,
-            409,
-            "UPLOAD_ID_CONFLICT",
-            "This file reference is already in use.",
-          );
-          requireCondition(old.key_fingerprint === v.keyFingerprint && (old.status === "complete" || key?.fingerprint === v.keyFingerprint), 409, "KEY_MISMATCH", "This file uses a different room key.");
-          const chunks = await tx.query<{
-            chunk_index: number;
-          }>(
-            "SELECT chunk_index FROM room_file_chunks WHERE file_id=$1 ORDER BY chunk_index",
-            [v.id],
-          );
-          const result: {
-            id: string;
-            complete: boolean;
-            uploadedChunks: number[];
-            receipt?: FileReceipt;
-          } = {
-            id: v.id,
-            complete: old.status === "complete",
-            uploadedChunks: chunks.map((x) => x.chunk_index),
-          };
-          if (old.status === "complete") {
-            const [x] = await tx.query<{
-              receipt: FileReceipt;
-            }>(
-              "SELECT jsonb_build_object('id',id,'acceptedAt',completed_at,'encryptedBytes',encrypted_bytes,'manifestSha256',manifest_sha256) AS receipt FROM room_files WHERE id=$1",
-              [v.id],
-            );
-            result.receipt = x.receipt;
-          }
-          return result;
-        }
-        requireCondition(key?.fingerprint === v.keyFingerprint, 409, "KEY_MISMATCH", "This file uses a different room key.");
-        await tx.query(
-          "DELETE FROM room_files WHERE room_id=$1 AND uploader_id=$2 AND status='uploading' AND created_at < clock_timestamp()-interval '24 hours'",
-          [rid, who.uploader],
-        );
-        const [usage] = await tx.query<{
-          total: string;
-        }>(
-          "SELECT (COALESCE((SELECT sum(encrypted_bytes) FROM private_submissions WHERE room_id=$1),0)+COALESCE((SELECT sum(encrypted_bytes) FROM room_files WHERE room_id=$1),0))::text AS total",
-          [rid],
+          'SELECT owner_id, status, encrypted_descriptor FROM room_files WHERE id = $1 AND room_id = $2',
+          [fileId, pathRoom],
         );
         requireCondition(
-          Number(usage.total) + v.encryptedBytes <= QUOTA,
-          413,
-          "ROOM_QUOTA",
-          "The room has reached its encrypted storage limit.",
-        );
-        const [counts] = await tx.query<{
-          all: number;
-          pending: number;
-          mine: number;
-        }>(
-          "SELECT count(*)::int all,count(*) FILTER(WHERE status='uploading')::int pending,count(*) FILTER(WHERE status='uploading' AND uploader_id=$2)::int mine FROM room_files WHERE room_id=$1",
-          [rid, who.uploader],
+          file && file.owner_id === request.session!.id,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
         );
         requireCondition(
-          counts.all < 1000,
-          413,
-          "OBJECT_LIMIT",
-          "The room has reached its shared file limit.",
-        );
-        requireCondition(
-          counts.pending < 100 && counts.mine < 10,
-          429,
-          "UPLOADS_PENDING",
-          "Too many uploads are already in progress.",
-        );
-        const inserted = await tx.query<{
-          id: string;
-        }>(
-          "INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes,key_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING RETURNING id",
-          [v.id, rid, who.uploader, desc, v.chunkCount, v.encryptedBytes, v.keyFingerprint],
-        );
-        requireCondition(
-          inserted.length === 1,
+          file.status === 'uploading' && file.encrypted_descriptor,
           409,
-          "UPLOAD_ID_CONFLICT",
-          "This file reference is already in use.",
+          'UPLOAD_UNAVAILABLE',
+          'This file is no longer accepting chunks.',
         );
-        return { id: v.id, complete: false, uploadedChunks: [] };
-      },
+        express.raw({
+          type: 'application/octet-stream',
+          limit: CHUNK_BYTES + 16,
+        })(request, response, next);
+      })().catch(next);
+    },
+  );
+
+  router.get('/rooms/:id/files/keys', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const [room] = await database.query<RoomPolicy>(
+      'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1',
+      [id],
     );
-    res.status(201).json(result);
-  });
-  router.put("/rooms/:roomId/files/:fileId/chunks/:index", async (req, res) => {
-    const rid = roomId.parse(req.params.roomId),
-      fid = roomId.parse(req.params.fileId),
-      idx = z.coerce.number().int().min(0).max(249).parse(req.params.index);
+    requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+    if (room.owner_id !== request.session!.id) {
+      requireCondition(
+        room.status === 'open' && !room.is_expired,
+        410,
+        'ROOM_CLOSED',
+        'This room is no longer exchanging files.',
+      );
+      await requireVisible(database, room, request.session!.id);
+    } else
+      requireCondition(
+        room.status !== 'closed' && !room.is_expired,
+        410,
+        'ROOM_CLOSED',
+        'This room has closed.',
+      );
+    const [ownerKey] = await database.query<{
+      publicKey: Buffer;
+      fingerprint: string;
+    }>(
+      'SELECT public_key AS "publicKey", fingerprint FROM room_recipient_keys WHERE room_id = $1',
+      [id],
+    );
     requireCondition(
-      Buffer.isBuffer(req.body),
-      400,
-      "INVALID_CHUNK",
-      "Chunk body is required.",
+      ownerKey,
+      409,
+      'KEYS_NOT_READY',
+      'The organizer has not set up encryption for this room yet.',
     );
-    const bytes = req.body as Buffer;
-    let outcome = "stored";
-    await db.transaction(async (tx) => {
-      const r = await locked(tx, rid),
-        who = await admit(tx, r, req.ownerId, req.session!.id),
-        [f] = await tx.query<{
-          uploader_id: string;
-          chunk_count: number;
-          encrypted_bytes: string;
-          status: string;
-        }>(
-          "SELECT uploader_id,chunk_count,encrypted_bytes::text,status FROM room_files WHERE id=$1 AND room_id=$2 FOR UPDATE",
-          [fid, rid],
-        );
-      requireCondition(
-        f && f.uploader_id === who.uploader,
-        404,
-        "FILE_NOT_FOUND",
-        "File not found.",
+    const [recipientKey] = await database.query<{ fingerprint: string }>(
+      'SELECT fingerprint FROM session_recipient_keys WHERE room_id = $1 AND session_id = $2',
+      [id, request.session!.id],
+    );
+    const [roomAccess] = await database.query<{ public_key: Buffer; fingerprint: string }>('SELECT public_key, fingerprint FROM room_access_keys WHERE room_id = $1', [id]);
+    const sharedKeyInfo = {
+      roomAccessPublicKey: roomAccess ? Buffer.from(roomAccess.public_key).toString('base64') : null,
+      roomAccessFingerprint: roomAccess?.fingerprint ?? null,
+    };
+    if (room.owner_id !== request.session!.id) {
+      response.json({
+        ownerPublicKey: Buffer.from(ownerKey.publicKey).toString('base64'),
+        ownerFingerprint: ownerKey.fingerprint,
+        recipientFingerprint: recipientKey?.fingerprint ?? null,
+        ...sharedKeyInfo,
+      });
+      return;
+    }
+    const recipients = await database.query<{
+      id: string;
+      label: string;
+      publicKey: Buffer;
+      fingerprint: string;
+    }>(
+      `SELECT m.session_id AS id, m.label, k.public_key AS "publicKey", k.fingerprint
+       FROM memberships m
+       JOIN sessions s ON s.id = m.session_id AND s.expires_at > clock_timestamp()
+       JOIN session_recipient_keys k ON k.room_id = m.room_id AND k.session_id = m.session_id
+       WHERE m.room_id = $1 AND m.status = 'approved'
+       ORDER BY m.label, m.session_id`,
+      [id],
+    );
+    response.json({
+      ownerPublicKey: Buffer.from(ownerKey.publicKey).toString('base64'),
+      ownerFingerprint: ownerKey.fingerprint,
+      ownerRecipientId: room.owner_id,
+      ...sharedKeyInfo,
+      recipients: recipients.map((row) => ({
+        id: row.id,
+        label: row.label,
+        publicKey: Buffer.from(row.publicKey).toString('base64'),
+        fingerprint: row.fingerprint,
+      })),
+    });
+  });
+
+  router.post('/rooms/:id/files', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const { fileId: fileIdValue } = z
+      .object({ fileId: roomId })
+      .strict()
+      .parse(request.body);
+    let completed = false;
+    let completionReceipt: unknown;
+    await database.transaction(async (transaction) => {
+      const [room] = await transaction.query<RoomPolicy>(
+        'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireOwner(transaction, room, request.session!.id);
+      const [ownerKey] = await transaction.query<{ public_key: Buffer }>(
+        'SELECT public_key FROM room_recipient_keys WHERE room_id = $1',
+        [id],
       );
       requireCondition(
-        f.status === "uploading",
+        ownerKey,
         409,
-        "UPLOAD_COMPLETE",
-        "File upload is complete.",
+        'KEYS_REQUIRED',
+        'The organizer must register their room key before publishing files.',
       );
-      requireCondition(
-        idx < f.chunk_count,
-        422,
-        "INVALID_CHUNK",
-        "Chunk index is outside the file.",
-      );
-      const total = Number(f.encrypted_bytes) - Number(f.chunk_count) * 16,
-        expected =
-          idx < f.chunk_count - 1
-            ? CHUNK + 16
-            : total - (f.chunk_count - 1) * CHUNK + 16;
-      requireCondition(
-        bytes.length === expected,
-        422,
-        "INVALID_CHUNK",
-        "Chunk size does not match the declared file.",
-      );
-      const [existing] = await tx.query<{
-        ciphertext: Buffer;
+      const [existing] = await transaction.query<{
+        owner_id: string;
+        status: string;
+        room_id: string;
+        receipt: unknown;
       }>(
-        "SELECT ciphertext FROM room_file_chunks WHERE file_id=$1 AND chunk_index=$2",
-        [fid, idx],
+        'SELECT owner_id, status, room_id, receipt FROM room_files WHERE id = $1 FOR UPDATE',
+        [fileIdValue],
       );
       if (existing) {
         requireCondition(
-          Buffer.from(existing.ciphertext).equals(bytes),
+          existing.room_id === id && existing.owner_id === request.session!.id,
           409,
-          "CHUNK_CONFLICT",
-          "This chunk index already contains different ciphertext.",
+          'UPLOAD_ID_CONFLICT',
+          'This upload reference is already in use.',
         );
-        outcome = "retry";
+        completed = existing.status === 'complete';
+        if (completed) completionReceipt = existing.receipt;
         return;
       }
-      const [last] = await tx.query<{
-        n: number;
-      }>(
-        "SELECT COALESCE(max(chunk_index),-1)::int n FROM room_file_chunks WHERE file_id=$1",
-        [fid],
+      await reclaimStaleFileUploads(transaction, id, 1000);
+      const [usage] = await transaction.query<{ total: string }>(
+        `SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM room_files WHERE room_id = $1`,
+        [id],
       );
       requireCondition(
-        idx === last.n + 1,
-        409,
-        "CHUNK_ORDER",
-        "Upload chunks in order.",
+        Number(usage.total) < MAX_ROOM_BYTES,
+        413,
+        'ROOM_QUOTA',
+        'The room has reached its encrypted storage limit.',
       );
-      await tx.query(
-        "INSERT INTO room_file_chunks(file_id,chunk_index,ciphertext,sha256) VALUES($1,$2,$3,$4)",
-        [fid, idx, bytes, hash(bytes)],
+      const [objectCount] = await transaction.query<{ count: number }>(
+        'SELECT count(*)::int AS count FROM room_files WHERE room_id = $1',
+        [id],
+      );
+      requireCondition(
+        objectCount.count < 1000,
+        413,
+        'OBJECT_LIMIT',
+        'The room has reached its 1,000-file limit.',
+      );
+      const [pending] = await transaction.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM room_files WHERE room_id = $1 AND status = 'uploading'",
+        [id],
+      );
+      requireCondition(
+        pending.count < 20,
+        429,
+        'UPLOADS_PENDING',
+        'Finish or retry the existing file uploads before starting another.',
+      );
+      const inserted = await transaction.query(
+        'INSERT INTO room_files (id, room_id, owner_id) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING RETURNING id',
+        [fileIdValue, id, request.session!.id],
+      );
+      requireCondition(
+        inserted.length,
+        409,
+        'UPLOAD_ID_CONFLICT',
+        'This upload reference is already in use.',
       );
     });
-    res.status(200).json({ uploaded: true, retry: outcome === "retry" });
+    response.status(201).json({
+      id: fileIdValue,
+      complete: completed,
+      ...(completed ? { receipt: completionReceipt } : {}),
+      chunkBytes: CHUNK_BYTES,
+      maxFileBytes: MAX_FILE_BYTES,
+    });
   });
-  router.post("/rooms/:roomId/files/:fileId/complete", async (req, res) => {
-    const rid = roomId.parse(req.params.roomId);
-    const fid = roomId.parse(req.params.fileId);
-    const manifest = z
-      .string()
-      .regex(/^[0-9a-f]{64}$/)
-      .parse(
-        z.object({ manifestSha256: z.string() }).strict().parse(req.body)
-          .manifestSha256,
-      );
-    let receipt: FileReceipt | undefined;
-    await db.transaction(async (tx) => {
-      const r = await locked(tx, rid),
-        who = await admit(tx, r, req.ownerId, req.session!.id);
-      const [f] = await tx.query<{
-        uploader_id: string;
-        status: string;
-        chunk_count: number;
-        encrypted_bytes: string;
-        descriptor: Buffer;
-        manifest_sha256: string | null;
-        completed_at: Date | null;
-      }>(
-        "SELECT uploader_id,status,chunk_count,encrypted_bytes::text,descriptor,manifest_sha256,completed_at FROM room_files WHERE id=$1 AND room_id=$2 FOR UPDATE",
-        [fid, rid],
-      );
+
+  router.put(
+    '/rooms/:roomId/files/:fileId/metadata',
+    async (request, response) => {
+      const roomIdValue = roomId.parse(request.params.roomId);
+      const fileIdValue = roomId.parse(request.params.fileId);
+      const input = z
+        .object({
+          descriptor: b64,
+          roomEnvelope: z.object({ fingerprint: z.string().regex(/^[a-f0-9]{64}$/), enc: b64, ciphertext: b64 }).strict().optional(),
+          recipientFingerprints: z.record(roomId, z.string().regex(/^[a-f0-9]{64}$/)).optional(),
+          envelopes: z
+            .array(
+              z
+                .object({
+                  recipientId: roomId,
+                  enc: b64,
+                  ciphertext: b64,
+                })
+                .strict(),
+            )
+            .min(1)
+            .max(MAX_RECIPIENTS),
+        })
+        .strict()
+        .parse(request.body);
+      const descriptor = Buffer.from(input.descriptor, 'base64');
+      const envelopes = input.envelopes.map((envelope) => ({
+        recipientId: envelope.recipientId,
+        enc: Buffer.from(envelope.enc, 'base64'),
+        ciphertext: Buffer.from(envelope.ciphertext, 'base64'),
+      }));
       requireCondition(
-        f && f.uploader_id === who.uploader,
-        404,
-        "FILE_NOT_FOUND",
-        "File not found.",
-      );
-      if (f.status === "complete") {
-        requireCondition(
-          f.manifest_sha256 === manifest,
-          409,
-          "MANIFEST_CONFLICT",
-          "This file was completed with another manifest.",
-        );
-        receipt = {
-          id: fid,
-          acceptedAt: f.completed_at!,
-          encryptedBytes: Number(f.encrypted_bytes),
-          manifestSha256: manifest,
-        };
-        return;
-      }
-      const [count] = await tx.query<{
-        count: number;
-        bytes: string;
-      }>(
-        "SELECT count(*)::int count,COALESCE(sum(octet_length(ciphertext)),0)::text bytes FROM room_file_chunks WHERE file_id=$1",
-        [fid],
-      );
-      requireCondition(
-        count.count === f.chunk_count &&
-          Number(count.bytes) === Number(f.encrypted_bytes),
-        409,
-        "CHUNKS_INCOMPLETE",
-        "Upload all chunks before completing.",
-      );
-      const digest = createHash("sha256").update(Buffer.from(f.descriptor));
-      for (let i = 0; i < f.chunk_count; i++) {
-        const [chunk] = await tx.query<{
-          sha256: string;
-          ciphertext: Buffer;
-        }>(
-          "SELECT sha256,ciphertext FROM room_file_chunks WHERE file_id=$1 AND chunk_index=$2",
-          [fid, i],
-        );
-        requireCondition(
-          chunk && hash(Buffer.from(chunk.ciphertext)) === chunk.sha256,
-          409,
-          "CHUNK_CORRUPT",
-          "An uploaded chunk failed its integrity check.",
-        );
-        digest.update(Buffer.from(chunk.sha256, "hex"));
-      }
-      const actual = digest.digest("hex");
-      requireCondition(
-        actual === manifest,
+        new Set(envelopes.map((x) => x.recipientId)).size === envelopes.length,
         422,
-        "MANIFEST_MISMATCH",
-        "The file manifest does not match its encrypted chunks.",
-      );
-      const [fresh] = await tx.query<{
-        status: string;
-        expired: boolean;
-      }>(
-        "SELECT status,expires_at<=clock_timestamp() AS expired FROM rooms WHERE id=$1",
-        [rid],
+        'INVALID_ENCRYPTION',
+        'Each recipient may appear only once.',
       );
       requireCondition(
-        fresh.status === "open" && !fresh.expired,
-        410,
-        "ROOM_CLOSED",
-        "This room is no longer accepting shared files.",
+        descriptor.length >= 69 &&
+          descriptor.length <= 16_384 &&
+          envelopes.every(
+            (x) =>
+              x.enc.length === 65 &&
+              x.ciphertext.length >= 16 &&
+              x.ciphertext.length <= 4096,
+          ),
+        422,
+        'INVALID_ENCRYPTION',
+        'Encrypted file metadata is invalid.',
       );
-      const [stamp] = await tx.query<{
-        completed_at: Date;
-      }>(
-        "UPDATE room_files SET status='complete',manifest_sha256=$2,completed_at=clock_timestamp() WHERE id=$1 RETURNING completed_at",
-        [fid, manifest],
+      await database.transaction(async (transaction) => {
+        const [room] = await transaction.query<RoomPolicy>(
+          'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE',
+          [roomIdValue],
+        );
+        requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+        await requireOwner(transaction, room, request.session!.id);
+        const [file] = await transaction.query<{
+          owner_id: string;
+          status: string;
+          encrypted_descriptor: Buffer | null;
+        }>(
+          'SELECT owner_id, status, encrypted_descriptor FROM room_files WHERE id = $1 AND room_id = $2 FOR UPDATE',
+          [fileIdValue, roomIdValue],
+        );
+        requireCondition(
+          file && file.owner_id === request.session!.id,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
+        );
+        requireCondition(
+          file.status === 'uploading',
+          409,
+          'UPLOAD_COMPLETE',
+          'This upload has already completed.',
+        );
+        const [accessKey] = await transaction.query<{ fingerprint: string }>('SELECT fingerprint FROM room_access_keys WHERE room_id = $1', [roomIdValue]);
+        const roomEnvelope = input.roomEnvelope;
+        requireCondition(!accessKey || roomEnvelope, 409, 'ROOM_ACCESS_REQUIRED', 'Reload the organizer page before publishing so all room members receive access.');
+        if (roomEnvelope) {
+          requireCondition(accessKey?.fingerprint === roomEnvelope.fingerprint && Buffer.from(roomEnvelope.enc, 'base64').length === 65 && Buffer.from(roomEnvelope.ciphertext, 'base64').length === 48,
+            422, 'INVALID_ENCRYPTION', 'Room-wide file envelope does not match this room.');
+        }
+        const eligible = await eligibleRecipients(transaction, room);
+        if (input.recipientFingerprints) {
+          const keys = await transaction.query<{ id: string; fingerprint: string }>(
+            `SELECT r.owner_id AS id, k.fingerprint FROM rooms r JOIN room_recipient_keys k ON k.room_id = r.id WHERE r.id = $1
+             UNION ALL SELECT session_id AS id, fingerprint FROM session_recipient_keys WHERE room_id = $1`, [roomIdValue]);
+          requireCondition(envelopes.every(envelope => keys.some(key => key.id === envelope.recipientId && key.fingerprint === input.recipientFingerprints![key.id])),
+            409, 'RECIPIENT_CHANGED', 'Recipient keys changed. Discard the saved plan and seal a fresh upload.');
+        }
+
+        requireCondition(
+          envelopes.every((x) => eligible.has(x.recipientId)),
+          422,
+          'INVALID_RECIPIENT',
+          'Only the organizer and approved participants can receive a file.',
+        );
+        requireCondition(
+          envelopes.some((x) => x.recipientId === room.owner_id),
+          422,
+          'INVALID_RECIPIENT',
+          'The organizer must keep a copy of the file key.',
+        );
+        if (file.encrypted_descriptor) {
+          const stored = await transaction.query<{
+            recipient_id: string;
+            enc: Buffer;
+            ciphertext: Buffer;
+          }>(
+            'SELECT recipient_id, enc, ciphertext FROM room_file_envelopes WHERE file_id = $1',
+            [fileIdValue],
+          );
+          const [storedShared] = await transaction.query<{ fingerprint: string; enc: Buffer; ciphertext: Buffer }>('SELECT fingerprint, enc, ciphertext FROM room_file_shared_envelopes WHERE file_id = $1', [fileIdValue]);
+          requireCondition(!storedShared ? !roomEnvelope : roomEnvelope && storedShared.fingerprint === roomEnvelope.fingerprint && Buffer.from(storedShared.enc).equals(Buffer.from(roomEnvelope.enc, 'base64')) && Buffer.from(storedShared.ciphertext).equals(Buffer.from(roomEnvelope.ciphertext, 'base64')),
+            409, 'METADATA_CONFLICT', 'A retry must send the original room envelope.');
+          const identical =
+            Buffer.from(file.encrypted_descriptor).equals(descriptor) &&
+            stored.length === envelopes.length &&
+            envelopes.every((envelope) => {
+              const match = stored.find(
+                (row) => row.recipient_id === envelope.recipientId,
+              );
+              return (
+                match &&
+                Buffer.from(match.enc).equals(envelope.enc) &&
+                Buffer.from(match.ciphertext).equals(envelope.ciphertext)
+              );
+            });
+          requireCondition(
+            identical,
+            409,
+            'METADATA_CONFLICT',
+            'A retry must send the original encrypted metadata and envelopes.',
+          );
+          return;
+        }
+        await transaction.query(
+          'UPDATE room_files SET encrypted_descriptor = $2 WHERE id = $1',
+          [fileIdValue, descriptor],
+        );
+        if (roomEnvelope) await transaction.query('INSERT INTO room_file_shared_envelopes(file_id, fingerprint, enc, ciphertext) VALUES ($1, $2, $3, $4)', [fileIdValue, roomEnvelope.fingerprint, Buffer.from(roomEnvelope.enc, 'base64'), Buffer.from(roomEnvelope.ciphertext, 'base64')]);
+        for (const envelope of envelopes)
+          await transaction.query(
+            'INSERT INTO room_file_envelopes (file_id, recipient_id, enc, ciphertext) VALUES ($1, $2, $3, $4)',
+            [fileIdValue, envelope.recipientId, envelope.enc, envelope.ciphertext],
+          );
+      });
+      response.status(204).end();
+    },
+  );
+
+  router.put(
+    '/rooms/:roomId/files/:fileId/chunks/:index',
+    async (request, response) => {
+      const roomIdValue = roomId.parse(request.params.roomId);
+      const fileIdValue = roomId.parse(request.params.fileId);
+      const index = z.coerce
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_CHUNKS - 1)
+        .parse(request.params.index);
+      const ciphertext = request.body as Buffer;
+      requireCondition(
+        Buffer.isBuffer(ciphertext) &&
+          ciphertext.length >= 16 &&
+          ciphertext.length <= CHUNK_BYTES + 16,
+        413,
+        'INVALID_CHUNK',
+        'Encrypted chunk size is invalid.',
       );
-      receipt = {
-        id: fid,
-        acceptedAt: stamp.completed_at,
-        encryptedBytes: Number(f.encrypted_bytes),
-        manifestSha256: manifest,
-      };
-    });
-    res.json({ receipt });
-  });
-  router.get("/rooms/:id/files", async (req, res) => {
-    const rid = roomId.parse(req.params.id),
-      r = await getRoom(db, rid);
-    await admit(db, r, req.ownerId, req.session!.id);
-    let cursor: {
-      createdAt: string;
-      id: string;
-    } | null = null;
-    if (req.query.before !== undefined) {
-      const raw = z.string().base64url().max(200).parse(req.query.before);
-      try {
-        cursor = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as {
-          createdAt: string;
-          id: string;
+      const digest = fingerprint(ciphertext);
+      const result = await database.transaction(async (transaction) => {
+        const [room] = await transaction.query<RoomPolicy>(
+          'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE',
+          [roomIdValue],
+        );
+        requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+        await requireOwner(transaction, room, request.session!.id);
+        const [file] = await transaction.query<{
+          owner_id: string;
+          status: string;
+          chunk_count: number;
+          encrypted_bytes: string;
+          encrypted_descriptor: Buffer | null;
+        }>(
+          'SELECT owner_id, status, chunk_count, encrypted_bytes::text AS encrypted_bytes, encrypted_descriptor FROM room_files WHERE id = $1 AND room_id = $2 FOR UPDATE',
+          [fileIdValue, roomIdValue],
+        );
+        requireCondition(
+          file && file.owner_id === request.session!.id,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
+        );
+        requireCondition(
+          file.status === 'uploading',
+          409,
+          'UPLOAD_COMPLETE',
+          'This upload has already completed.',
+        );
+        requireCondition(
+          file.encrypted_descriptor,
+          409,
+          'METADATA_REQUIRED',
+          'Set encrypted file metadata before uploading chunks.',
+        );
+        const [existing] = await transaction.query<{ sha256: string }>(
+          'SELECT sha256 FROM room_file_chunks WHERE file_id = $1 AND chunk_index = $2',
+          [fileIdValue, index],
+        );
+        if (existing) {
+          requireCondition(
+            existing.sha256 === digest,
+            409,
+            'CHUNK_CONFLICT',
+            'A retry must send the original encrypted bytes.',
+          );
+          return 'retry';
+        }
+        const [existingCount] = await transaction.query<{ count: number }>(
+          'SELECT count(*)::int AS count FROM room_file_chunks WHERE file_id = $1',
+          [fileIdValue],
+        );
+        requireCondition(
+          index <= existingCount.count,
+          409,
+          'CHUNK_ORDER',
+          'Upload chunks must be sent in order.',
+        );
+        requireCondition(
+          Number(file.encrypted_bytes) + ciphertext.length <=
+            MAX_FILE_BYTES + MAX_CHUNKS * 16,
+          413,
+          'FILE_LIMIT',
+          'The file exceeds the 250 MiB encrypted upload limit.',
+        );
+        const [usage] = await transaction.query<{ total: string }>(
+          'SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM room_files WHERE room_id = $1',
+          [roomIdValue],
+        );
+        requireCondition(
+          Number(usage.total) + ciphertext.length <= MAX_ROOM_BYTES,
+          413,
+          'ROOM_QUOTA',
+          'The room has reached its encrypted storage limit.',
+        );
+        await transaction.query(
+          'INSERT INTO room_file_chunks (file_id, chunk_index, ciphertext, sha256) VALUES ($1, $2, $3, $4)',
+          [fileIdValue, index, ciphertext, digest],
+        );
+        await transaction.query(
+          'UPDATE room_files SET chunk_count = chunk_count + 1, encrypted_bytes = encrypted_bytes + $2 WHERE id = $1',
+          [fileIdValue, ciphertext.length],
+        );
+        return 'stored';
+      });
+      response
+        .status(result === 'retry' ? 200 : 201)
+        .set('X-Ciphertext-SHA256', digest)
+        .json({ index, sha256: digest, status: result });
+    },
+  );
+
+  router.post(
+    '/rooms/:roomId/files/:fileId/complete',
+    async (request, response) => {
+      const roomIdValue = roomId.parse(request.params.roomId);
+      const fileIdValue = roomId.parse(request.params.fileId);
+      const { chunkCount, manifestSha256 } = z
+        .object({
+          chunkCount: z.number().int().min(1).max(MAX_CHUNKS),
+          manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        })
+        .strict()
+        .parse(request.body);
+      const receipt = await database.transaction(async (transaction) => {
+        const [room] = await transaction.query<RoomPolicy>(
+          'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE',
+          [roomIdValue],
+        );
+        requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+        await requireOwner(transaction, room, request.session!.id);
+        const [file] = await transaction.query<{
+          owner_id: string;
+          status: string;
+          chunk_count: number;
+          encrypted_bytes: string;
+          receipt: unknown;
+          encrypted_descriptor: Buffer | null;
+          manifest_sha256: string | null;
+        }>(
+          'SELECT owner_id, status, chunk_count, encrypted_bytes::text AS encrypted_bytes, receipt, encrypted_descriptor, manifest_sha256 FROM room_files WHERE id = $1 AND room_id = $2 FOR UPDATE',
+          [fileIdValue, roomIdValue],
+        );
+        requireCondition(
+          file && file.owner_id === request.session!.id,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
+        );
+        if (file.status === 'complete') {
+          requireCondition(
+            file.chunk_count === chunkCount &&
+              file.manifest_sha256 === manifestSha256,
+            409,
+            'COMPLETION_CONFLICT',
+            'The completion retry does not match the accepted upload.',
+          );
+          return file.receipt;
+        }
+        requireCondition(
+          file.encrypted_descriptor,
+          409,
+          'METADATA_REQUIRED',
+          'Encrypted metadata is missing.',
+        );
+        requireCondition(
+          file.chunk_count === chunkCount,
+          409,
+          'CHUNKS_MISSING',
+          'Upload is incomplete. Retry missing chunks before completing.',
+        );
+        const manifestHash = createHash('sha256').update(
+          file.encrypted_descriptor,
+        );
+        for (let index = 0; index < chunkCount; index += 1) {
+          const [chunk] = await transaction.query<{
+            ciphertext: Buffer;
+            sha256: string;
+          }>(
+            'SELECT ciphertext, sha256 FROM room_file_chunks WHERE file_id = $1 AND chunk_index = $2',
+            [fileIdValue, index],
+          );
+          requireCondition(
+            chunk && fingerprint(chunk.ciphertext) === chunk.sha256,
+            409,
+            'CHUNKS_INVALID',
+            'Upload chunks are incomplete or corrupted.',
+          );
+          manifestHash.update(Buffer.from(chunk.sha256, 'hex'));
+        }
+        const [stillActive] = await transaction.query<{ active: boolean }>(
+          "SELECT status = 'open' AND expires_at > clock_timestamp() AS active FROM rooms WHERE id = $1",
+          [roomIdValue],
+        );
+        requireCondition(
+          stillActive?.active,
+          410,
+          'ROOM_CLOSED',
+          'This room is no longer exchanging files.',
+        );
+        const manifest = manifestHash.digest('hex');
+        requireCondition(
+          manifest === manifestSha256,
+          422,
+          'MANIFEST_MISMATCH',
+          'The encrypted upload manifest does not match stored chunks.',
+        );
+        const value = {
+          id: fileIdValue,
+          manifestSha256: manifest,
+          acceptedAt: new Date().toISOString(),
+          encryptedBytes: Number(file.encrypted_bytes),
         };
+        await transaction.query(
+          "UPDATE room_files SET status = 'complete', manifest_sha256 = $2, receipt = $3, completed_at = clock_timestamp() WHERE id = $1",
+          [fileIdValue, manifest, JSON.stringify(value)],
+        );
+        await recordActivity(transaction, roomIdValue, 'file_published');
+        return value;
+      });
+      response.json({ receipt });
+    },
+  );
+
+  router.delete(
+    '/rooms/:roomId/files/:fileId',
+    async (request, response) => {
+      const roomIdValue = roomId.parse(request.params.roomId);
+      const fileIdValue = roomId.parse(request.params.fileId);
+      await database.transaction(async (transaction) => {
+        const [room] = await transaction.query<RoomPolicy>(
+          'SELECT id, owner_id, status, expires_at, expires_at <= clock_timestamp() AS is_expired FROM rooms WHERE id = $1 FOR UPDATE',
+          [roomIdValue],
+        );
+        requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+        await requireOwner(transaction, room, request.session!.id);
+        const [file] = await transaction.query<{
+          owner_id: string;
+          status: string;
+        }>(
+          'SELECT owner_id, status FROM room_files WHERE id = $1 AND room_id = $2 FOR UPDATE',
+          [fileIdValue, roomIdValue],
+        );
+        requireCondition(
+          file &&
+            file.owner_id === request.session!.id && (!request.query.incompleteOnly || file.status === 'uploading'),
+          404,
+          'FILE_NOT_FOUND',
+          'Upload not found.',
+        );
+        await transaction.query('DELETE FROM room_files WHERE id = $1', [fileIdValue]);
+        if (file.status === 'complete') await recordActivity(transaction, roomIdValue, 'file_deleted');
+      });
+      response.status(204).end();
+    },
+  );
+
+  router.get('/rooms/:roomId/files', async (request, response) => {
+    const id = roomId.parse(request.params.roomId);
+    const room = await roomPolicy(database, id);
+    const role = await requireVisible(database, room, request.session!.id);
+    const beforeValue = z
+      .string()
+      .base64url()
+      .max(200)
+      .optional()
+      .parse(request.query.before);
+    let before: { createdAt: string; id: string } | null = null;
+    if (beforeValue) {
+      try {
+        before = z
+          .object({ createdAt: z.iso.datetime(), id: roomId })
+          .strict()
+          .parse(
+            JSON.parse(Buffer.from(beforeValue, 'base64url').toString('utf8')),
+          );
       } catch {
         requireCondition(
           false,
           422,
-          "INVALID_CURSOR",
-          "File page cursor is invalid.",
+          'INVALID_CURSOR',
+          'File page cursor is invalid.',
         );
       }
-      requireCondition(
-        Boolean(
-          cursor &&
-          /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(cursor.createdAt) &&
-          /^[0-9a-f-]{36}$/.test(cursor.id),
-        ),
-        422,
-        "INVALID_CURSOR",
-        "File page cursor is invalid.",
-      );
     }
-    type FileRow = {
+    const rows = await database.query<{
       id: string;
-      descriptor: Buffer;
-      key_fingerprint: string;
+      owner_id: string;
+      encrypted_descriptor: Buffer;
+      envelope_enc: Buffer;
+      envelope_ciphertext: Buffer;
       chunk_count: number;
       encrypted_bytes: string;
       manifest_sha256: string;
+      receipt: unknown;
       created_at: Date;
       created_at_cursor: string;
-      receipt: FileReceipt;
-      can_delete: boolean;
-    };
-    const rows = await db.query<FileRow>(
-      `SELECT f.id,f.descriptor,f.chunk_count,f.encrypted_bytes::text,f.key_fingerprint,
-    f.manifest_sha256,f.created_at,
-    to_char(f.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor,
-    jsonb_build_object('id',f.id,'acceptedAt',f.completed_at,'encryptedBytes',f.encrypted_bytes,'manifestSha256',f.manifest_sha256) receipt,
-    (f.uploader_id=$2) can_delete FROM room_files f WHERE f.room_id=$1 AND f.status='complete'
-    AND ($3::timestamptz IS NULL OR (f.created_at,f.id)<($3::timestamptz,$4::uuid))
-    ORDER BY f.created_at DESC,f.id DESC LIMIT 51`,
-      [rid, req.session!.id, cursor?.createdAt ?? null, cursor?.id ?? null],
-    );
-    const page = rows.slice(0, 50),
-      last = page.at(-1);
-    const activeFiles = await db.query<{ id: string }>(
-      "SELECT id FROM room_files WHERE room_id=$1 AND status='complete' ORDER BY created_at DESC,id DESC",
-      [rid],
-    );
-    res.json({
-      activeIds: activeFiles.map((file) => file.id),
-      files: page.map((x) => ({
-        id: x.id,
-        keyFingerprint: x.key_fingerprint,
-        descriptor: Buffer.from(x.descriptor).toString("base64"),
-        chunkCount: x.chunk_count,
-        encryptedBytes: Number(x.encrypted_bytes),
-        manifestSha256: x.manifest_sha256,
-        createdAt: x.created_at,
-        receipt: x.receipt,
-        canDelete: x.can_delete || r.owner_id === req.ownerId,
-      })),
-      nextCursor:
-        rows.length > 50 && last
-          ? Buffer.from(
-              JSON.stringify({
-                createdAt: last.created_at_cursor,
-                id: last.id,
-              }),
-            ).toString("base64url")
-          : null,
-    });
-  });
-  router.get("/rooms/:roomId/files/:fileId/chunks/:index", async (req, res) => {
-    const rid = roomId.parse(req.params.roomId),
-      fid = roomId.parse(req.params.fileId),
-      idx = z.coerce.number().int().min(0).max(249).parse(req.params.index),
-      r = await getRoom(db, rid);
-    await admit(db, r, req.ownerId, req.session!.id);
-    const [c] = await db.query<{
-      ciphertext: Buffer;
-      sha256: string;
+      envelope_kind: 'room' | 'personal';
+      room_shared: boolean;
     }>(
-      "SELECT c.ciphertext,c.sha256 FROM room_file_chunks c JOIN room_files f ON f.id=c.file_id WHERE f.id=$1 AND f.room_id=$2 AND f.status='complete' AND c.chunk_index=$3",
-      [fid, rid, idx],
+      `SELECT f.id, f.owner_id, f.encrypted_descriptor,
+        COALESCE(CASE WHEN $5::boolean THEN shared.enc END, e.enc) AS envelope_enc,
+        COALESCE(CASE WHEN $5::boolean THEN shared.ciphertext END, e.ciphertext) AS envelope_ciphertext,
+        CASE WHEN $5::boolean AND shared.file_id IS NOT NULL THEN 'room' ELSE 'personal' END AS envelope_kind,
+        shared.file_id IS NOT NULL AS room_shared,
+        f.chunk_count, f.encrypted_bytes::text AS encrypted_bytes, f.manifest_sha256, f.receipt, f.created_at,
+        to_char(f.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor
+       FROM room_files f LEFT JOIN room_file_envelopes e ON e.file_id = f.id AND e.recipient_id = $2
+       LEFT JOIN room_file_shared_envelopes shared ON shared.file_id = f.id
+       WHERE (e.recipient_id IS NOT NULL OR ($5::boolean AND shared.file_id IS NOT NULL)) AND f.room_id = $1 AND f.status = 'complete'
+         AND ($3::timestamptz IS NULL OR (f.created_at, f.id) < ($3::timestamptz, $4::uuid))
+       ORDER BY f.created_at DESC, f.id DESC LIMIT 51`,
+      [
+        id,
+        request.session!.id,
+        before?.createdAt ?? null,
+        before?.id ?? null,
+        role === 'recipient',
+      ],
     );
-    requireCondition(c, 404, "FILE_NOT_FOUND", "File not found.");
-    const ciphertext = Buffer.from(c.ciphertext);
-    requireCondition(
-      hash(ciphertext) === c.sha256,
-      500,
-      "FILE_CORRUPT",
-      "Stored file ciphertext failed its integrity check.",
-    );
-    res
-      .setHeader("X-Ciphertext-SHA256", c.sha256)
-      .type("application/octet-stream")
-      .setHeader("Content-Length", ciphertext.length)
-      .send(ciphertext);
-  });
-  router.delete("/rooms/:roomId/files/:fileId", async (req, res) => {
-    const rid = roomId.parse(req.params.roomId),
-      fid = roomId.parse(req.params.fileId);
-    await db.transaction(async (tx) => {
-      const r = await locked(tx, rid),
-        who = await admit(tx, r, req.ownerId, req.session!.id),
-        [f] = await tx.query<{
-          uploader_id: string;
-        }>(
-          "SELECT uploader_id FROM room_files WHERE id=$1 AND room_id=$2 FOR UPDATE",
-          [fid, rid],
-        );
-      if (!f) return;
-      requireCondition(
-        r.owner_id === req.ownerId || f.uploader_id === who.uploader,
-        403,
-        "OWNER_REQUIRED",
-        "You cannot delete this shared file.",
-      );
-      await tx.query("DELETE FROM room_files WHERE id=$1", [fid]);
+    const pageRows = rows.slice(0, 50);
+    const last = pageRows.at(-1);
+    const nextCursor =
+      rows.length > 50 && last
+        ? Buffer.from(
+            JSON.stringify({ createdAt: last.created_at_cursor, id: last.id }),
+          ).toString('base64url')
+        : null;
+    response.json({
+      files: pageRows.map((row) => ({
+        id: row.id,
+        descriptor: Buffer.from(row.encrypted_descriptor).toString('base64'),
+        envelope: {
+          enc: Buffer.from(row.envelope_enc).toString('base64'),
+          ciphertext: Buffer.from(row.envelope_ciphertext).toString('base64'),
+        },
+        envelopeKind: row.envelope_kind,
+        roomShared: row.room_shared,
+        chunkCount: row.chunk_count,
+        encryptedBytes: Number(row.encrypted_bytes),
+        manifestSha256: row.manifest_sha256,
+        receipt: row.receipt,
+        createdAt: row.created_at.toISOString(),
+      })),
+      nextCursor,
     });
-    res.status(204).end();
   });
+
+  router.get(
+    '/rooms/:roomId/files/:fileId/chunks/:index',
+    async (request, response) => {
+      const roomIdValue = roomId.parse(request.params.roomId);
+      const fileIdValue = roomId.parse(request.params.fileId);
+      const index = z.coerce
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_CHUNKS - 1)
+        .parse(request.params.index);
+      const room = await roomPolicy(database, roomIdValue);
+      const role = await requireVisible(database, room, request.session!.id);
+      const [file] = await database.query<{
+        owner_id: string;
+        chunk_count: number;
+      }>(
+        "SELECT owner_id, chunk_count FROM room_files WHERE id = $1 AND room_id = $2 AND status = 'complete'",
+        [fileIdValue, roomIdValue],
+      );
+      if (file && role === 'recipient') {
+        const [envelope] = await database.query<{ recipient_id: string }>(
+          `SELECT recipient_id FROM room_file_envelopes WHERE file_id = $1 AND recipient_id = $2
+           UNION ALL SELECT $2::uuid AS recipient_id FROM room_file_shared_envelopes WHERE file_id = $1 LIMIT 1`,
+          [fileIdValue, request.session!.id],
+        );
+        requireCondition(
+          envelope,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
+        );
+      } else
+        requireCondition(
+          file && file.owner_id === request.session!.id,
+          404,
+          'FILE_NOT_FOUND',
+          'File not found.',
+        );
+      requireCondition(
+        index < file!.chunk_count,
+        404,
+        'CHUNK_NOT_FOUND',
+        'Chunk not found.',
+      );
+      const [chunk] = await database.query<{
+        ciphertext: Buffer;
+        sha256: string;
+      }>(
+        'SELECT ciphertext, sha256 FROM room_file_chunks WHERE file_id = $1 AND chunk_index = $2',
+        [fileIdValue, index],
+      );
+      requireCondition(
+        chunk && fingerprint(chunk.ciphertext) === chunk.sha256,
+        500,
+        'CHUNK_CORRUPT',
+        'Stored encrypted data failed integrity verification.',
+      );
+      response.setHeader('Content-Type', 'application/octet-stream');
+      response.setHeader('Content-Length', chunk.ciphertext.length);
+      response.setHeader('X-Ciphertext-SHA256', chunk.sha256);
+      response.send(Buffer.from(chunk.ciphertext));
+    },
+  );
+
+  router.put('/rooms/:roomId/files/:fileId/recipients/:recipientId', async (request, response) => {
+    const id = roomId.parse(request.params.roomId), fileId = roomId.parse(request.params.fileId), recipientId = roomId.parse(request.params.recipientId);
+    const input = z.object({ fingerprint: z.string().regex(/^[a-f0-9]{64}$/), enc: b64, ciphertext: b64 }).strict().parse(request.body);
+    const enc = Buffer.from(input.enc, 'base64'), ciphertext = Buffer.from(input.ciphertext, 'base64');
+    requireCondition(enc.length === 65 && ciphertext.length === 48, 422, 'INVALID_ENCRYPTION', 'Recipient envelope is invalid.');
+    await database.transaction(async tx => {
+      const [room] = await tx.query<RoomPolicy>('SELECT id, owner_id, status, expires_at FROM rooms WHERE id = $1 FOR UPDATE', [id]);
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireOwner(tx, room, request.session!.id);
+      const [recipient] = await tx.query<{ fingerprint: string }>(`SELECT k.fingerprint FROM session_recipient_keys k JOIN memberships m
+        ON m.room_id = k.room_id AND m.session_id = k.session_id JOIN sessions s ON s.id = m.session_id
+        WHERE k.room_id = $1 AND k.session_id = $2 AND m.status = 'approved' AND s.expires_at > clock_timestamp()
+        AND (m.credential_expires_at IS NULL OR m.credential_expires_at > clock_timestamp())`, [id, recipientId]);
+      requireCondition(recipient?.fingerprint === input.fingerprint, 409, 'RECIPIENT_CHANGED', 'The approved recipient key changed. Refresh before granting access.');
+      const [file] = await tx.query("SELECT id FROM room_files WHERE id = $1 AND room_id = $2 AND status = 'complete'", [fileId, id]);
+      requireCondition(file, 404, 'FILE_NOT_FOUND', 'Published file not found.');
+      await tx.query(`INSERT INTO room_file_envelopes(file_id, recipient_id, enc, ciphertext) VALUES ($1, $2, $3, $4)
+        ON CONFLICT(file_id, recipient_id) DO UPDATE SET enc = EXCLUDED.enc, ciphertext = EXCLUDED.ciphertext`, [fileId, recipientId, enc, ciphertext]);
+      await recordActivity(tx, id, 'file_access_granted');
+    });
+    response.status(204).end();
+  });
+
+  // Upgrade old publications once in the organizer browser. Only envelopes
+  // change; ciphertext, filenames and file secrets never reach the API.
+  router.post('/rooms/:id/files/room-access', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const input = z.object({ fingerprint: z.string().regex(/^[a-f0-9]{64}$/), envelopes: z.array(z.object({ fileId: roomId, enc: b64, ciphertext: b64 }).strict()).max(1000) }).strict().parse(request.body);
+    await database.transaction(async tx => {
+      const [room] = await tx.query<RoomPolicy>('SELECT id, owner_id, status, expires_at FROM rooms WHERE id = $1 FOR UPDATE', [id]);
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireOwner(tx, room, request.session!.id);
+      const [key] = await tx.query<{ fingerprint: string }>('SELECT fingerprint FROM room_access_keys WHERE room_id = $1', [id]);
+      requireCondition(key?.fingerprint === input.fingerprint, 409, 'KEY_CHANGED', 'Reload room access before continuing.');
+      for (const envelope of input.envelopes) {
+        requireCondition(Buffer.from(envelope.enc, 'base64').length === 65 && Buffer.from(envelope.ciphertext, 'base64').length === 48, 422, 'INVALID_ENCRYPTION', 'Room envelope is invalid.');
+        const [file] = await tx.query("SELECT id FROM room_files WHERE id = $1 AND room_id = $2 AND status = 'complete'", [envelope.fileId, id]);
+        requireCondition(file, 404, 'FILE_NOT_FOUND', 'Published file not found.');
+        const inserted = await tx.query('INSERT INTO room_file_shared_envelopes(file_id, fingerprint, enc, ciphertext) VALUES ($1, $2, $3, $4) ON CONFLICT(file_id) DO NOTHING RETURNING file_id', [envelope.fileId, input.fingerprint, Buffer.from(envelope.enc, 'base64'), Buffer.from(envelope.ciphertext, 'base64')]);
+        if (inserted.length) await recordActivity(tx, id, 'file_access_granted');
+      }
+    });
+    response.status(204).end();
+  });
+
+  router.post('/rooms/:id/files/grants', async (request, response) => {
+    const id = roomId.parse(request.params.id);
+    const input = z.object({ recipientId: roomId, fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+      envelopes: z.array(z.object({ fileId: roomId, enc: b64, ciphertext: b64 }).strict()).max(1000),
+    }).strict().parse(request.body);
+    await database.transaction(async tx => {
+      const [room] = await tx.query<RoomPolicy>('SELECT id, owner_id, status, expires_at FROM rooms WHERE id = $1 FOR UPDATE', [id]);
+      requireCondition(room, 404, 'ROOM_NOT_FOUND', 'Room not found.');
+      await requireOwner(tx, room, request.session!.id);
+      const [recipient] = await tx.query<{ fingerprint: string }>(`SELECT k.fingerprint FROM session_recipient_keys k JOIN memberships m
+        ON m.room_id = k.room_id AND m.session_id = k.session_id JOIN sessions s ON s.id = m.session_id
+        WHERE k.room_id = $1 AND k.session_id = $2 AND m.status = 'approved' AND s.expires_at > clock_timestamp()
+        AND (m.credential_expires_at IS NULL OR m.credential_expires_at > clock_timestamp())
+        AND NOT EXISTS (SELECT 1 FROM credential_revocations v WHERE v.room_id = m.room_id AND v.nullifier = m.credential_nullifier)`, [id, input.recipientId]);
+      requireCondition(recipient?.fingerprint === input.fingerprint, 409, 'RECIPIENT_CHANGED', 'Refresh the approved recipient key.');
+      requireCondition(new Set(input.envelopes.map(e => e.fileId)).size === input.envelopes.length, 422, 'INVALID_INPUT', 'Duplicate file grants are not allowed.');
+      for (const envelope of input.envelopes) {
+        const enc = Buffer.from(envelope.enc, 'base64'), ciphertext = Buffer.from(envelope.ciphertext, 'base64');
+        requireCondition(enc.length === 65 && ciphertext.length === 48, 422, 'INVALID_ENCRYPTION', 'Recipient envelope is invalid.');
+        const [file] = await tx.query("SELECT id FROM room_files WHERE id = $1 AND room_id = $2 AND status = 'complete'", [envelope.fileId, id]);
+        requireCondition(file, 404, 'FILE_NOT_FOUND', 'Published file not found.');
+        await tx.query(`INSERT INTO room_file_envelopes(file_id, recipient_id, enc, ciphertext) VALUES ($1, $2, $3, $4)
+          ON CONFLICT(file_id, recipient_id) DO UPDATE SET enc = EXCLUDED.enc, ciphertext = EXCLUDED.ciphertext`, [envelope.fileId, input.recipientId, enc, ciphertext]);
+      }
+      if (input.envelopes.length) await recordActivity(tx, id, 'file_access_granted');
+    });
+    response.status(204).end();
+  });
+
+  router.get('/rooms/:roomId/files/:fileId/upload', async (request, response) => {
+    const id = roomId.parse(request.params.roomId), fileId = roomId.parse(request.params.fileId);
+    const room = await roomPolicy(database, id);
+    await requireOwner(database, room, request.session!.id);
+    const [file] = await database.query<{ status: string; encrypted_descriptor: Buffer | null; receipt: unknown }>('SELECT status, encrypted_descriptor, receipt FROM room_files WHERE id = $1 AND room_id = $2', [fileId, id]);
+    requireCondition(file, 404, 'FILE_NOT_FOUND', 'Upload not found.');
+    const chunks = await database.query<{ index: number; sha256: string }>('SELECT chunk_index AS index, sha256 FROM room_file_chunks WHERE file_id = $1 ORDER BY chunk_index', [fileId]);
+    response.json({ status: file.status, descriptor: file.encrypted_descriptor ? Buffer.from(file.encrypted_descriptor).toString('base64') : null, receipt: file.receipt, chunks });
+  });
+
   return router;
 }

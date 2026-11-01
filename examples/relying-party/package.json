@@ -1,8 +1,0 @@
-{
-  "name": "portkey-relying-party-example",
-  "private": true,
-  "type": "module",
-  "engines": { "node": ">=22.12.0" },
-  "scripts": { "start": "node --env-file-if-exists=.env src/server.js" },
-  "dependencies": { "connect-pg-simple": "^10.0.0", "express": "^5.1.0", "express-session": "^1.18.2", "pg": "^8.16.3", "portkey": "file:../../portkey-0.1.0.tgz" }
-}

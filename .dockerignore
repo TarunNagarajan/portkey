@@ -1,0 +1,17 @@
+node_modules
+.git
+.data
+.env
+.env.*
+!.env.example
+.taste-skill
+test-results
+playwright-report
+circuits/build
+.backups
+credential-*.json
+credentials/
+
+.codex
+.agents
+.aws

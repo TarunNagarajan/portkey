@@ -1,206 +1,99 @@
-import { useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
-import {
-  configuredPageUrl,
-  loadPublicConfig,
-  setPublicOrigin,
-  startSession,
-} from "./api.js";
-import { Home } from "./Home.js";
-import { JoinPage } from "./JoinPage.js";
-import { RoomPage } from "./RoomPage.js";
-import { Icon } from "./ui.js";
-import { CredentialGroups, CredentialGroupDetail } from "./CredentialGroups.js";
-import { CredentialWallet } from "./CredentialWallet.js";
-import { CredentialEnrollment } from "./CredentialEnrollment.js";
-import "./styles.css";
-import { PlatformPage } from "./PlatformPage.js";
-import { WalletProofPage } from "./WalletProofPage.js";
-import { PublicContractPage } from "./PublicContractPage.js";
-import { AccountPage } from "./AccountPage.js";
+import { useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { startSession } from './api.js';
+import { RecoverRoom } from './Recovery.js';
+import { Home } from './Home.js';
+import { JoinPage } from './JoinPage.js';
+import { RoomPage } from './RoomPage.js';
+import { BrandMark } from './ui.js';
+import './styles.css';
 
 function App() {
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState("");
-  const [originMismatch, setOriginMismatch] = useState("");
-  const path = window.location.pathname;
-  const publicContract = path.match(
-    /^\/contracts\/([a-f0-9-]+)\/versions\/(\d+)$/i,
-  );
+  const [online, setOnline] = useState(navigator.onLine);
   useEffect(() => {
-    void loadPublicConfig()
-      .then(({ publicOrigin }) => {
-        setPublicOrigin(publicOrigin);
-        if (window.location.origin !== publicOrigin) {
-          setOriginMismatch(
-            configuredPageUrl(
-              publicOrigin,
-              window.location.pathname,
-              window.location.search,
-              window.location.hash,
-            ),
-          );
-          return;
-        }
-        if (publicContract) {
-          setReady(true);
-          return;
-        }
-        return startSession().then(() => setReady(true));
-      })
+    const changed = () => setOnline(navigator.onLine);
+    window.addEventListener('online', changed); window.addEventListener('offline', changed);
+    return () => { window.removeEventListener('online', changed); window.removeEventListener('offline', changed); };
+  }, []);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    void startSession()
+      .then(() => setReady(true))
       .catch((error) => setError(error.message));
   }, []);
+  const path = window.location.pathname;
   const room = path.match(/^\/rooms\/([a-f0-9-]+)$/i);
   const join = path.match(/^\/join\/([A-Za-z0-9_-]+)$/);
-  const credentialGroup = path.match(/^\/credential-groups\/([a-f0-9-]+)$/i);
-  const credentialEnrollment = path.match(/^\/credentials\/([a-f0-9-]+)$/i);
-  const groupList = path === "/credential-groups";
-  const wallet = path === "/my-credentials";
-  const platform = path === "/platform";
-  const account = path === "/account";
-  const proofRequest = path.match(/^\/prove\/([0-9a-f-]+)$/i);
   return (
-    <div className="app-layout">
+    <div className="frame">
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <aside className="sidebar">
-        <a className="brand" href="/">
-          <span className="brand-mark">P</span>Portkey
-        </a>
-        <p className="nav-label">WORKSPACE</p>
-        <nav aria-label="Workspace navigation">
-          <a
-            className={path === "/" ? "nav-item selected" : "nav-item"}
-            href="/"
-          >
-            <Icon name="rooms" />
-            Your rooms
+      <header className="bar">
+        <div className="shell">
+          <a className="brand" href="/">
+            <BrandMark size={22} />
+            Portkey
           </a>
-          <a className="nav-item nav-create-room" href="/#new-room">
-            <Icon name="plus" />
-            Create a room
-          </a>
-          <a
-            className={
-              groupList || credentialGroup ? "nav-item selected" : "nav-item"
-            }
-            href="/credential-groups"
-          >
-            Credential groups
-          </a>
-          <a
-            className={wallet ? "nav-item selected" : "nav-item"}
-            href="/my-credentials"
-          >
-            My credentials
-          </a>
-          <a
-            className={platform ? "nav-item selected" : "nav-item"}
-            href="/platform"
-          >
-            Applications
-          </a>
-          <a
-            className={account ? "nav-item selected" : "nav-item"}
-            href="/account"
-          >
-            Account
-          </a>
-        </nav>
-        <div className="sidebar-note">
-          <Icon name="shield" />
-          <strong>Protect organizer access.</strong>
-          <p>
-            Create a passkey account to manage the same workspace across
-            browsers.
+          <nav className="bar-links" aria-label="Workspace">
+            <a aria-current={join ? undefined : 'page'} href="/">
+              Your rooms
+            </a>
+            <a href="/#new-room">Create a room</a>
+            <a href="/recover">Recover room</a>
+          </nav>
+          {ready && (
+            <p className="bar-note">
+              <span className="square pulse" aria-hidden="true" />
+              Session held in this browser
+            </p>
+          )}
+        </div>
+      </header>
+      <main id="main" className="board shell">
+        {!online && <p className="notice span-12" role="status">You are offline. Saved uploads remain in this browser. Reconnect to resume.</p>}
+        {error ? (
+          <p role="alert" className="error">
+            {error} <button onClick={() => window.location.reload()}>Retry</button>
+          </p>
+        ) : !ready ? (
+          <p role="status">Starting your session…</p>
+        ) : room ? (
+          <RoomPage id={room[1]} />
+        ) : join ? (
+          <JoinPage code={join[1]} />
+        ) : path === '/recover' ? (<RecoverRoom />
+        ) : path === '/' ? (
+          <Home />
+        ) : (
+          <h1>Page not found.</h1>
+        )}
+      </main>
+      <footer className="foot">
+        <div className="shell">
+          <div className="foot-line">
+            <p className="foot-mark">
+              <BrandMark size={18} />
+              Portkey — rooms that open by invitation
+            </p>
+            <nav className="foot-links" aria-label="Footer">
+              <a href="/">Your rooms</a>
+              <a href="/#new-room">Create a room</a>
+            </nav>
+            <p className="foot-year">2026</p>
+          </div>
+          <p className="foot-credits" data-ui>
+            Pictures: “Set old keys hanging wall” by Markus Spiske (CC0, rawpixel) · “Entrance to
+            the East Block of the Parliament of Canada in Ottawa” by Hayden Soloviev (CC BY 4.0,
+            Wikimedia Commons) · “Igreja do Curral das Freiras: Azulejo, Tiles” by Celsoazevedo
+            (CC BY 4.0, Wikimedia Commons) · “Einsteckschloss-Animation” by Andreas Gortan
+            (CC BY-SA 4.0, Wikimedia Commons).
           </p>
         </div>
-      </aside>
-      <div className="workspace">
-        <div className="topbar">
-          <span>
-            Workspace <span className="breadcrumb-divider">/</span>{" "}
-            {publicContract
-              ? "Public contract"
-              : proofRequest
-                ? "Application request"
-                : platform
-                  ? "Applications"
-                  : account
-                    ? "Account"
-                    : credentialEnrollment
-                      ? "Credential enrollment"
-                      : credentialGroup || groupList
-                        ? "Credential groups"
-                        : wallet
-                          ? "My credentials"
-                          : join
-                            ? "Join room"
-                            : room
-                              ? "Room overview"
-                              : "Rooms"}
-          </span>
-          {ready && (
-            <span className="session-indicator">
-              <span className="status-dot" />
-              Session active
-            </span>
-          )}
-        </div>
-        <main id="main">
-          {originMismatch ? (
-            <section role="alert" className="error">
-              <h1>Open Portkey at its configured address</h1>
-              <p>
-                This page’s address does not match the site address. Continue at
-                the configured address before creating or sharing rooms.
-              </p>
-              <a href={originMismatch}>Open the configured Portkey address</a>
-            </section>
-          ) : error ? (
-            <p role="alert" className="error">
-              {error}{" "}
-              <button onClick={() => window.location.reload()}>Retry</button>
-            </p>
-          ) : !ready ? (
-            <p role="status">Starting your session…</p>
-          ) : publicContract ? (
-            <PublicContractPage
-              contractId={publicContract[1]}
-              version={publicContract[2]}
-            />
-          ) : proofRequest ? (
-            <WalletProofPage requestId={proofRequest[1]} />
-          ) : platform ? (
-            <PlatformPage />
-          ) : account ? (
-            <AccountPage />
-          ) : room ? (
-            <RoomPage id={room[1]} />
-          ) : join ? (
-            <JoinPage code={join[1]} />
-          ) : credentialEnrollment ? (
-            <CredentialEnrollment id={credentialEnrollment[1]} />
-          ) : credentialGroup ? (
-            <CredentialGroupDetail id={credentialGroup[1]} />
-          ) : groupList ? (
-            <CredentialGroups />
-          ) : wallet ? (
-            <CredentialWallet />
-          ) : path === "/" ? (
-            <Home />
-          ) : (
-            <h1>Page not found.</h1>
-          )}
-        </main>
-        <footer>
-          <span>Portkey</span>
-          <span>Access managed by the organizer.</span>
-        </footer>
-      </div>
+      </footer>
     </div>
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById('root')!).render(<App />);

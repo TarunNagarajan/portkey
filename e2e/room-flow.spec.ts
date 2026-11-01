@@ -1,7 +1,11 @@
-import { test, expect } from '@playwright/test';
-import { createHash } from 'node:crypto';
+import { test, expect, type Page } from '@playwright/test';
 
-test('encrypted submissions require a pinned organizer key and round-trip privately', async ({
+async function security(page: Page) {
+  const details = page.locator('details.security-settings');
+  if (await details.getAttribute('open') === null) await details.locator('summary').click();
+}
+
+test('the organizer shares an encrypted file and the student decrypts it; students cannot upload', async ({
   page,
   browser,
 }) => {
@@ -17,16 +21,14 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
   const ownerRoomUrl = page.url();
   const ownerRoomPath = new URL(ownerRoomUrl).pathname;
-  await page.getByRole('button', { name: 'Enable encrypted inbox' }).click();
   await expect(
-    page.getByText('Encrypted inbox enabled.', { exact: false }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole('button', { name: 'Download encrypted key backup' }),
+    page.getByRole('heading', { name: 'Room file sharing' }),
   ).toBeVisible();
   await page.getByRole('button', { name: 'Open room', exact: true }).click();
+  await expect(page.getByLabel('Choose a file (up to 250 MiB)')).toBeVisible();
+  await expect(page.getByLabel('Backup passphrase')).not.toBeVisible();
   const invite = await page.locator('.join-link').getAttribute('href');
-  expect(invite).toMatch(/#key=[a-f0-9]{64}$/);
+  expect(invite).toMatch(/#key=[a-f0-9]{64}&access=[A-Za-z0-9_-]+$/);
 
   const participantContext = await browser.newContext({
     viewport: { width: 390, height: 844 },
@@ -39,8 +41,8 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
     if (data) transferred.push(data);
   });
   await participant.goto(invite!);
-  await expect(participant).toHaveURL(/#key=[a-f0-9]{64}$/);
-  await participant.getByLabel('Your label').fill('Private submitter');
+  await expect(participant).toHaveURL(/#key=[a-f0-9]{64}&access=[A-Za-z0-9_-]+$/);
+  await participant.getByLabel('Your label').fill('Team Cedar');
   await participant.getByRole('button', { name: 'Request access' }).click();
   await expect(
     participant.getByText(
@@ -49,80 +51,52 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   ).toBeVisible();
   const memberRow = page
     .getByRole('row')
-    .filter({ hasText: 'Private submitter' });
+    .filter({ hasText: 'Team Cedar' });
   await expect(memberRow).toBeVisible();
   await memberRow.getByRole('button', { name: 'Approve', exact: true }).click();
   await participant.getByRole('link', { name: 'Enter room' }).click();
   await expect(
-    participant.getByRole('heading', { name: 'Encrypted submission inbox' }),
+    participant.getByRole('heading', { name: 'Files from your organizer' }),
   ).toBeVisible();
+  // Students have no upload control anywhere on the room page.
   await expect(
-    participant.getByRole('button', { name: 'Submit file privately' }),
-  ).toBeVisible();
+    participant.getByLabel('Choose a file (up to 250 MiB)'),
+  ).toHaveCount(0);
+  await expect(
+    participant.getByRole('button', { name: /Encrypt and share|Submit file privately/i }),
+  ).toHaveCount(0);
 
   const fixture = {
-    name: 'draft notes.txt',
+    name: 'lecture notes.txt',
     mimeType: 'text/plain',
-    buffer: Buffer.from('private contents with no server-side filename\n'.repeat(50_000)),
+    buffer: Buffer.from('shared contents no browser other than the student can read'),
   };
-  await participant
-    .getByLabel('Choose a file (up to 250 MiB)')
-    .setInputFiles(fixture);
-  const chunkEndpoint = '**/api' + ownerRoomPath + '/submissions/*/chunks/0';
-  let originalCiphertext: Buffer | null = null;
-  let signalInterrupted: () => void = () => {};
-  const interrupted = new Promise<void>((resolve) => {
-    signalInterrupted = resolve;
-  });
-  await participant.route(chunkEndpoint, async (route) => {
-    originalCiphertext = route.request().postDataBuffer();
-    await route.fulfill({
-      status: 429,
-      headers: { 'Retry-After': '60' },
-      json: {
-        error: { code: 'RATE_LIMITED', message: 'Wait before retrying.' },
-      },
-    });
-    signalInterrupted();
-  });
-  await participant
-    .getByRole('button', { name: 'Submit file privately' })
-    .click();
-  await interrupted;
-  await participant.getByRole('button', { name: 'Pause transfer' }).click();
-  await expect(participant.getByRole('alert')).toContainText(
-    'Transfer paused.',
-  );
-  await participant.unroute(chunkEndpoint);
-  let lostCompletion = false;
-  await participant.route(
-    '**/api' + ownerRoomPath + '/submissions/*/complete',
-    async (route) => {
-      if (!lostCompletion) {
-        lostCompletion = true;
-        const response = await route.fetch();
-        expect(response.status()).toBe(200);
-        await route.abort('failed');
-      } else await route.continue();
-    },
-  );
-  const retryRequest = participant.waitForRequest((request) =>
-    /\/submissions\/[^/]+\/chunks\/0$/.test(request.url()),
-  );
-  await participant
-    .getByRole('button', { name: 'Resume with selected file' })
-    .click();
-  expect(
-    (await retryRequest).postDataBuffer()?.equals(originalCiphertext!),
-  ).toBe(true);
-  await expect(participant.getByText(/Submission accepted at/)).toBeVisible({
-    timeout: 30_000,
-  });
-  expect(lostCompletion).toBe(true);
-  await expect(
-    page.getByRole('button', { name: 'Decrypt and download' }),
-  ).toHaveCount(1, { timeout: 20_000 });
+  // An interrupted publication must release its pending upload slot.
+  const metadataEndpoint = '**/api/rooms/*/files/*/metadata';
+  await page.route(metadataEndpoint, (route) => route.fulfill({
+    status: 503, contentType: 'application/json',
+    body: JSON.stringify({ error: { code: 'UNAVAILABLE', message: 'Upload interrupted.' } }),
+  }));
+  await page.getByLabel('Choose a file (up to 250 MiB)').setInputFiles(fixture);
+  const discarded = page.waitForResponse((response) =>
+    response.request().method() === 'DELETE' && /\/files\/[a-f0-9-]+$/.test(new URL(response.url()).pathname));
+  await page.getByRole('button', { name: 'Encrypt and share with room' }).click();
+  expect((await discarded).status()).toBe(204);
+  await expect(page.getByRole('alert')).toHaveText('Upload interrupted.');
+  await page.unroute(metadataEndpoint);
 
+  await page.reload();
+  await page.getByRole('button', { name: 'Resume upload', exact: true }).click();
+  await expect(page.getByText(/Published “lecture notes\.txt”/)).toBeVisible();
+  await expect(
+    page.getByText(/All approved members can download it/,
+    { exact: false }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Download', exact: true }),
+  ).toBeVisible();
+
+  await security(page);
   await page
     .getByLabel('Backup passphrase')
     .last()
@@ -151,106 +125,122 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   );
   await page.reload();
   await expect(
-    page.getByText(/registered private key is not stored/i),
+    page.getByText(/Restore your organizer backup under Security and recovery/),
   ).toBeVisible();
   await page
     .getByLabel('Backup passphrase')
+    .first()
     .fill('a long browser-only backup passphrase');
-  await page.getByLabel('Encrypted key backup').setInputFiles({
+  await page.getByLabel('Restore key backup (.json)').setInputFiles({
     name: 'recovery.json',
     mimeType: 'application/json',
     buffer: Buffer.from(backupText),
   });
   await expect(
-    page.getByText('The backup key matches the registered room key.'),
+    page.getByText('The organizer key was restored from its backup.'),
   ).toBeVisible();
   await expect(
-    page.getByRole('button', { name: 'Decrypt and download' }),
+    page.getByRole('button', { name: 'Download', exact: true }),
   ).toBeVisible();
   await page.screenshot({
-    path: '../outputs/Portkey_EncryptedInbox_Desktop.png',
+    path: '../outputs/Portkey_SharedFiles_Desktop.png',
     fullPage: true,
   });
   await participant.screenshot({
-    path: '../outputs/Portkey_EncryptedInbox_Mobile.png',
+    path: '../outputs/Portkey_SharedFiles_Mobile.png',
     fullPage: true,
   });
-  await page.evaluate(() => {
+
+  // Recover the participant's own key, which differs from the organizer key.
+  await security(participant);
+  await participant.getByLabel('Backup passphrase').fill('a long participant recovery passphrase');
+  const participantBackupEvent = participant.waitForEvent('download');
+  await participant.getByRole('button', { name: 'Download encrypted key backup' }).click();
+  const participantBackup = await participantBackupEvent;
+  const participantBackupPath = await participantBackup.path();
+  const participantBackupText = await (await import('node:fs/promises')).readFile(participantBackupPath!, 'utf8');
+  await participant.evaluate(() => new Promise<void>((resolve, reject) => {
+    const removal = indexedDB.deleteDatabase('portkey-private-keys');
+    removal.onsuccess = () => resolve();
+    removal.onerror = () => reject(removal.error);
+    removal.onblocked = () => reject(new Error('Key database connection leaked.'));
+  }));
+  await participant.goto(ownerRoomUrl);
+  await expect(participant.getByRole('alert')).toContainText('current invitation');
+  await security(participant);
+  await participant.getByLabel('Backup passphrase').fill('a long participant recovery passphrase');
+  await participant.getByLabel('Restore key backup (.json)').setInputFiles({
+    name: 'participant-recovery.json', mimeType: 'application/json', buffer: Buffer.from(participantBackupText),
+  });
+  await expect(participant.getByText('Your room access was restored.')).toBeVisible();
+  await security(participant);
+  await expect(participant.getByLabel('Backup passphrase')).toHaveValue('');
+
+  await expect(participant.getByRole('button', { name: 'Rotate encryption key', exact: true })).toHaveCount(0);
+
+  // The student downloads through a mocked save-file picker and retries once
+  // against a tampered ciphertext to confirm integrity enforcement.
+  await participant.evaluate(() => {
     const target = window as Window & {
-      __savedFile?: { chunks: Uint8Array[]; closed: boolean };
+      __savedFile?: number[];
       showSaveFilePicker?: (options: unknown) => Promise<unknown>;
     };
-    Object.defineProperty(target, '__savedFile', {
-      configurable: true,
-      writable: true,
-      value: { chunks: [], closed: false },
-    });
     Object.defineProperty(target, 'showSaveFilePicker', {
       configurable: true,
       value: async () => ({
         createWritable: async () =>
           new WritableStream({
             write: (chunk: Uint8Array) => {
-              target.__savedFile?.chunks.push(chunk.slice());
+              target.__savedFile = [...(target.__savedFile ?? []), ...chunk];
             },
-            close: () => { if (target.__savedFile) target.__savedFile.closed = true; },
           }),
       }),
     });
   });
-
-  await page.route(
-    '**/api' + ownerRoomPath + '/submissions/*/chunks/*',
-    async (route) => {
-      const response = await route.fetch();
-      const body = Buffer.from(await response.body());
-      body[0] ^= 0xff;
-      await route.fulfill({ response, body });
-    },
-  );
-  await page.getByRole('button', { name: 'Decrypt and download' }).click();
-  await expect(page.getByRole('alert')).toContainText(
+  await participant
+    .getByRole('button', { name: 'Refresh files' })
+    .click();
+  await expect(
+    participant.getByRole('button', { name: 'Download', exact: true }),
+  ).toBeVisible();
+  const participantChunks = '**/rooms/*/files/*/chunks/*';
+  await participant.route(participantChunks, async (route) => {
+    const response = await route.fetch();
+    const body = Buffer.from(await response.body());
+    body[0] ^= 0xff;
+    await route.fulfill({ response, body });
+  });
+  await participant.getByRole('button', { name: 'Download', exact: true }).click();
+  await expect(participant.getByRole('alert')).toContainText(
     /integrity|manifest|authenticate/i,
   );
   expect(
-    await page.evaluate(
-      () => (window as Window & { __savedFile?: { chunks: Uint8Array[]; closed: boolean } }).__savedFile,
+    await participant.evaluate(
+      () => (window as Window & { __savedFile?: number[] }).__savedFile,
     ),
-  ).toEqual({ chunks: [], closed: false });
-  await page.unroute('**/api' + ownerRoomPath + '/submissions/*/chunks/*');
-  await page.getByRole('button', { name: 'Decrypt and download' }).click();
+  ).toBeUndefined();
+  await participant.unroute(participantChunks);
+  await participant
+    .getByRole('button', { name: 'Download', exact: true })
+    .click();
   await expect
     .poll(() =>
-      page.evaluate(async () => {
-        const saved = (window as Window & { __savedFile?: { chunks: Uint8Array[]; closed: boolean } }).__savedFile;
-        if (!saved?.closed) return null;
-        const bytes = new Uint8Array(saved.chunks.reduce((total, chunk) => total + chunk.length, 0));
-        let offset = 0;
-        for (const chunk of saved.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        const digest = await crypto.subtle.digest('SHA-256', bytes);
-        return { size: bytes.length, digest: Array.from(new Uint8Array(digest)) };
-      }),
+      participant.evaluate(
+        () => (window as Window & { __savedFile?: number[] }).__savedFile,
+      ),
     )
-    .toEqual({ size: fixture.buffer.length, digest: [...createHash('sha256').update(fixture.buffer).digest()] });
-  await page.evaluate(() =>
+    .toEqual(Array.from(fixture.buffer));
+  await participant.evaluate(() =>
     Object.defineProperty(window, 'showSaveFilePicker', {
       configurable: true,
       value: undefined,
     }),
   );
-  const actualDownload = page.waitForEvent('download');
-  await page.getByRole('button', { name: 'Decrypt and download' }).click();
-  const downloaded = await actualDownload;
-  expect(downloaded.suggestedFilename()).toBe(fixture.name);
-  expect(
-    await (
-      await import('node:fs/promises')
-    ).readFile((await downloaded.path())!, 'utf8'),
-  ).toBe(fixture.buffer.toString());
-  await page
+  await participant
     .getByRole('button', { name: 'Remove local download copies' })
     .click();
-  await expect(page.getByText('1 local download copy removed.')).toBeVisible();
+
+  // Nothing readable ever crossed the network: no plaintext and no filename.
   for (const body of transferred) {
     expect(body.includes(fixture.buffer)).toBe(false);
     expect(body.includes(Buffer.from(fixture.name))).toBe(false);
@@ -258,8 +248,11 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
       body.includes(Buffer.from('a long browser-only backup passphrase')),
     ).toBe(false);
   }
+
+  // A mismatched simulated room key blocks file sharing and hides the invite
+  // fingerprint until the real registration returns.
   const fake = await page.evaluate(async () => {
-    const moduleUrl = '/client/submissionCrypto.ts';
+    const moduleUrl = '/client/roomCrypto.ts';
     const cryptoModule = await import(moduleUrl);
     const pair = await cryptoModule.createKey();
     return {
@@ -267,51 +260,36 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
       ownerFingerprint: pair.fingerprint,
     };
   });
-  await page.route('**/api' + ownerRoomPath + '/submissions/keys', (route) =>
+  await page.route('**/api' + ownerRoomPath + '/files/keys', (route) =>
     route.fulfill({ json: fake }),
   );
   await page.reload();
-  await expect(page.getByRole('alert')).toContainText(
-    'saved key does not match',
-  );
-  await expect(page.locator('.join-link')).not.toHaveAttribute('href', /#key=/);
-  await page.unroute('**/api' + ownerRoomPath + '/submissions/keys');
+  await expect(page.getByRole('alert')).toContainText('Restore your organizer backup');
+  await expect(page.locator('.join-link')).toHaveCount(0);
+  await page.unroute('**/api' + ownerRoomPath + '/files/keys');
   await page.reload();
   await expect(page.locator('.join-link')).toHaveAttribute(
     'href',
-    /#key=[a-f0-9]{64}$/,
+    /#key=[a-f0-9]{64}&access=[A-Za-z0-9_-]+$/,
   );
-  await participant.goto(ownerRoomUrl + '#key=' + '0'.repeat(64));
-  await expect(participant.getByRole('alert')).toContainText(
-    'invitation key does not match',
-  );
-  await expect(
-    participant.getByRole('button', { name: 'Submit file privately' }),
-  ).toHaveCount(0);
+
+  // Room access is verified silently; an unrelated invitation key is rejected.
+  const wrongAccess = await participant.evaluate(async () => {
+    const url = '/client/roomCrypto.ts'; const c = await import(url);
+    return c.encodeRoomAccess(await c.createKey());
+  });
+  await participant.goto(ownerRoomUrl + '#access=' + wrongAccess);
+  await expect(participant.getByRole('alert')).toContainText('current invitation');
+  await expect(participant.getByRole('button', { name: 'Download', exact: true })).toHaveCount(0);
+  // A previously accepted invitation is retained in this browser without a
+  // fingerprint confirmation or key-rotation step on later visits.
   await participant.goto(ownerRoomUrl);
-  await expect(
-    participant.getByRole('button', { name: 'Submit file privately' }),
-  ).toBeVisible();
-  await participant.evaluate(
-    (roomId) => localStorage.removeItem(`portkey-organizer-key:${roomId}`),
-    ownerRoomPath.split('/').at(-1)!,
-  );
-  await participant.reload();
-  await expect(
-    participant.getByRole('button', { name: 'Submit file privately' }),
-  ).toHaveCount(0);
-  await participant
-    .getByRole('button', {
-      name: 'I verified this fingerprint with the organizer',
-    })
-    .click();
-  await expect(
-    participant.getByRole('button', { name: 'Submit file privately' }),
-  ).toBeVisible();
+  await expect(participant.getByRole('button', { name: 'Download', exact: true })).toBeVisible();
+  await expect(participant.getByText('Organizer verification fingerprint:', { exact: false })).not.toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(
     await page
-      .locator('.private-inbox')
+      .locator('.room-files')
       .evaluate((element) => element.scrollWidth <= element.clientWidth),
   ).toBe(true);
   await page.setViewportSize({ width: 1280, height: 900 });
@@ -323,27 +301,34 @@ test('encrypted submissions require a pinned organizer key and round-trip privat
   await participantContext.close();
 });
 
-test('browser crypto rejects altered contexts and lost retry chunks, and protects backup keys', async ({
+test('browser crypto binds rooms, recipients and chunks, and protects backup keys', async ({
   page,
 }) => {
   await page.goto('/');
   const result = await page.evaluate(async () => {
-    const moduleUrl = '/client/submissionCrypto.ts';
+    const moduleUrl = '/client/roomCrypto.ts';
     const c = await import(moduleUrl);
     const room = crypto.randomUUID();
     const id = crypto.randomUUID();
-    const owner = await c.createKey();
-    const submitter = await c.createKey();
+    const organizer = await c.createKey();
+    const student = await c.createKey();
     const file = new File([new Uint8Array(1048577).fill(43)], 'two chunks.bin');
-    const plan = await c.prepareSubmission(
+    const plan = await c.prepareDistribution(
       file,
       room,
       id,
-      owner.publicKey,
-      owner.fingerprint,
-      submitter,
+      [
+        { id: organizer.fingerprint, publicKey: organizer.publicKey },
+        { id: student.fingerprint, publicKey: student.publicKey },
+      ],
     );
-    const chunk = await c.encryptUploadChunk(file, plan, 0);
+    const firstChunk = await c.encryptDistributionChunk(plan, 0);
+    const secondChunk = await c.encryptDistributionChunk(plan, 1);
+    const digestOf = async (value: Uint8Array) => await c.digest(value);
+    const manifest = await c.distributionManifest(plan, [
+      await digestOf(firstChunk.ciphertext),
+      await digestOf(secondChunk.ciphertext),
+    ]);
     const failures: string[] = [];
     async function mustReject(label: string, work: () => Promise<unknown>) {
       try {
@@ -351,25 +336,71 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
         failures.push(label);
       } catch {}
     }
-    const context = (roomId: string, purpose = 'submission-file-key') =>
-      c.encode(
+    const context = (
+      roomId: string,
+      purpose = 'submission-file-key',
+      fingerprint = organizer.fingerprint,
+    ) =>
+      new TextEncoder().encode(
         JSON.stringify({
           protocol: 'portkey-private-submission-v1',
           roomId,
           objectId: id,
-          recipientFingerprint: owner.fingerprint,
+          recipientFingerprint: fingerprint,
           purpose,
         }),
       );
-    const key = await c.hpkeOpen(owner, plan.ownerEnvelope, context(room));
-    const descriptor = await c.decryptDescriptor(
-      plan.descriptor,
-      key,
-      room,
-      id,
+    const studentEnvelope = plan.envelopes.find(
+      (envelope: { recipientId: string }) =>
+        envelope.recipientId === student.fingerprint,
+    )!;
+    const key = await c.hpkeOpen(
+      { ...student, publicKey: student.publicKey },
+      { enc: studentEnvelope.enc, ciphertext: studentEnvelope.ciphertext },
+      context(room, 'submission-file-key', student.fingerprint),
     );
+    const organizerEnvelope = plan.envelopes.find(
+      (envelope: { recipientId: string }) =>
+        envelope.recipientId === organizer.fingerprint,
+    )!;
+    const organizerKey = await c.hpkeOpen(
+      organizer,
+      { enc: organizerEnvelope.enc, ciphertext: organizerEnvelope.ciphertext },
+      context(room, 'submission-file-key'),
+    );
+    await mustReject('room substitution', () =>
+      c.hpkeOpen(
+        organizer,
+        {
+          enc: organizerEnvelope.enc,
+          ciphertext: organizerEnvelope.ciphertext,
+        },
+        context(crypto.randomUUID()),
+      ),
+    );
+    await mustReject('purpose substitution', () =>
+      c.hpkeOpen(
+        organizer,
+        {
+          enc: organizerEnvelope.enc,
+          ciphertext: organizerEnvelope.ciphertext,
+        },
+        context(room, 'another-purpose'),
+      ),
+    );
+    await mustReject('recipient substitution', () =>
+      c.hpkeOpen(
+        student,
+        {
+          enc: organizerEnvelope.enc,
+          ciphertext: organizerEnvelope.ciphertext,
+        },
+        context(room),
+      ),
+    );
+    const descriptor = await c.decryptDescriptor(plan.descriptor, key, room, id);
     const plain = await c.decryptChunk(
-      chunk,
+      firstChunk.ciphertext,
       key,
       descriptor.keySalt,
       descriptor.noncePrefix,
@@ -378,18 +409,9 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
       0,
       descriptor.chunkSizes[0],
     );
-    await mustReject('room substitution', () =>
-      c.hpkeOpen(owner, plan.ownerEnvelope, context(crypto.randomUUID())),
-    );
-    await mustReject('purpose substitution', () =>
-      c.hpkeOpen(owner, plan.ownerEnvelope, context(room, 'another-purpose')),
-    );
-    await mustReject('recipient substitution', () =>
-      c.hpkeOpen(submitter, plan.ownerEnvelope, context(room)),
-    );
     await mustReject('chunk reordering', () =>
       c.decryptChunk(
-        chunk,
+        firstChunk.ciphertext,
         key,
         descriptor.keySalt,
         descriptor.noncePrefix,
@@ -401,7 +423,7 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
     );
     await mustReject('chunk truncation', () =>
       c.decryptChunk(
-        chunk.slice(0, -1),
+        firstChunk.ciphertext.slice(0, -1),
         key,
         descriptor.keySalt,
         descriptor.noncePrefix,
@@ -411,7 +433,7 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
         descriptor.chunkSizes[0],
       ),
     );
-    const altered = Uint8Array.from(chunk);
+    const altered = Uint8Array.from(firstChunk.ciphertext);
     altered[0] ^= 1;
     await mustReject('chunk modification', () =>
       c.decryptChunk(
@@ -430,62 +452,26 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
     await mustReject('metadata modification', () =>
       c.decryptDescriptor(c.encodeBase64(metadataBytes), key, room, id),
     );
-    const envelopeBytes = c.decodeBase64(plan.ownerEnvelope.ciphertext);
+    const envelopeBytes = c.decodeBase64(studentEnvelope.ciphertext);
     envelopeBytes[0] ^= 1;
     await mustReject('envelope modification', () =>
       c.hpkeOpen(
-        owner,
-        { ...plan.ownerEnvelope, ciphertext: c.encodeBase64(envelopeBytes) },
+        student,
+        {
+          enc: studentEnvelope.enc,
+          ciphertext: c.encodeBase64(envelopeBytes),
+        },
         context(room),
       ),
     );
-    const changedTail = new Uint8Array(1048577).fill(43);
-    changedTail[changedTail.length - 1] = 44;
-    await mustReject('changed unencrypted tail', () =>
-      c.encryptUploadChunk(
-        new File([changedTail], 'changed tail.bin'),
-        plan,
-        1,
-      ),
-    );
-    const second = await c.encryptUploadChunk(file, plan, 1);
-    const retry = await c.encryptUploadChunk(file, plan, 0);
-    const retryIdentical = (await c.digest(chunk)) === (await c.digest(retry));
-    await new Promise<void>((resolve, reject) => {
-      const opening = indexedDB.open('portkey-private-keys', 2);
-      opening.onsuccess = () => {
-        const db = opening.result;
-        const tx = db.transaction('uploads', 'readwrite');
-        tx.objectStore('uploads').delete(`chunk:${id}:0`);
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onabort = () => {
-          db.close();
-          reject(tx.error);
-        };
-      };
-      opening.onerror = () => reject(opening.error);
-    });
-    await mustReject('lost ciphertext reused nonce', () =>
-      c.encryptUploadChunk(file, plan, 0),
-    );
-    await mustReject('changed file reused nonce', () =>
-      c.encryptUploadChunk(
-        new File([new Uint8Array(1048577).fill(44)], 'changed.bin'),
-        plan,
-        0,
-      ),
-    );
     const password = 'a long unique testing backup passphrase';
-    const backup = await c.exportEncryptedBackup(room, owner, password);
+    const backup = await c.exportEncryptedBackup(room, organizer, password);
     await mustReject('wrong backup password', () =>
       c.restoreEncryptedBackup(
         room,
         backup,
         'a different long testing password',
-        owner.fingerprint,
+        organizer.fingerprint,
       ),
     );
     await mustReject('wrong room backup', () =>
@@ -493,48 +479,40 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
         crypto.randomUUID(),
         backup,
         password,
-        owner.fingerprint,
+        organizer.fingerprint,
       ),
     );
     await mustReject('wrong registered key', () =>
-      c.restoreEncryptedBackup(room, backup, password, submitter.fingerprint),
+      c.restoreEncryptedBackup(room, backup, password, student.fingerprint),
     );
     const restored = await c.restoreEncryptedBackup(
       room,
       backup,
       password,
-      owner.fingerprint,
+      organizer.fingerprint,
     );
     await mustReject('local key overwrite', () =>
-      c.retainPendingKey(room, submitter),
+      c.retainConfirmedKey(room, student),
     );
     const saved = await c.loadKey(room);
     const emptyId = crypto.randomUUID();
-    const emptyPlan = await c.prepareSubmission(
+    const emptyPlan = await c.prepareDistribution(
       new File([], 'empty.txt'),
       room,
       emptyId,
-      owner.publicKey,
-      owner.fingerprint,
-      submitter,
+      [{ id: student.fingerprint, publicKey: student.publicKey }],
     );
-    const emptyChunk = await c.encryptUploadChunk(
-      new File([], 'empty.txt'),
-      emptyPlan,
-      0,
-    );
+    const emptyChunk = await c.encryptDistributionChunk(emptyPlan, 0);
     const emptyPlain = await c.decryptChunk(
-      emptyChunk,
-      c.decodeBase64(emptyPlan.fileKey),
+      emptyChunk.ciphertext,
+      emptyPlan.fileKey,
       emptyPlan.keySalt,
       emptyPlan.noncePrefix,
       room,
       emptyId,
       0,
-      0,
+      emptyPlan.chunkSizes[0],
     );
-    await c.clearUpload(id);
-    await c.clearUpload(emptyId);
     await new Promise<void>((resolve, reject) => {
       const removal = indexedDB.deleteDatabase('portkey-private-keys');
       removal.onsuccess = () => resolve();
@@ -545,21 +523,23 @@ test('browser crypto rejects altered contexts and lost retry chunks, and protect
     return {
       failures,
       plainLength: plain.length,
-      secondLength: second.length,
-      retryIdentical,
+      secondLength: secondChunk.ciphertext.length,
       restored:
-        restored.fingerprint === owner.fingerprint &&
-        saved?.fingerprint === owner.fingerprint,
+        restored.fingerprint === organizer.fingerprint &&
+        saved?.fingerprint === organizer.fingerprint,
+      organizerOpens: organizerKey.length === 32,
       emptyLength: emptyPlain.length,
+      manifestMatches: manifest.length === 64,
     };
   });
   expect(result).toEqual({
     failures: [],
     plainLength: 1048576,
     secondLength: 17,
-    retryIdentical: true,
     restored: true,
+    organizerOpens: true,
     emptyLength: 0,
+    manifestMatches: true,
   });
 });
 
@@ -708,16 +688,22 @@ test('rooms can be searched, filtered and reused for another workshop', async ({
   await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
   const originalPath = new URL(page.url()).pathname;
   await page.getByRole('button', { name: 'Open room', exact: true }).click();
-  await page.getByRole('link', { name: 'Your rooms', exact: true }).click();
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('link', { name: 'Your rooms', exact: true })
+    .click();
   await page.getByLabel('Room title').fill('Design sprint');
   await page
     .getByLabel('Public description')
     .fill('A new brief for the next event');
   await page.getByRole('button', { name: 'Create draft' }).click();
   await expect(page).toHaveURL(/\/rooms\/[a-f0-9-]+$/);
-  await page.getByRole('link', { name: 'Your rooms', exact: true }).click();
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('link', { name: 'Your rooms', exact: true })
+    .click();
 
-  const rooms = page.locator('.room-list > li');
+  const rooms = page.locator('.rooms-list > li');
   await expect(rooms).toHaveCount(2);
   await page.getByLabel('Search rooms').fill('lighting');
   await expect(rooms).toHaveCount(1);
@@ -726,7 +712,7 @@ test('rooms can be searched, filtered and reused for another workshop', async ({
   await expect(
     page.getByRole('heading', { name: 'No matching rooms' }),
   ).toBeVisible();
-  await page.getByRole('button', { name: 'Clear filters' }).click();
+  await page.getByRole('button', { name: 'Clear the filters' }).click();
   await expect(rooms).toHaveCount(2);
   await page.getByLabel('Filter rooms by status').selectOption('open');
   await expect(rooms).toHaveCount(1);
@@ -738,7 +724,7 @@ test('rooms can be searched, filtered and reused for another workshop', async ({
 
   await page
     .getByRole('link', {
-      name: 'Use Photography basics as template',
+      name: 'Use Photography basics as a template',
       exact: true,
     })
     .click();
@@ -759,7 +745,10 @@ test('rooms can be searched, filtered and reused for another workshop', async ({
   await expect(
     page.getByRole('heading', { name: 'No requests yet' }),
   ).toBeVisible();
-  await page.getByRole('link', { name: 'Your rooms', exact: true }).click();
+  await page
+    .getByRole('navigation', { name: 'Workspace' })
+    .getByRole('link', { name: 'Your rooms', exact: true })
+    .click();
   await expect(rooms).toHaveCount(3);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(
