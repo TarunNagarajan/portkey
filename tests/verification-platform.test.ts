@@ -640,7 +640,7 @@ test("different-owner contract, controlled domain, genuine ZK proof, PKCE exchan
   assert.equal(jwks.keys.length, 1);
   assert.equal("d" in jwks.keys[0], false);
   const [signingKey] = await database.query<{ kid: string }>(
-    "SELECT kid FROM platform_signing_keys",
+    "SELECT kid FROM platform_signing_keyring WHERE active=TRUE",
   );
   assert.equal(jwks.keys[0].kid, signingKey.kid);
 

@@ -6,6 +6,7 @@ const decoder = new TextDecoder('utf-8', { fatal: true });
 const DB = 'portkey-room-files';
 const STORE = 'secrets';
 const UPLOADS = 'uploads';
+const HISTORY = 'history';
 const CHUNK = 1024 * 1024;
 const MAX_SIZE = 250 * CHUNK;
 const base64urlPattern = /^[A-Za-z0-9_-]+$/;
@@ -62,10 +63,10 @@ export async function hexDigest(value: Uint8Array) {
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB, 1);
+    const request = indexedDB.open(DB, 2);
     request.onupgradeneeded = () => {
-      request.result.createObjectStore(STORE);
-      request.result.createObjectStore(UPLOADS);
+      for (const name of [STORE, UPLOADS, HISTORY])
+        if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -106,6 +107,146 @@ export async function saveRoomFileSecret(roomId: string, secret: Uint8Array): Pr
 }
 export const roomFileFingerprint = (secret: Uint8Array) => hexDigest(secret);
 
+export async function loadRoomFileHistory(roomId: string): Promise<Record<string, string>> {
+  return await getStored<Record<string, string>>(HISTORY, roomId) ?? {};
+}
+
+export async function saveRoomFileHistory(roomId: string, history: Record<string, string>): Promise<void> {
+  await putStored(HISTORY, roomId, history);
+}
+
+export async function commitRoomFileKeyState(
+  roomId: string,
+  secret: Uint8Array,
+  history: Record<string, string>,
+  clearPendingFingerprint?: string,
+): Promise<Record<string, string>> {
+  if (secret.length !== 32) throw new Error('Invalid room file key.');
+  const validatedHistory = await validateRoomFileHistory(secret, history);
+  const database = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction([STORE, HISTORY], 'readwrite');
+      let synchronousFailure: unknown;
+      transaction.oncomplete = () => {
+        if (synchronousFailure !== undefined) reject(synchronousFailure);
+        else resolve();
+      };
+      transaction.onerror = () => {};
+      transaction.onabort = () => {
+        reject(
+          synchronousFailure ??
+            transaction.error ??
+            new Error('Could not save the rotated room key.'),
+        );
+      };
+
+      try {
+        transaction.objectStore(STORE).put(encodeUrl(secret), roomId);
+        const historyStore = transaction.objectStore(HISTORY);
+        historyStore.put(validatedHistory, roomId);
+        if (clearPendingFingerprint) {
+          const pendingRequest = historyStore.get(`rotation:${roomId}`);
+          pendingRequest.onsuccess = () => {
+            const pending = pendingRequest.result as
+              | { newFingerprint?: string }
+              | undefined;
+            if (pending?.newFingerprint === clearPendingFingerprint)
+              historyStore.delete(`rotation:${roomId}`);
+          };
+        }
+      } catch (error) {
+        synchronousFailure = error;
+        try {
+          transaction.abort();
+        } catch {
+          reject(error);
+        }
+      }
+    });
+  } finally {
+    database.close();
+  }
+  return validatedHistory;
+}
+
+export interface PendingRoomFileRotation { expectedFingerprint: string; newFingerprint: string; secret: string; historyEnvelope: string; epoch: number; }
+export async function loadPendingRoomFileRotation(roomId: string): Promise<PendingRoomFileRotation | null> {
+  return await getStored<PendingRoomFileRotation>(HISTORY, `rotation:${roomId}`) ?? null;
+}
+export async function savePendingRoomFileRotation(roomId: string, rotation: PendingRoomFileRotation): Promise<void> {
+  await putStored(HISTORY, `rotation:${roomId}`, rotation);
+}
+export async function clearPendingRoomFileRotation(roomId: string): Promise<void> {
+  const database = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(HISTORY, 'readwrite');
+      transaction.objectStore(HISTORY).delete(`rotation:${roomId}`);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally { database.close(); }
+}
+
+function historyAad(roomId: string, epoch: number): Uint8Array {
+  return encoder.encode(JSON.stringify({ protocol: 'portkey-room-key-history-v1', roomId, epoch, purpose: 'key-history' }));
+}
+
+async function validateRoomFileHistory(current: Uint8Array, history: Record<string, string>): Promise<Record<string, string>> {
+  const entries = Object.entries(history);
+  if (current.length !== 32 || entries.length > 31)
+    throw new Error('Shared file key history is invalid or full.');
+  const currentFingerprint = await roomFileFingerprint(current);
+  const validated: Record<string, string> = {};
+  for (const [fingerprint, encoded] of entries) {
+    if (!/^[a-f0-9]{64}$/.test(fingerprint) || typeof encoded !== 'string' || validated[fingerprint] || fingerprint === currentFingerprint)
+      throw new Error('Shared file key history failed validation.');
+    const priorSecret = decodeUrl(encoded);
+    if (priorSecret.length !== 32 || await roomFileFingerprint(priorSecret) !== fingerprint)
+      throw new Error('Shared file key history failed validation.');
+    validated[fingerprint] = encoded;
+  }
+  return validated;
+}
+
+export function sameRoomFileHistory(left: Record<string, string>, right: Record<string, string>): boolean {
+  const canonical = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+  return canonical(left) === canonical(right);
+}
+
+export async function encryptRoomFileHistory(roomId: string, epoch: number, current: Uint8Array, history: Record<string, string>): Promise<string> {
+  const validated = await validateRoomFileHistory(current, history);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.importKey('raw', toBuffer(current), 'AES-GCM', false, ['encrypt']);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: toBuffer(historyAad(roomId, epoch)) }, key, encoder.encode(JSON.stringify(validated))));
+  return encodePacket(concat(iv, ciphertext));
+}
+
+export async function decryptRoomFileHistory(roomId: string, epoch: number, current: Uint8Array, envelope: string | null): Promise<Record<string, string>> {
+  if (!envelope) return {};
+  const packet = decodePacket(envelope);
+  if (packet.length < 28 || packet.length > 8192) throw new Error('Shared file key history is invalid.');
+  const key = await crypto.subtle.importKey('raw', toBuffer(current), 'AES-GCM', false, ['decrypt']);
+  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: toBuffer(packet.slice(0, 12)), additionalData: toBuffer(historyAad(roomId, epoch)) }, key, toBuffer(packet.slice(12)));
+  const json = decoder.decode(plaintext);
+  const parsed: unknown = JSON.parse(json);
+  if (JSON.stringify(parsed) !== json)
+    throw new Error('Shared file key history is not canonical JSON.');
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Shared file key history is invalid.');
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  const currentFingerprint = await roomFileFingerprint(current);
+  if (entries.length > 31) throw new Error('Shared file key history is invalid.');
+  const result: Record<string, string> = {};
+  for (const [fingerprint, encoded] of entries) {
+    if (!/^[a-f0-9]{64}$/.test(fingerprint) || typeof encoded !== 'string' || fingerprint === currentFingerprint || result[fingerprint]) throw new Error('Shared file key history is invalid.');
+    const secret = decodeUrl(encoded);
+    if (secret.length !== 32 || await roomFileFingerprint(secret) !== fingerprint) throw new Error('Shared file key history is invalid.');
+    result[fingerprint] = encoded;
+  }
+  return result;
+}
+
 export function readFilesFragment(): { secret: Uint8Array | null; invalid: boolean } {
   const values = new URLSearchParams(location.hash.slice(1)).getAll('files');
   if (!values.length) return { secret: null, invalid: false };
@@ -136,6 +277,7 @@ export interface ReadyPlan {
   encryptedBytes: number;
   chunkHashes: string[];
   state: 'ready' | 'preparing';
+  keyFingerprint?: string;
 }
 export interface RoomFileReceipt {
   id: string;
@@ -151,6 +293,7 @@ const planSchema = z.object({
   encryptedBytes: z.number().int().min(16).max(MAX_SIZE + 16 * 250),
   chunkHashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(250),
   state: z.enum(['ready', 'preparing']),
+  keyFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 }).strict();
 
 async function savePlan(plan: ReadyPlan): Promise<void> { await putStored(UPLOADS, `plan:${plan.id}`, plan); }
@@ -233,7 +376,7 @@ export async function prepareRoomFile(file: File, roomId: string, master: Uint8A
   const plan: ReadyPlan = {
     roomId, id, filename: file.name, size: file.size, mediaType,
     descriptor: encodePacket(descriptor), chunkCount,
-    encryptedBytes: file.size + 16 * chunkCount, chunkHashes: [], state: 'preparing',
+    encryptedBytes: file.size + 16 * chunkCount, chunkHashes: [], state: 'preparing', keyFingerprint: await roomFileFingerprint(master),
   };
   // An interrupted plan is visible as discard-only; its reserved nonces are never reused.
   await savePlan(plan);
@@ -328,6 +471,8 @@ function validateReceipt(value: unknown, plan: ReadyPlan, manifestSha256: string
 
 export async function uploadRoomFile(plan: ReadyPlan, fingerprint: string, signal: AbortSignal, onProgress: (done: number, total: number) => void): Promise<RoomFileReceipt> {
   if (plan.state !== 'ready') throw new Error('This interrupted preparation cannot resume. Discard it and select the file again.');
+  if (!plan.keyFingerprint) throw new Error('This saved upload predates key binding. Select the original file again to encrypt it with the current shared file key.');
+  if (plan.keyFingerprint !== fingerprint) throw new Error('This saved upload uses an older shared file key. Select the original file again to encrypt a new copy before sharing.');
   const { api, apiBytes } = await import('./api.js');
   const state = await withTransferRetry(() => api<{ uploadedChunks: number[]; complete: boolean; receipt?: unknown }>(`/rooms/${plan.roomId}/files`, 'POST', {
     id: plan.id, keyFingerprint: fingerprint, descriptor: plan.descriptor,

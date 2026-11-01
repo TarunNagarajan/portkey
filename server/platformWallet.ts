@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   Router,
   type Request,
@@ -8,7 +8,9 @@ import {
 import { Group } from "@semaphore-protocol/group";
 import type { SemaphoreProof } from "@semaphore-protocol/proof";
 import { ipKeyGenerator, rateLimit } from "express-rate-limit";
-import { verifySemaphoreProofBounded } from "./semaphoreProof.js";
+import { semaphoreProofSchema, verifySemaphoreProofBounded } from "./semaphoreProof.js";
+import { customProofSchema, verifyGroth16Bounded } from "./groth16Verifier.js";
+import { BN254_SCALAR_FIELD, GROTH16_ADAPTER, type Groth16AdapterConfig } from "../shared/platform.js";
 import type { Database } from "./database.js";
 import { HttpError, requireCondition } from "./errors.js";
 import {
@@ -81,6 +83,9 @@ export function platformWalletRoutes(
         description: string;
         digest: string;
         group_ids: string[];
+        adapter: string;
+        proof_depth: number | null;
+        adapter_config: Groth16AdapterConfig | null;
         expires_at: Date;
         request_active: boolean;
         available: boolean;
@@ -92,7 +97,7 @@ export function platformWalletRoutes(
         app_owner_valid: boolean;
         trusted: boolean;
       }>(
-        `SELECT r.id,r.app_id,a.name,a.origin,r.redirect_uri,r.contract_id,r.contract_version,c.name AS contract_name,c.issuer_label,v.description,v.digest,v.group_ids,r.expires_at,
+        `SELECT r.id,r.app_id,a.name,a.origin,r.redirect_uri,r.contract_id,r.contract_version,c.name AS contract_name,c.issuer_label,v.description,v.digest,v.group_ids,v.adapter,v.proof_depth,v.adapter_config,r.expires_at,
        r.expires_at>clock_timestamp() AS request_active,s.available AS available,v.retired_at IS NOT NULL AS retired,r.status,r.wallet_session_id,r.key_generation,
        a.key_generation=r.key_generation AND a.disabled_at IS NULL AND a.domain_verified_at>clock_timestamp()-interval '24 hours' AS domain_valid,
        appOwner.available AS app_owner_valid,
@@ -136,6 +141,9 @@ export function platformWalletRoutes(
           description: row.description,
           digest: row.digest,
           groups,
+          adapter: row.adapter,
+          proofDepth: row.proof_depth,
+          adapterConfig: row.adapter_config,
         },
         expiresAt: row.expires_at.toISOString(),
       });
@@ -166,6 +174,65 @@ export function platformWalletRoutes(
           "REQUEST_UNAVAILABLE",
           "This request is unavailable or expired.",
         );
+        if (contract.adapter === GROTH16_ADAPTER) {
+          requireCondition(
+            contract.adapter_config,
+            422,
+            "INVALID_VERIFICATION_KEY",
+            "The pinned verification key is unavailable.",
+          );
+          const [existingChallenge] = await tx.query<{ id: string }>(
+            "SELECT id FROM platform_challenges WHERE request_id=$1 FOR UPDATE",
+            [requestId],
+          );
+          const challengeId = existingChallenge?.id ?? randomUUID();
+          const nonce = randomBytes(32).toString("hex");
+          const challengeHash = createHash("sha256")
+            .update(
+              [
+                "portkey:custom-proof-challenge:v1",
+                requestId,
+                wallet.id,
+                head.app_id,
+                row.redirect_uri,
+                contract.digest,
+                nonce,
+              ].join(":"),
+            )
+            .digest("hex");
+          const scalar =
+            (BigInt(`0x${challengeHash}`) % (BN254_SCALAR_FIELD - 1n) + 1n).toString();
+          const [walletRow] = await tx.query<{
+            expires_at: Date;
+            active: boolean;
+          }>(
+            "SELECT expires_at,expires_at>clock_timestamp() AS active FROM sessions WHERE id=$1",
+            [wallet.id],
+          );
+          requireCondition(walletRow?.active, 401, "SESSION_EXPIRED", "Start a new Portkey session.");
+          const [expiry] = await tx.query<{ value: Date }>(
+            "SELECT LEAST(clock_timestamp()+interval '2 minutes',$1::timestamptz,$2::timestamptz) AS value",
+            [row.expires_at, walletRow.expires_at],
+          );
+          const [stored] = await tx.query<{ expires_at: Date }>(
+            `INSERT INTO platform_challenges(id,request_id,wallet_session_id,accepted_root,scope,message,policy_digest,expires_at)
+             VALUES($1,$2,$3,$4,'',$4,$5,$6)
+             ON CONFLICT(request_id) DO UPDATE SET id=EXCLUDED.id,
+               wallet_session_id=EXCLUDED.wallet_session_id,
+               accepted_root=EXCLUDED.accepted_root,scope='',message=EXCLUDED.message,
+               policy_digest=EXCLUDED.policy_digest,expires_at=EXCLUDED.expires_at,
+               consumed_at=NULL,staged_public_signals=NULL,staged_nullifier_digest=NULL
+             RETURNING expires_at`,
+            [challengeId, requestId, wallet.id, scalar, contract.digest, expiry.value],
+          );
+          return {
+            adapter: GROTH16_ADAPTER,
+            challengeId,
+            challenge: scalar,
+            adapterFingerprint: contract.adapter_config.fingerprint,
+            expiresAt: stored.expires_at.toISOString(),
+          };
+        }
         const groups = await tx.query<{ commitment: string }>(
           `SELECT DISTINCT m.commitment FROM credential_group_commitments m JOIN credential_groups g ON g.id=m.group_id JOIN owner_authorities s ON s.id=g.owner_session_id
         WHERE m.group_id=ANY($1::uuid[]) AND s.available ORDER BY m.commitment LIMIT 1001`,
@@ -274,8 +341,10 @@ export function platformWalletRoutes(
       status: string;
       request_wallet_session_id: string | null;
       policy_digest: string;
+      adapter: string;
+      adapter_config: Groth16AdapterConfig | null;
     }>(
-      `SELECT c.request_id,c.wallet_session_id,c.accepted_root,c.scope,c.message,c.expires_at,c.expires_at>clock_timestamp() AS active,c.consumed_at,r.status,r.wallet_session_id AS request_wallet_session_id,c.policy_digest FROM platform_challenges c JOIN platform_requests r ON r.id=c.request_id
+      `SELECT c.request_id,c.wallet_session_id,c.accepted_root,c.scope,c.message,c.expires_at,c.expires_at>clock_timestamp() AS active,c.consumed_at,r.status,r.wallet_session_id AS request_wallet_session_id,c.policy_digest,v.adapter,v.adapter_config FROM platform_challenges c JOIN platform_requests r ON r.id=c.request_id JOIN platform_contract_versions v ON v.contract_id=r.contract_id AND v.version=r.contract_version
       WHERE c.id=$1 AND c.request_id=$2 AND r.capability_digest=$3`,
       [input.challengeId, requestId, hash(input.capability)],
     );
@@ -290,7 +359,90 @@ export function platformWalletRoutes(
       "PROOF_INVALID",
       "This proof is invalid or expired. Refresh and try again.",
     );
-    const proof = input.proof as SemaphoreProof;
+    if (challenge.adapter === GROTH16_ADAPTER) {
+      const config = challenge.adapter_config;
+      requireCondition(
+        config &&
+          challenge.active &&
+          !challenge.consumed_at &&
+          challenge.status === "pending",
+        403,
+        "PROOF_INVALID",
+        "This proof is invalid or expired. Refresh and try again.",
+      );
+      const parsed = customProofSchema.parse(input.proof);
+      requireCondition(
+        parsed.publicSignals.length === config.nPublic &&
+          parsed.proof.curve === "bn128" &&
+          parsed.publicSignals[0] === challenge.message &&
+          parsed.publicSignals[1] === "1" &&
+          parsed.publicSignals[2] !== "0",
+        403,
+        "PROOF_INVALID",
+        "This proof is invalid or expired. Refresh and try again.",
+      );
+      const valid = await verifyGroth16Bounded(config, parsed);
+      requireCondition(
+        valid,
+        403,
+        "PROOF_INVALID",
+        "This proof is invalid or expired. Refresh and try again.",
+      );
+      await database.transaction(async (tx) => {
+        const authority = await lockRequestAuthority(tx, requestId, wallet.id);
+        const [cap] = await tx.query<{ valid: boolean }>(
+          "SELECT capability_digest=$2 AS valid FROM platform_requests WHERE id=$1",
+          [requestId, hash(input.capability)],
+        );
+        requireCondition(
+          cap?.valid &&
+            authority.contract.adapter === GROTH16_ADAPTER &&
+            authority.contract.digest === challenge.policy_digest &&
+            authority.contract.adapter_config?.fingerprint === config.fingerprint,
+          403,
+          "PROOF_INVALID",
+          "This proof is invalid or expired. Refresh and try again.",
+        );
+        const [stored] = await tx.query<{
+          active: boolean;
+          consumed_at: Date | null;
+          message: string;
+        }>(
+          "SELECT expires_at>clock_timestamp() AS active,consumed_at,message FROM platform_challenges WHERE id=$1 AND request_id=$2 AND wallet_session_id=$3 FOR UPDATE",
+          [input.challengeId, requestId, wallet.id],
+        );
+        requireCondition(
+          stored?.active &&
+            !stored.consumed_at &&
+            stored.message === parsed.publicSignals[0] &&
+            authority.request.status === "pending" &&
+            (!authority.request.wallet_session_id ||
+              authority.request.wallet_session_id === wallet.id),
+          403,
+          "PROOF_INVALID",
+          "This proof is invalid or expired. Refresh and try again.",
+        );
+        const nullifierDigest = createHash("sha256")
+          .update(
+            `${GROTH16_ADAPTER}:${authority.head.contract_id}:${authority.head.contract_version}:${parsed.publicSignals[2]}`,
+          )
+          .digest("hex");
+        await tx.query(
+          "UPDATE platform_challenges SET consumed_at=clock_timestamp(),staged_public_signals=$2::jsonb,staged_nullifier_digest=$3 WHERE id=$1",
+          [input.challengeId, JSON.stringify(parsed.publicSignals), nullifierDigest],
+        );
+      });
+      response.json({
+        verified: true,
+        approved: false,
+        disclosedSignals: config.publicSignalNames.map((name, index) => ({
+          name,
+          value: parsed.publicSignals[index],
+        })),
+      });
+      return;
+    }
+    const proof = semaphoreProofSchema.parse(input.proof) as SemaphoreProof;
     requireCondition(
       proof.merkleTreeDepth === 10 &&
         proof.merkleTreeRoot === challenge.accepted_root &&
@@ -396,6 +548,103 @@ export function platformWalletRoutes(
     });
     response.json({ verified: true, alreadyVerified });
   });
+  router.post(
+    "/proof-requests/:requestId/approve-custom-proof",
+    async (request, response) => {
+      const wallet = requireSession(request);
+      const requestId = canonicalUuid.parse(request.params.requestId);
+      const { capability } = challengeInput.parse(request.body);
+      const alreadyApproved = await database.transaction(async (tx) => {
+        const authority = await lockRequestAuthority(tx, requestId, wallet.id);
+        const [cap] = await tx.query<{ valid: boolean }>(
+          "SELECT capability_digest=$2 AS valid FROM platform_requests WHERE id=$1",
+          [requestId, hash(capability)],
+        );
+        requireCondition(
+          cap?.valid,
+          403,
+          "PROOF_INVALID",
+          "This proof cannot be approved. Start again from the application.",
+        );
+        const confirmation = async (contractId: string, version: number) => {
+          const [row] = await tx.query<{
+            disclosed: boolean;
+            nullifier_matches: boolean;
+          }>(
+            "SELECT c.staged_public_signals IS NOT NULL AS disclosed,c.staged_nullifier_digest=n.nullifier_digest AS nullifier_matches FROM platform_challenges c JOIN platform_custom_nullifiers n ON n.request_id=c.request_id WHERE c.request_id=$1 AND c.wallet_session_id=$2 AND n.contract_id=$3 AND n.contract_version=$4",
+            [requestId, wallet.id, contractId, version],
+          );
+          return Boolean(row?.disclosed && row.nullifier_matches);
+        };
+        requireCondition(
+          authority.contract.adapter === GROTH16_ADAPTER,
+          403,
+          "PROOF_INVALID",
+          "This request uses a different proof adapter.",
+        );
+        if (
+          authority.request.status === "verified" &&
+          authority.request.wallet_session_id === wallet.id
+        ) {
+          requireCondition(
+            await confirmation(
+              authority.head.contract_id,
+              authority.head.contract_version,
+            ),
+            403,
+            "PROOF_INVALID",
+            "This request was not approved with the imported proof.",
+          );
+          return true;
+        }
+        requireCondition(
+          authority.request.status === "pending",
+          403,
+          "PROOF_INVALID",
+          "This proof cannot be approved. Start again from the application.",
+        );
+        const [stored] = await tx.query<{
+          staged_public_signals: string[] | null;
+          staged_nullifier_digest: string | null;
+          consumed_at: Date | null;
+          active: boolean;
+        }>(
+          "SELECT staged_public_signals,staged_nullifier_digest,consumed_at,expires_at>clock_timestamp() AS active FROM platform_challenges WHERE request_id=$1 AND wallet_session_id=$2 FOR UPDATE",
+          [requestId, wallet.id],
+        );
+        requireCondition(
+          stored?.active &&
+            stored.consumed_at &&
+            stored.staged_public_signals &&
+            stored.staged_nullifier_digest,
+          403,
+          "PROOF_INVALID",
+          "Import and verify a fresh proof before approving it.",
+        );
+        const [spent] = await tx.query<{ request_id: string }>(
+          "INSERT INTO platform_custom_nullifiers(contract_id,contract_version,nullifier_digest,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING request_id",
+          [
+            authority.head.contract_id,
+            authority.head.contract_version,
+            stored.staged_nullifier_digest,
+            requestId,
+          ],
+        );
+        requireCondition(
+          spent,
+          403,
+          "PROOF_INVALID",
+          "This nullifier has already been used for this contract version.",
+        );
+        await tx.query(
+          "UPDATE platform_requests SET status='verified',verified_at=clock_timestamp(),wallet_session_id=$2 WHERE id=$1",
+          [requestId, wallet.id],
+        );
+        return false;
+      });
+      response.json({ approved: true, alreadyApproved });
+    },
+  );
   router.post(
     "/proof-requests/:requestId/return",
     async (request, response) => {

@@ -9,7 +9,8 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Database } from "./database.js";
 import { HttpError, requireCondition } from "./errors.js";
-import { platformContractDigest } from "../shared/platform.js";
+import { platformContractDigest, customContractDigest, GROTH16_ADAPTER } from "../shared/platform.js";
+import { parseVerificationKey, validateVerificationKeyBounded } from "./groth16Verifier.js";
 import { fetchDomainVerificationFile } from "./domainVerification.js";
 import { canonicalUuid, versionInput } from "./platformProtocol.js";
 
@@ -20,9 +21,26 @@ const contractInput = z
     name: z.string().trim().min(1).max(100),
     issuerLabel: z.string().trim().min(1).max(100),
     description: z.string().max(500),
-    groupIds: z.array(id).min(1).max(4),
+    adapter: z.enum(["semaphore-membership-v1", GROTH16_ADAPTER]).default("semaphore-membership-v1"),
+    groupIds: z.array(id).max(4).optional(),
+    verificationKey: z.unknown().optional(),
+    publicSignalNames: z.unknown().optional(),
   })
   .strict();
+
+function contractPolicy(input: z.infer<typeof contractInput>, contractId: string, version: number, customConfig?: ReturnType<typeof parseVerificationKey>) {
+  if (input.adapter === GROTH16_ADAPTER) {
+    requireCondition(!input.groupIds || input.groupIds.length === 0, 422, "INVALID_GROUPS", "Custom Groth16 contracts do not use credential groups.");
+    const config = customConfig ?? parseVerificationKey(input.verificationKey, input.publicSignalNames);
+    return { groups: [] as string[], config, digest: customContractDigest(contractId, version, config) };
+  }
+  requireCondition(input.verificationKey === undefined && input.publicSignalNames === undefined, 422, "INVALID_ADAPTER", "Choose a supported proof adapter.");
+  const rawGroups = input.groupIds ?? [];
+  requireCondition(rawGroups.length >= 1, 422, "INVALID_GROUPS", "Choose at least one credential group.");
+  const groups = [...new Set(rawGroups.map(value => value.toLowerCase()))].sort();
+  requireCondition(groups.length === rawGroups.length, 422, "INVALID_GROUPS", "Choose distinct credential groups.");
+  return { groups, config: null, digest: platformContractDigest(contractId, version, groups) };
+}
 const appInput = z
   .object({
     name: z.string().trim().min(1).max(100),
@@ -52,15 +70,8 @@ export function platformControlRoutes(
   });
   router.post("/platform/contracts", async (request, response) => {
     const input = contractInput.parse(request.body);
-    const groups = [
-      ...new Set(input.groupIds.map((value) => value.toLowerCase())),
-    ].sort();
-    requireCondition(
-      groups.length === input.groupIds.length,
-      422,
-      "INVALID_GROUPS",
-      "Choose distinct credential groups.",
-    );
+    const customConfig = input.adapter === GROTH16_ADAPTER ? parseVerificationKey(input.verificationKey, input.publicSignalNames) : undefined;
+    if (customConfig) await validateVerificationKeyBounded(customConfig);
     const result = await database.transaction(async (tx) => {
       await tx.query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE", [
         request.ownerId!,
@@ -86,13 +97,15 @@ export function platformControlRoutes(
         "This session has reached its contract limit.",
       );
       const contractId = randomUUID();
+      const policy = contractPolicy(input, contractId, 1, customConfig);
+      const groups = policy.groups;
       const owned = await tx.query<{ id: string; name: string }>(
         `SELECT g.id,g.name FROM credential_groups g JOIN owner_authorities s ON s.id=g.owner_session_id
         WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.available ORDER BY g.id FOR UPDATE OF g`,
         [groups, request.ownerId!],
       );
       requireCondition(
-        owned.length === groups.length,
+        input.adapter === GROTH16_ADAPTER || owned.length === groups.length,
         403,
         "GROUP_NOT_OWNED",
         "Each contract group must belong to this issuer session.",
@@ -101,12 +114,12 @@ export function platformControlRoutes(
         "INSERT INTO platform_contracts(id,owner_session_id,name,issuer_label) VALUES($1,$2,$3,$4)",
         [contractId, request.ownerId!, input.name, input.issuerLabel],
       );
-      const digest = platformContractDigest(contractId, 1, groups);
+      const digest = policy.digest;
       await tx.query(
-        "INSERT INTO platform_contract_versions(contract_id,version,description,group_ids,digest) VALUES($1,1,$2,$3,$4)",
-        [contractId, input.description, groups, digest],
+        "INSERT INTO platform_contract_versions(contract_id,version,description,group_ids,digest,adapter,proof_depth,adapter_config) VALUES($1,1,$2,$3,$4,$5,$6,$7)",
+        [contractId, input.description, groups, digest, input.adapter, input.adapter === GROTH16_ADAPTER ? null : 10, policy.config],
       );
-      return { id: contractId, version: 1, digest, groups: owned };
+      return { id: contractId, version: 1, digest, groups: owned, adapter: input.adapter, adapterConfig: policy.config };
     });
     response.status(201).json(result);
   });
@@ -120,7 +133,7 @@ export function platformControlRoutes(
       );
       requireCondition(owned, 404, "CONTRACT_NOT_FOUND", "Contract not found.");
       const versions = await database.query(
-        "SELECT version,description,group_ids,digest,published_at,retired_at FROM platform_contract_versions WHERE contract_id=$1 ORDER BY version DESC",
+        "SELECT version,description,group_ids,digest,adapter,proof_depth,adapter_config,published_at,retired_at FROM platform_contract_versions WHERE contract_id=$1 ORDER BY version DESC",
         [contractId],
       );
       response.json({ versions });
@@ -131,17 +144,10 @@ export function platformControlRoutes(
     async (request, response) => {
       const contractId = id.parse(request.params.contractId);
       const input = contractInput
-        .pick({ description: true, groupIds: true })
+        .pick({ description: true, adapter: true, groupIds: true, verificationKey: true, publicSignalNames: true })
         .parse(request.body);
-      const groups = [
-        ...new Set(input.groupIds.map((value) => value.toLowerCase())),
-      ].sort();
-      requireCondition(
-        groups.length === input.groupIds.length,
-        422,
-        "INVALID_GROUPS",
-        "Choose distinct credential groups.",
-      );
+      const customConfig = input.adapter === GROTH16_ADAPTER ? parseVerificationKey(input.verificationKey, input.publicSignalNames) : undefined;
+      if (customConfig) await validateVerificationKeyBounded(customConfig);
       const result = await database.transaction(async (tx) => {
         const [contract] = await tx.query<{ id: string }>(
           "SELECT id FROM platform_contracts WHERE id=$1 AND owner_session_id=$2 FOR UPDATE",
@@ -163,24 +169,21 @@ export function platformControlRoutes(
           "VERSION_LIMIT",
           "This contract has reached its version limit.",
         );
+        const version = count.version + 1;
+        const policy = contractPolicy(input as z.infer<typeof contractInput>, contractId, version, customConfig);
+        const groups = policy.groups;
         const owned = await tx.query<{ id: string; name: string }>(
           `SELECT g.id,g.name FROM credential_groups g JOIN owner_authorities s ON s.id=g.owner_session_id
         WHERE g.id=ANY($1::uuid[]) AND g.owner_session_id=$2 AND s.available ORDER BY g.id FOR UPDATE OF g`,
           [groups, request.ownerId!],
         );
-        requireCondition(
-          owned.length === groups.length,
-          403,
-          "GROUP_NOT_OWNED",
-          "Each contract group must belong to this issuer session.",
-        );
-        const version = count.version + 1;
-        const digest = platformContractDigest(contractId, version, groups);
+        requireCondition(input.adapter === GROTH16_ADAPTER || owned.length === groups.length, 403, "GROUP_NOT_OWNED", "Each contract group must belong to this issuer session.");
+        const digest = policy.digest;
         await tx.query(
-          "INSERT INTO platform_contract_versions(contract_id,version,description,group_ids,digest) VALUES($1,$2,$3,$4,$5)",
-          [contractId, version, input.description, groups, digest],
+          "INSERT INTO platform_contract_versions(contract_id,version,description,group_ids,digest,adapter,proof_depth,adapter_config) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+          [contractId, version, input.description, groups, digest, input.adapter, input.adapter === GROTH16_ADAPTER ? null : 10, policy.config],
         );
-        return { contractId, version, digest, groups: owned };
+        return { contractId, version, digest, groups: owned, adapter: input.adapter, adapterConfig: policy.config };
       });
       response.status(201).json(result);
     },

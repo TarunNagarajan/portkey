@@ -4,7 +4,7 @@ export default defineConfig({
   metadata: { builtAssets: true },
   testDir: "./e2e",
   testMatch:
-    /(?:workshop-proof-admission|reusable-credential-admission|organizer-accounts|room-files)\.spec\.ts$/,
+    /(?:workshop-proof-admission|reusable-credential-admission|organizer-accounts|room-files|room-key-rotation)\.spec\.ts$/,
   workers: 1,
   timeout: 180_000,
   expect: { timeout: 12_000 },

@@ -8,12 +8,20 @@ import {
   clearRoomFileDownloadCopies,
   listRoomFilePlans,
   loadRoomFileSecret,
+  loadRoomFileHistory,
+  commitRoomFileKeyState,
+  sameRoomFileHistory,
+  encryptRoomFileHistory,
+  decryptRoomFileHistory,
+  loadPendingRoomFileRotation,
+  savePendingRoomFileRotation,
   prepareRoomFile,
   readFilesFragment,
   removeFilesFragment,
   roomFileFingerprint,
+  roomFileUnbase64,
+  roomFileBase64,
   retryRoomFileRequest,
-  saveRoomFileSecret,
   uploadRoomFile,
   type ReadyPlan,
 } from './roomFileCrypto.js';
@@ -27,6 +35,7 @@ interface ListedFile {
   createdAt: string;
   receipt: { acceptedAt: string };
   canDelete: boolean;
+  keyFingerprint: string;
 }
 interface FileListPage {
   files: ListedFile[];
@@ -59,6 +68,7 @@ export function RoomFiles({
 }) {
   const [secret, setSecret] = useState<Uint8Array | null>(null);
   const [registered, setRegistered] = useState<string | null>(null);
+  const [history, setHistory] = useState<Record<string, string>>({});
   const [files, setFiles] = useState<ListedFile[]>([]);
   const [plans, setPlans] = useState<ReadyPlan[]>([]);
   const [fileNames, setFileNames] = useState<Record<string, string>>({});
@@ -164,8 +174,14 @@ export function RoomFiles({
     const currentListGeneration = listGeneration.current;
     const controller = createListRequest();
     try {
+      let staleKey = false;
       const page = await api<FileListPage>(`/rooms/${room.id}/files`, 'GET', undefined, controller.signal);
       if (generation !== lifecycle.current || currentListGeneration !== listGeneration.current || controller.signal.aborted || roomStatus.current !== 'open') return;
+      if (registered && room.role !== 'owner') {
+        const key = await api<{ fingerprint: string | null }>(`/rooms/${room.id}/files/key`, 'GET', undefined, controller.signal);
+        if (generation !== lifecycle.current || controller.signal.aborted) return;
+        staleKey = Boolean(key.fingerprint && key.fingerprint !== registered);
+      }
       const activeIds = new Set(page.activeIds);
       setFiles((current) => mergeFiles(
         current.filter((file) => activeIds.has(file.id)),
@@ -174,7 +190,7 @@ export function RoomFiles({
       setFileNames((current) => Object.fromEntries(Object.entries(current).filter(([id]) => activeIds.has(id))));
       setAccessUnavailable(false);
       if (!loadedOlderPages.current) setNextCursor(page.nextCursor);
-      setConnectionError('');
+      setConnectionError(staleKey ? 'The organizer rotated the shared file key. Open an updated room invitation to access newly shared files.' : '');
     } catch (cause) {
       if (controller.signal.aborted || generation !== lifecycle.current) return;
       if (isAccessLost(cause)) {
@@ -186,7 +202,7 @@ export function RoomFiles({
       finishListRequest(controller);
       refreshLock.current = false;
     }
-  }, [room.id, createListRequest, finishListRequest, markAccessLost]);
+  }, [room.id, room.role, registered, createListRequest, finishListRequest, markAccessLost]);
 
   async function loadOlder() {
     if (!nextCursor || refreshLock.current) return;
@@ -238,13 +254,13 @@ export function RoomFiles({
         return;
       }
       try {
-        const fragment = readFilesFragment();
+      const fragment = readFilesFragment();
         setInvalid(fragment.invalid);
         if (fragment.invalid) {
           rejectActiveKey('The shared files key in this invitation is invalid.', true);
           return;
         }
-        const serverKey = await api<{ fingerprint: string | null }>(
+        const serverKey = await api<{ fingerprint: string | null; epoch: number; historyEnvelope: string | null }>(
           `/rooms/${room.id}/files/key`,
           'GET',
           undefined,
@@ -256,16 +272,31 @@ export function RoomFiles({
 
         const savedSecret = await loadRoomFileSecret(room.id);
         if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
-        const candidate = fragment.secret ?? savedSecret;
+        const pendingRotation = await loadPendingRoomFileRotation(room.id);
+        const recoverCandidate = pendingRotation && serverKey.fingerprint === pendingRotation.newFingerprint
+          ? roomFileUnbase64(pendingRotation.secret)
+          : null;
+        const candidate = fragment.secret ?? recoverCandidate ?? savedSecret;
         if (candidate) {
           const candidateFingerprint = await roomFileFingerprint(candidate);
           if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
           if (serverKey.fingerprint && serverKey.fingerprint !== candidateFingerprint) {
-            rejectActiveKey('This browser has a different shared files key. Open the original room invitation to restore access.', false);
+            rejectActiveKey('This browser has an older shared files key. Ask the organizer to send the updated room invitation to restore access.', false);
             return;
           }
+          const recoveredHistory = await decryptRoomFileHistory(room.id, serverKey.epoch, candidate, serverKey.historyEnvelope);
+          const priorHistory = await loadRoomFileHistory(room.id);
+          const allHistory = { ...priorHistory, ...recoveredHistory };
           if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
-          await saveRoomFileSecret(room.id, candidate);
+          const committedHistory = await commitRoomFileKeyState(
+            room.id,
+            candidate,
+            allHistory,
+            pendingRotation && candidateFingerprint === pendingRotation.newFingerprint
+              ? pendingRotation.newFingerprint
+              : undefined,
+          );
+          setHistory(committedHistory);
           if (!active || generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
           setSecret(candidate);
           if (fragment.secret) removeFilesFragment();
@@ -345,7 +376,7 @@ export function RoomFiles({
     const restoreFromInvitation = () => {
       const generation = lifecycle.current;
       const fragmentRequest = ++fragmentGeneration.current;
-      const fragment = readFilesFragment();
+        const fragment = readFilesFragment();
       if (fragment.invalid) {
         rejectActiveKey('The shared files key in this invitation is invalid.', true);
         return;
@@ -354,7 +385,7 @@ export function RoomFiles({
       const controller = createRequest();
       void (async () => {
         try {
-          const serverKey = await api<{ fingerprint: string | null }>(
+          const serverKey = await api<{ fingerprint: string | null; epoch: number; historyEnvelope: string | null }>(
             `/rooms/${room.id}/files/key`,
             'GET',
             undefined,
@@ -366,8 +397,20 @@ export function RoomFiles({
             rejectActiveKey('This invitation does not match the room’s registered shared files key.', false);
             return;
           }
-          await saveRoomFileSecret(room.id, fragment.secret!);
+          const recoveredHistory = await decryptRoomFileHistory(room.id, serverKey.epoch, fragment.secret!, serverKey.historyEnvelope);
+          const priorHistory = await loadRoomFileHistory(room.id);
+          const allHistory = { ...priorHistory, ...recoveredHistory };
           if (generation !== lifecycle.current || fragmentRequest !== fragmentGeneration.current || controller.signal.aborted) return;
+          const pending = await loadPendingRoomFileRotation(room.id);
+          const committedHistory = await commitRoomFileKeyState(
+            room.id,
+            fragment.secret!,
+            allHistory,
+            pending && fingerprint === pending.newFingerprint
+              ? pending.newFingerprint
+              : undefined,
+          );
+          setHistory(committedHistory);
           setSecret(fragment.secret);
           setRegistered(fingerprint);
           setInvalid(false);
@@ -402,11 +445,13 @@ export function RoomFiles({
     void Promise.all(
       files.map(async (file) => {
         try {
+          const fileSecret = file.keyFingerprint === await roomFileFingerprint(secret) ? secret : history[file.keyFingerprint] ? roomFileUnbase64(history[file.keyFingerprint]) : null;
+          if (!fileSecret) return [file.id, 'Unavailable file'] as const;
           const metadata = await decryptRoomFileDescriptor(
             room.id,
             file.id,
             file.descriptor,
-            secret,
+            fileSecret,
           );
           return [file.id, metadata.filename] as const;
         } catch {
@@ -419,7 +464,7 @@ export function RoomFiles({
     return () => {
       active = false;
     };
-  }, [files, room.id, secret]);
+  }, [files, room.id, secret, history]);
 
   useEffect(
     () => () => activeController.current?.abort(),
@@ -430,7 +475,7 @@ export function RoomFiles({
     setBusy(true);
     setError('');
     try {
-      const current = await api<{ fingerprint: string | null }>(
+      const current = await api<{ fingerprint: string | null; epoch: number; historyEnvelope: string | null }>(
         `/rooms/${room.id}/files/key`,
       );
       const savedSecret = await loadRoomFileSecret(room.id);
@@ -441,7 +486,10 @@ export function RoomFiles({
       if (current.fingerprint && current.fingerprint !== fingerprint)
         throw new Error('This browser has a different shared files key. Open the original room invitation to restore access.');
 
-      await saveRoomFileSecret(room.id, candidate);
+      const recoveredHistory = await decryptRoomFileHistory(room.id, current.epoch, candidate, current.historyEnvelope);
+      const priorHistory = await loadRoomFileHistory(room.id);
+      const allHistory = { ...priorHistory, ...recoveredHistory };
+      const committedHistory = await commitRoomFileKeyState(room.id, candidate, allHistory);
       if (!current.fingerprint) {
         try {
           await api(`/rooms/${room.id}/files/key`, 'POST', { fingerprint });
@@ -453,11 +501,111 @@ export function RoomFiles({
         }
       }
       setSecret(candidate);
+      setHistory(committedHistory);
       setRegistered(fingerprint);
       onKeyReady?.(candidate);
       setStatus('Shared files enabled. Use an updated room link to share this key.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not enable shared files.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rotateSharedFileKey() {
+    if (room.role !== 'owner' || !secret || !registered || busy) return;
+    const confirmed = window.confirm(
+      'Rotate the shared file key? All in-progress room uploads will be canceled and removed. Completed files remain available. You must send the updated room invitation to every remaining participant. Rotation cannot retract files or keys already downloaded.',
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setError('');
+    try {
+      const latest = await api<{
+        fingerprint: string | null;
+        epoch: number;
+        historyEnvelope: string | null;
+      }>(`/rooms/${room.id}/files/key`);
+      if (latest.fingerprint !== registered)
+        throw new Error('The room key changed in another rotation. Refresh and use the current updated invitation.');
+      const pending = await loadPendingRoomFileRotation(room.id);
+      let candidate: Uint8Array;
+      let fingerprint: string;
+      let previous: Record<string, string>;
+      let envelope: string;
+      let savePending = false;
+      if (pending) {
+        candidate = roomFileUnbase64(pending.secret);
+        fingerprint = await roomFileFingerprint(candidate);
+        if (
+          pending.expectedFingerprint !== registered ||
+          pending.newFingerprint !== fingerprint ||
+          pending.epoch !== latest.epoch + 1
+        )
+          throw new Error('A previous key rotation is unresolved. Restore its updated room invitation before trying again.');
+        previous = { ...history, [registered]: roomFileBase64(secret) };
+        envelope = pending.historyEnvelope;
+      } else {
+        candidate = crypto.getRandomValues(new Uint8Array(32));
+        fingerprint = await roomFileFingerprint(candidate);
+        previous = { ...history, [registered]: roomFileBase64(secret) };
+        envelope = await encryptRoomFileHistory(
+          room.id,
+          latest.epoch + 1,
+          candidate,
+          previous,
+        );
+        savePending = true;
+      }
+      const authenticatedHistory = await decryptRoomFileHistory(
+        room.id,
+        latest.epoch + 1,
+        candidate,
+        envelope,
+      );
+      if (!sameRoomFileHistory(authenticatedHistory, previous))
+        throw new Error('The encrypted shared file key history does not match the pending rotation.');
+      if (savePending) {
+        await savePendingRoomFileRotation(room.id, {
+          expectedFingerprint: registered,
+          newFingerprint: fingerprint,
+          secret: roomFileBase64(candidate),
+          historyEnvelope: envelope,
+          epoch: latest.epoch + 1,
+        });
+      }
+      try {
+        await api(`/rooms/${room.id}/files/key/rotate`, 'POST', {
+          expectedFingerprint: registered,
+          newFingerprint: fingerprint,
+          historyEnvelope: envelope,
+        });
+      } catch (cause) {
+        const check = await api<{
+          fingerprint: string | null;
+          epoch: number;
+          historyEnvelope: string | null;
+        }>(`/rooms/${room.id}/files/key`);
+        if (check.fingerprint !== fingerprint || check.historyEnvelope !== envelope) throw cause;
+      }
+      activeController.current?.abort();
+      const committedHistory = await commitRoomFileKeyState(
+        room.id,
+        candidate,
+        previous,
+        fingerprint,
+      );
+      setHistory(committedHistory);
+      setSecret(candidate);
+      setRegistered(fingerprint);
+      onKeyReady?.(candidate);
+      setPlans(await listRoomFilePlans(room.id));
+      setStatus(
+        'Shared file key rotated. Send the updated room invitation to remaining participants. Completed files remain under their original key.',
+      );
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not rotate the shared file key.');
     } finally {
       setBusy(false);
     }
@@ -506,6 +654,11 @@ export function RoomFiles({
 
   async function downloadFile(file: ListedFile) {
     if (!secret || accessUnavailable || room.status !== 'open') return;
+    const keyForFile = file.keyFingerprint === await roomFileFingerprint(secret) ? secret : history[file.keyFingerprint] ? roomFileUnbase64(history[file.keyFingerprint]) : null;
+    if (!keyForFile) {
+      setError('This file needs an earlier shared file key. Open an updated room invitation from the organizer to restore the encrypted key history.');
+      return;
+    }
     const controller = new AbortController();
     activeController.current = controller;
     setProgress({ done: 0, total: file.encryptedBytes });
@@ -515,7 +668,7 @@ export function RoomFiles({
       await decryptRoomFileToDownload(
         room.id,
         file,
-        secret!,
+        keyForFile,
         async (index) => {
           const result = await retryRoomFileRequest(
             () => apiBytes(
@@ -653,6 +806,7 @@ export function RoomFiles({
           <p className="muted">Files are encrypted before upload. Maximum size: 250 MiB.</p>
           {room.status !== 'open' && <p role="status">File sharing is available while the room is open.</p>}
           {localCopyCount > 0 && <p role="status">{localCopyCount} local verified download {localCopyCount === 1 ? 'copy is' : 'copies are'} stored in this browser.</p>}
+          {room.role === 'owner' && <button className="secondary" type="button" disabled={busy || room.status !== 'open'} onClick={() => void rotateSharedFileKey()}>Rotate shared-file key</button>}
           <button className="secondary" type="button" onClick={() => void clearLocalDownloadCopies()}>
             Remove local verified download copies
           </button>
@@ -661,9 +815,10 @@ export function RoomFiles({
               <span>
                 {plan.filename} · {plan.size.toLocaleString()} bytes
                 {plan.state === 'preparing' ? ' · interrupted preparation' : ''}
+                {!plan.keyFingerprint ? ' · key not recorded; select original file again' : registered && plan.keyFingerprint !== registered ? ' · encrypted with an older key; select original file again' : ''}
               </span>
               <button
-                disabled={busy || accessUnavailable || room.status !== 'open' || plan.state !== 'ready'}
+                disabled={busy || accessUnavailable || room.status !== 'open' || plan.state !== 'ready' || !plan.keyFingerprint || plan.keyFingerprint !== registered}
                 onClick={() => void uploadPlan(plan)}
               >
                 Share with room

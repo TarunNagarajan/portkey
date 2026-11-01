@@ -1,0 +1,17 @@
+# Platform proof adapters
+
+Portkey's separate-application platform supports the built-in `semaphore-membership-v1` adapter and versioned organizer-published `groth16-bn254-v1` verifier keys. A relying application pins an exact contract version and digest; publishing a revised rule or key creates a new version that must be pinned separately.
+
+## Custom Groth16 contract
+
+The organizer uploads a standard Groth16 verification-key JSON object and names its public signals. Portkey accepts only the Groth16 BN254 pairing curve (`bn128`/`bn254`), keys with three to sixteen public inputs, the expected verifier-key fields, canonical bounded coordinates, and valid subgroup points. The uploaded key and declared signal names become part of the immutable version. Portkey does not load uploaded code or circuits.
+
+The first three public signals have a fixed layout: index 0 is the request challenge, index 1 is the eligibility result and must be `1`, and index 2 is a nonzero nullifier. An issuer may declare additional public signals, up to sixteen in total. The participant sees every declared signal value before approving. Public signals are visible to Portkey; the relying application receives the approved eligibility result and receipt, not the proof packet or private witness.
+
+For each request, Portkey creates a fresh challenge bound to the request, wallet session, application, redirect address and pinned contract version. The participant generates the proof locally with the issuer's circuit and proving key, then imports proof JSON containing exactly `proof` and `publicSignals`. Portkey checks the proof against the pinned verification key in an isolated bounded process. It never runs an uploaded circuit or witness. Importing a proof is not approval: the wallet displays the declared public signals and requires an explicit approval action before making the verified result available to the relying application.
+
+The issuer chooses the circuit and therefore its eligibility rule. A valid proof establishes that the proof matches that issuer-selected circuit and key; it does not establish that the circuit's policy is fair, correct, or independently audited. Issuers remain responsible for circuit review, proving-key distribution, and production-grade trusted setup. The local circuit and artifacts in `examples/groth16-bn254-testonly/` are deliberately unsafe test fixtures; never publish their key or use their ceremony for real decisions.
+
+Custom nullifiers are single-use per contract version. Circuits should derive nullifiers from the subject and intended application or request scope when a subject needs to complete separate checks. The public nullifier is visible to the wallet and Portkey, so issuers should choose its scope with linkability in mind.
+
+The normal development and API test suite includes a generated real proof using the committed test-only fixture. The browser acceptance flow additionally exercises the packaged SDK, relying-party callback and wallet disclosures. Prepare the app and relying-party artifacts first with `npm run build` and `npm run sdk:pack`, install the example dependencies with `npm ci --prefix examples/relying-party --ignore-scripts`, configure `PORTKEY_SDK_EXAMPLE_DATABASE_URL` to a disposable local PostgreSQL database whose name includes `test` or `sdk`, then run `npm run test:e2e:custom-proof`. This launches headless Edge on Windows (or Chromium elsewhere) and uses local ports 5300 and 5310; it is an acceptance run, not a routine unit test.

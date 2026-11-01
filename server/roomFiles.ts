@@ -147,8 +147,87 @@ export function roomFilesRoutes(db: Database) {
       );
     const [k] = await db.query<{
       fingerprint: string;
-    }>("SELECT fingerprint FROM room_file_keys WHERE room_id=$1", [id]);
-    res.json({ fingerprint: k?.fingerprint ?? null });
+      epoch: number;
+      history_envelope: string | null;
+    }>("SELECT fingerprint,epoch,history_envelope FROM room_file_keys WHERE room_id=$1", [id]);
+    res.json({ fingerprint: k?.fingerprint ?? null, epoch: k?.epoch ?? 0, historyEnvelope: k?.history_envelope ?? null });
+  });
+  router.post("/rooms/:id/files/key/rotate", async (req, res) => {
+    const id = roomId.parse(req.params.id);
+    const { expectedFingerprint, newFingerprint, historyEnvelope } = z
+      .object({
+        expectedFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+        newFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+        historyEnvelope: z
+          .string()
+          .max(7000)
+          .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/),
+      })
+      .strict()
+      .parse(req.body);
+    requireCondition(
+      canonicalB64(historyEnvelope) &&
+        Buffer.from(historyEnvelope, "base64").length >= 28,
+      422,
+      "INVALID_HISTORY",
+      "The encrypted key history is invalid.",
+    );
+    const result = await db.transaction(async (tx) => {
+      const r = await locked(tx, id);
+      requireCondition(
+        r.owner_id === req.ownerId,
+        403,
+        "OWNER_REQUIRED",
+        "Only the organizer can rotate the shared file key.",
+      );
+      requireCondition(
+        r.status === "open" && !r.expired,
+        410,
+        "ROOM_CLOSED",
+        "This room is no longer accepting shared files.",
+      );
+      const [key] = await tx.query<{
+        fingerprint: string;
+        epoch: number;
+        history_envelope: string | null;
+      }>(
+        "SELECT fingerprint,epoch,history_envelope FROM room_file_keys WHERE room_id=$1 FOR UPDATE",
+        [id],
+      );
+      requireCondition(
+        key,
+        409,
+        "KEY_NOT_REGISTERED",
+        "Shared files do not have a key to rotate.",
+      );
+      if (key.fingerprint === newFingerprint && key.history_envelope === historyEnvelope)
+        return { fingerprint: key.fingerprint, epoch: key.epoch };
+      requireCondition(
+        key.fingerprint === expectedFingerprint,
+        409,
+        "KEY_ROTATION_CONFLICT",
+        "The room key changed in another rotation.",
+      );
+      requireCondition(
+        key.epoch < 32,
+        409,
+        "KEY_HISTORY_LIMIT",
+        "This room has reached its key history limit.",
+      );
+      requireCondition(
+        newFingerprint !== expectedFingerprint,
+        422,
+        "INVALID_ROTATION",
+        "Choose a new shared file key.",
+      );
+      await tx.query(
+        "UPDATE room_file_keys SET fingerprint=$2,epoch=epoch+1,history_envelope=$3 WHERE room_id=$1",
+        [id, newFingerprint, historyEnvelope],
+      );
+      await tx.query("DELETE FROM room_files WHERE room_id=$1 AND status='uploading'", [id]);
+      return { fingerprint: newFingerprint, epoch: key.epoch + 1 };
+    });
+    res.json(result);
   });
   router.post("/rooms/:id/files/key", async (req, res) => {
     const id = roomId.parse(req.params.id),
@@ -223,12 +302,6 @@ export function roomFilesRoutes(db: Database) {
           [key] = await tx.query<{
             fingerprint: string;
           }>("SELECT fingerprint FROM room_file_keys WHERE room_id=$1", [rid]);
-        requireCondition(
-          key?.fingerprint === v.keyFingerprint,
-          409,
-          "KEY_MISMATCH",
-          "This file uses a different room key.",
-        );
         const [old] = await tx.query<{
           id: string;
           room_id: string;
@@ -237,8 +310,9 @@ export function roomFilesRoutes(db: Database) {
           chunk_count: number;
           encrypted_bytes: string;
           status: string;
+          key_fingerprint: string;
         }>(
-          "SELECT id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes::text,status FROM room_files WHERE id=$1 FOR UPDATE",
+          "SELECT id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes::text,status,key_fingerprint FROM room_files WHERE id=$1 FOR UPDATE",
           [v.id],
         );
         if (old) {
@@ -252,6 +326,7 @@ export function roomFilesRoutes(db: Database) {
             "UPLOAD_ID_CONFLICT",
             "This file reference is already in use.",
           );
+          requireCondition(old.key_fingerprint === v.keyFingerprint && (old.status === "complete" || key?.fingerprint === v.keyFingerprint), 409, "KEY_MISMATCH", "This file uses a different room key.");
           const chunks = await tx.query<{
             chunk_index: number;
           }>(
@@ -279,6 +354,7 @@ export function roomFilesRoutes(db: Database) {
           }
           return result;
         }
+        requireCondition(key?.fingerprint === v.keyFingerprint, 409, "KEY_MISMATCH", "This file uses a different room key.");
         await tx.query(
           "DELETE FROM room_files WHERE room_id=$1 AND uploader_id=$2 AND status='uploading' AND created_at < clock_timestamp()-interval '24 hours'",
           [rid, who.uploader],
@@ -318,8 +394,8 @@ export function roomFilesRoutes(db: Database) {
         const inserted = await tx.query<{
           id: string;
         }>(
-          "INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING RETURNING id",
-          [v.id, rid, who.uploader, desc, v.chunkCount, v.encryptedBytes],
+          "INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes,key_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING RETURNING id",
+          [v.id, rid, who.uploader, desc, v.chunkCount, v.encryptedBytes, v.keyFingerprint],
         );
         requireCondition(
           inserted.length === 1,
@@ -570,6 +646,7 @@ export function roomFilesRoutes(db: Database) {
     type FileRow = {
       id: string;
       descriptor: Buffer;
+      key_fingerprint: string;
       chunk_count: number;
       encrypted_bytes: string;
       manifest_sha256: string;
@@ -579,7 +656,7 @@ export function roomFilesRoutes(db: Database) {
       can_delete: boolean;
     };
     const rows = await db.query<FileRow>(
-      `SELECT f.id,f.descriptor,f.chunk_count,f.encrypted_bytes::text,
+      `SELECT f.id,f.descriptor,f.chunk_count,f.encrypted_bytes::text,f.key_fingerprint,
     f.manifest_sha256,f.created_at,
     to_char(f.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor,
     jsonb_build_object('id',f.id,'acceptedAt',f.completed_at,'encryptedBytes',f.encrypted_bytes,'manifestSha256',f.manifest_sha256) receipt,
@@ -598,6 +675,7 @@ export function roomFilesRoutes(db: Database) {
       activeIds: activeFiles.map((file) => file.id),
       files: page.map((x) => ({
         id: x.id,
+        keyFingerprint: x.key_fingerprint,
         descriptor: Buffer.from(x.descriptor).toString("base64"),
         chunkCount: x.chunk_count,
         encryptedBytes: Number(x.encrypted_bytes),

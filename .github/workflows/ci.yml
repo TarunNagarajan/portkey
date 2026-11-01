@@ -55,3 +55,6 @@ jobs:
       - run: npm run sdk:example:acceptance
         env:
           PORTKEY_SDK_EXAMPLE_DATABASE_URL: postgres://portkey_test:portkey_test@127.0.0.1:5432/portkey_test
+      - run: npm run test:e2e:custom-proof
+        env:
+          PORTKEY_SDK_EXAMPLE_DATABASE_URL: postgres://portkey_test:portkey_test@127.0.0.1:5432/portkey_test

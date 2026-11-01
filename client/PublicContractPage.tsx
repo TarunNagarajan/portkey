@@ -9,7 +9,8 @@ interface PublicContract {
   groups: Array<{ id: string; name: string }>;
   digest: string;
   adapter: string;
-  proofDepth: number;
+  proofDepth: number | null;
+  adapterConfig: { fingerprint: string; nPublic: number; publicSignalNames: string[] } | null;
   available: boolean;
   publishedAt: string;
   portkeyOrigin: string;
@@ -78,20 +79,40 @@ export function PublicContractPage({
           ? "Available for new proof requests"
           : "Unavailable for new proof requests"}
       </p>
-      <h2>Eligibility rule</h2>
-      <p>
-        A valid Portkey Semaphore membership proof for any one of these groups
-        satisfies this contract:
-      </p>
-      <ul>
-        {contract.groups.map((group) => (
-          <li key={group.id}>{group.name}</li>
-        ))}
-      </ul>
+      <h2>Proof rule</h2>
+      {contract.adapter === "semaphore-membership-v1" ? (
+        <>
+          <p>
+            A valid Portkey Semaphore membership proof for any one of these
+            groups satisfies this contract:
+          </p>
+          <ul>
+            {contract.groups.map((group) => <li key={group.id}>{group.name}</li>)}
+          </ul>
+        </>
+      ) : (
+        <>
+          <p>
+            The issuer supplies the circuit and decides what its eligibility
+            result means. Portkey verifies Groth16 proofs against the pinned
+            verification key and does not run a witness or circuit.
+          </p>
+          {contract.adapterConfig && (
+            <>
+              <p>
+                Verification key fingerprint: <code>{contract.adapterConfig.fingerprint}</code>
+              </p>
+              <p>
+                Declared public signals: {contract.adapterConfig.publicSignalNames.join(", ")}
+              </p>
+            </>
+          )}
+        </>
+      )}
       <dl>
         <dt>Proof adapter</dt>
         <dd>
-          {contract.adapter}, depth {contract.proofDepth}
+          {contract.adapter}{contract.proofDepth === null ? "" : `, depth ${contract.proofDepth}`}
         </dd>
         <dt>Version digest</dt>
         <dd>
@@ -110,9 +131,7 @@ export function PublicContractPage({
         Download JSON manifest
       </a>
       <p className="muted">
-        The issuer label is self-described. Cryptographic verification proves
-        group membership according to this version; it does not establish who
-        controls or validates the issuer’s records.
+        Issuer labels and custom eligibility rules are self-described. A valid proof does not establish who controls the issuer or independently validate the issuer’s chosen circuit.
       </p>
     </article>
   );

@@ -64,12 +64,12 @@ test("room file key is write-once and private submissions stay behind their exis
     fingerprint = "a".repeat(64);
   assert.deepEqual(
     (await owner.get(`/rooms/${room.id}/files/key`).expect(200)).body,
-    { fingerprint: null },
+    { fingerprint: null, epoch: 0, historyEnvelope: null },
   );
   await owner.post(`/rooms/${room.id}/files/key`, { fingerprint }).expect(201);
   assert.deepEqual(
     (await owner.get(`/rooms/${room.id}/files/key`).expect(200)).body,
-    { fingerprint },
+    { fingerprint, epoch: 1, historyEnvelope: null },
   );
   await owner
     .post(`/rooms/${room.id}/files/key`, { fingerprint: "b".repeat(64) })
@@ -81,6 +81,45 @@ test("room file key is write-once and private submissions stay behind their exis
       .submissions,
     [],
   );
+});
+
+test('owner rotation is compare-and-swap, idempotent, and removes pending uploads only', async () => {
+  const owner = await client();
+  const room = await makeRoom(owner);
+  await openRoom(owner, room.id);
+  const first = '1'.repeat(64), second = '2'.repeat(64), third = '3'.repeat(64);
+  await owner.post(`/rooms/${room.id}/files/key`, { fingerprint: first }).expect(201);
+  const pending = randomUUID();
+  await owner.post(`/rooms/${room.id}/files`, {
+    id: pending, keyFingerprint: first,
+    descriptor: Buffer.from('pending metadata').toString('base64'),
+    chunkCount: 1, encryptedBytes: 16,
+  }).expect(201);
+  const envelope = Buffer.alloc(28, 7).toString('base64');
+  const rotate = { expectedFingerprint: first, newFingerprint: second, historyEnvelope: envelope };
+  await owner.post(`/rooms/${room.id}/files/key/rotate`, rotate).expect(200).expect(({ body }) => {
+    assert.deepEqual(body, { fingerprint: second, epoch: 2 });
+  });
+  await owner.post(`/rooms/${room.id}/files/key/rotate`, rotate).expect(200);
+  await owner.post(`/rooms/${room.id}/files/key/rotate`, {
+    expectedFingerprint: first, newFingerprint: third, historyEnvelope: Buffer.alloc(28, 8).toString('base64'),
+  }).expect(409);
+  await owner.put(`/rooms/${room.id}/files/${pending}/chunks/0`, Buffer.alloc(16)).expect(404);
+  assert.deepEqual((await owner.get(`/rooms/${room.id}/files/key`).expect(200)).body, {
+    fingerprint: second, epoch: 2, historyEnvelope: envelope,
+  });
+});
+
+test('only the room owner can rotate and rotation requires a same-origin CSRF token', async () => {
+  const owner = await client();
+  const room = await makeRoom(owner);
+  await openRoom(owner, room.id);
+  const first = '4'.repeat(64), second = '5'.repeat(64);
+  await owner.post(`/rooms/${room.id}/files/key`, { fingerprint: first }).expect(201);
+  const stranger = await client();
+  const payload = { expectedFingerprint: first, newFingerprint: second, historyEnvelope: Buffer.alloc(28, 9).toString('base64') };
+  await stranger.post(`/rooms/${room.id}/files/key/rotate`, payload).expect(403);
+  await owner.agent.post(`/api/rooms/${room.id}/files/key/rotate`).set('Origin', origin).send(payload).expect(403);
 });
 
 test("an unapproved session cannot read or register the shared file key", async () => {
@@ -449,15 +488,15 @@ test("retention purges shared files with expired-room cleanup and reclaims stale
   const oldFile = randomUUID();
   await db.query(
     `INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes,
-      manifest_sha256,status,completed_at,created_at)
-     VALUES($1,$2,$3,$4,1,16,$5,'complete',clock_timestamp(),clock_timestamp()-interval '2 days')`,
-    [oldFile, room.id, session.id, Buffer.from([1]), "a".repeat(64)],
+      manifest_sha256,status,completed_at,created_at,key_fingerprint)
+     VALUES($1,$2,$3,$4,1,16,$5,'complete',clock_timestamp(),clock_timestamp()-interval '2 days',$6)`,
+    [oldFile, room.id, session.id, Buffer.from([1]), "a".repeat(64), "a".repeat(64)],
   );
   const staleFile = randomUUID();
   await db.query(
-    `INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes,created_at)
-     VALUES($1,$2,$3,$4,1,16,clock_timestamp()-interval '25 hours')`,
-    [staleFile, activeRoom.id, session.id, Buffer.from([2])],
+    `INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes,created_at,key_fingerprint)
+     VALUES($1,$2,$3,$4,1,16,clock_timestamp()-interval '25 hours',$5)`,
+    [staleFile, activeRoom.id, session.id, Buffer.from([2]), "b".repeat(64)],
   );
   await db.query(
     `UPDATE rooms SET created_at=clock_timestamp()-interval '2 seconds',

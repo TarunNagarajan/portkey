@@ -8,6 +8,7 @@ import supertest from 'supertest';
 import { createApp } from '../server/app.js';
 import { openDatabase } from '../server/database.js';
 import { migrate } from '../server/migrations.js';
+import { publicJwks, rotateSigningKey, signingKey } from '../server/platformCrypto.js';
 
 const enabled = process.env.PORTKEY_RUN_POSTGRES_TESTS === '1';
 test('PostgreSQL adapter applies real migrations and preserves transaction guarantees', { skip: !enabled }, async () => {
@@ -32,6 +33,55 @@ test('PostgreSQL adapter applies real migrations and preserves transaction guara
     await Promise.all([migrate(database), migrate(database)]);
     const applied = await database.query<{ count: number }>('SELECT count(*)::int AS count FROM schema_migrations');
     assert.ok(applied[0].count > 0, 'Expected the repository SQL migrations to be recorded.');
+    const latestMigrations = await database.query<{ name: string }>(
+      "SELECT name FROM schema_migrations WHERE name = ANY($1::text[]) ORDER BY name",
+      [[
+        '013_room_key_rotation.sql',
+        '014_signing_key_rotation.sql',
+        '015_custom_proof_adapters.sql',
+      ]],
+    );
+    assert.deepEqual(latestMigrations.map(({ name }) => name), [
+      '013_room_key_rotation.sql',
+      '014_signing_key_rotation.sql',
+      '015_custom_proof_adapters.sql',
+    ]);
+
+    const initializedKeys = await Promise.all(
+      Array.from({ length: 6 }, () => signingKey(database!)),
+    );
+    assert.equal(new Set(initializedKeys.map(({ kid }) => kid)).size, 1);
+    const [initialActive] = await database.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM platform_signing_keyring WHERE active=TRUE',
+    );
+    assert.equal(initialActive.count, 1);
+
+    await database.query(
+      "UPDATE platform_signing_keyring SET created_at=clock_timestamp()-interval '61 seconds' WHERE active=TRUE",
+    );
+    const rotationResults = await Promise.allSettled([
+      rotateSigningKey(database),
+      rotateSigningKey(database),
+    ]);
+    const successfulRotations = rotationResults.filter(
+      (result): result is PromiseFulfilledResult<string> => result.status === 'fulfilled',
+    );
+    const rejectedRotations = rotationResults.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    assert.equal(successfulRotations.length, 1);
+    assert.equal(rejectedRotations.length, 1);
+    assert.match(String(rejectedRotations[0].reason), /rotated recently/);
+    const [activeSigningKey] = await database.query<{ kid: string; count: number }>(
+      'SELECT kid,count(*) OVER()::int AS count FROM platform_signing_keyring WHERE active=TRUE',
+    );
+    assert.equal(activeSigningKey.count, 1);
+    assert.equal(activeSigningKey.kid, successfulRotations[0].value);
+    const [retiredSigningKey] = await database.query<{ private_pkcs8: Buffer | null }>(
+      'SELECT private_pkcs8 FROM platform_signing_keyring WHERE active=FALSE ORDER BY created_at DESC LIMIT 1',
+    );
+    assert.equal(retiredSigningKey.private_pkcs8, null);
+    assert.equal((await publicJwks(database)).keys.length, 2);
 
     await assert.rejects(database.transaction(async tx => {
       await tx.exec('CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY)');
@@ -138,11 +188,68 @@ test('PostgreSQL adapter applies real migrations and preserves transaction guara
     const roomId = randomUUID();
     await legacyDatabase.query('INSERT INTO sessions(id, token_hash, expires_at) VALUES($1, $2, clock_timestamp() + interval \'1 day\')', [ownerId, randomBytes(32).toString('hex')]);
     await legacyDatabase.query('INSERT INTO rooms(id, owner_id, join_code, title, expires_at) VALUES($1, $2, $3, $4, clock_timestamp() + interval \'1 hour\')', [roomId, ownerId, randomBytes(12).toString('base64url'), 'Preserved legacy room']);
+    const roomFileMigrations = (await readdir(migrationDirectory))
+      .filter(name => /^01[12]_.*\.sql$/.test(name))
+      .sort();
+    for (const name of roomFileMigrations) {
+      const sql = (await readFile(`${migrationDirectory}/${name}`, 'utf8')).replace(/\r\n/g, '\n');
+      await legacyDatabase.exec(sql);
+      await legacyDatabase.query(
+        'INSERT INTO schema_migrations(name,checksum) VALUES($1,$2)',
+        [name, createHash('sha256').update(sql).digest('hex')],
+      );
+    }
+    const legacyFingerprint = 'd'.repeat(64);
+    const legacyFileId = randomUUID();
+    const legacyDescriptor = Buffer.from('encrypted descriptor from migration 012');
+    const legacyCiphertext = Buffer.alloc(16, 0x55);
+    await legacyDatabase.query(
+      'INSERT INTO room_file_keys(room_id,fingerprint) VALUES($1,$2)',
+      [roomId, legacyFingerprint],
+    );
+    await legacyDatabase.query(
+      'INSERT INTO room_files(id,room_id,uploader_id,descriptor,chunk_count,encrypted_bytes) VALUES($1,$2,$3,$4,1,16)',
+      [legacyFileId, roomId, ownerId, legacyDescriptor],
+    );
+    await legacyDatabase.query(
+      'INSERT INTO room_file_chunks(file_id,chunk_index,ciphertext,sha256) VALUES($1,0,$2,$3)',
+      [legacyFileId, legacyCiphertext, createHash('sha256').update(legacyCiphertext).digest('hex')],
+    );
     await Promise.all([migrate(legacyDatabase), migrate(legacyDatabase)]);
     const [preserved] = await legacyDatabase.query<{ title: string }>('SELECT title FROM rooms WHERE id=$1', [roomId]);
     assert.equal(preserved.title, 'Preserved legacy room', 'Concurrent forward migrations must preserve existing room data.');
-    const [newMigration] = await legacyDatabase.query<{ count: number }>("SELECT count(*)::int AS count FROM schema_migrations WHERE name='012_room_files.sql'");
-    assert.equal(newMigration.count, 1, 'The room-files migration must be recorded once.');
+    const latestLegacyMigrations = await legacyDatabase.query<{ name: string }>(
+      "SELECT name FROM schema_migrations WHERE name = ANY($1::text[]) ORDER BY name",
+      [[
+        '013_room_key_rotation.sql',
+        '014_signing_key_rotation.sql',
+        '015_custom_proof_adapters.sql',
+      ]],
+    );
+    assert.deepEqual(latestLegacyMigrations.map(({ name }) => name), [
+      '013_room_key_rotation.sql',
+      '014_signing_key_rotation.sql',
+      '015_custom_proof_adapters.sql',
+    ], 'All forward migrations must be recorded exactly once.');
+    const [backfilled] = await legacyDatabase.query<{
+      fingerprint: string;
+      epoch: number;
+      history_envelope: string | null;
+      key_fingerprint: string;
+      descriptor: Buffer;
+    }>(`SELECT k.fingerprint,k.epoch,k.history_envelope,f.key_fingerprint,f.descriptor
+        FROM room_file_keys k JOIN room_files f ON f.room_id=k.room_id WHERE f.id=$1`, [legacyFileId]);
+    const [preservedChunk] = await legacyDatabase.query<{ ciphertext: Buffer; sha256: string }>(
+      'SELECT ciphertext,sha256 FROM room_file_chunks WHERE file_id=$1 AND chunk_index=0',
+      [legacyFileId],
+    );
+    assert.equal(backfilled.fingerprint, legacyFingerprint);
+    assert.equal(backfilled.epoch, 1);
+    assert.equal(backfilled.history_envelope, null);
+    assert.equal(backfilled.key_fingerprint, legacyFingerprint);
+    assert.deepEqual(Buffer.from(backfilled.descriptor), legacyDescriptor);
+    assert.deepEqual(Buffer.from(preservedChunk.ciphertext), legacyCiphertext);
+    assert.equal(preservedChunk.sha256, createHash('sha256').update(legacyCiphertext).digest('hex'));
     const [preservedMigrations] = await legacyDatabase.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM schema_migrations WHERE name=ANY($1::text[])',
       [oldMigrations],

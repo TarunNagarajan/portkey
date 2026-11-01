@@ -37,6 +37,9 @@ export function platformPublicRoutes(database: Database, origin: string) {
         version: number;
         description: string;
         group_ids: string[];
+        adapter: string;
+        proof_depth: number | null;
+        adapter_config: unknown;
         digest: string;
         retired_at: Date | null;
         published_at: Date;
@@ -45,7 +48,7 @@ export function platformPublicRoutes(database: Database, origin: string) {
         available: boolean;
         names: string[];
       }>(
-        `SELECT v.contract_id,v.version,v.description,v.group_ids,v.digest,v.retired_at,v.published_at,c.issuer_label,c.name AS contract_name,
+        `SELECT v.contract_id,v.version,v.description,v.group_ids,v.digest,v.adapter,v.proof_depth,v.adapter_config,v.retired_at,v.published_at,c.issuer_label,c.name AS contract_name,
        s.available AS available,ARRAY(SELECT g.name FROM credential_groups g WHERE g.id=ANY(v.group_ids) ORDER BY g.id) AS names
        FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id WHERE v.contract_id=$1 AND v.version=$2`,
         [contractId, version],
@@ -67,8 +70,9 @@ export function platformPublicRoutes(database: Database, origin: string) {
           name: row.names[index] ?? "Unavailable group",
         })),
         digest: row.digest,
-        adapter: "semaphore-membership-v1",
-        proofDepth: 10,
+        adapter: row.adapter,
+        proofDepth: row.proof_depth,
+        adapterConfig: row.adapter_config,
         available: row.available && !row.retired_at,
         publishedAt: row.published_at.toISOString(),
         portkeyOrigin: origin,
@@ -283,7 +287,6 @@ export function platformAppApiRoutes(database: Database, origin: string) {
         "EXCHANGE_FAILED",
         "The return code could not be exchanged. Start a new request.",
       );
-      const key = await signingKey(database);
       const receipt = await database.transaction(async (tx) => {
         const authority = await lockRequestAuthority(
           tx,
@@ -309,6 +312,7 @@ export function platformAppApiRoutes(database: Database, origin: string) {
           "EXCHANGE_FAILED",
           "The return code could not be exchanged. Start a new request.",
         );
+        const key = await signingKey(tx);
         const [clock] = await tx.query<{ iat: number }>(
           "SELECT floor(extract(epoch FROM clock_timestamp()))::int AS iat",
         );

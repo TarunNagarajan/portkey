@@ -1,6 +1,6 @@
 # Portkey
 
-Portkey lets organizers issue membership credentials that participants can use in private rooms and separate applications. Participants save a credential once, then prove that they qualify when an application asks. Rooms also support approval, single-use passes, and browser-encrypted file submissions. The frontend uses React and TypeScript; the API uses Express and PostgreSQL.
+Portkey lets organizers issue membership credentials for private rooms and publish eligibility contracts for separate applications. Participants can save a credential for Semaphore membership proofs or import a locally generated proof for an issuer-published Groth16 BN254 verifier key. Rooms also support approval, single-use passes, and browser-encrypted file submissions. The frontend uses React and TypeScript; the API uses Express and PostgreSQL.
 
 ## Run locally
 
@@ -24,7 +24,7 @@ Install the official `cloudflared` executable separately, then run `npm run phon
 
 ## Cross-application verification
 
-Portkey supports issuer-published Semaphore membership contracts, application domain verification, explicit trust pins, and PKCE-bound signed eligibility receipts for separate relying applications. The supported adapter, backend SDK example, privacy boundaries, limits, and two-application local demo are documented in [the verification platform guide](docs/verification-platform.md). Run the complete demo with `npm run platform:demo`.
+Portkey supports issuer-published Semaphore membership contracts, application domain verification, explicit trust pins, and PKCE-bound signed eligibility receipts for separate relying applications. The supported adapters, custom proof trust boundaries, backend SDK example, and limits are documented in [the verification platform guide](docs/verification-platform.md) and [proof adapter guide](docs/proof-adapters.md). The operator procedure for receipt signing keys is in [signing key rotation](docs/signing-key-rotation.md). Run the complete demo with `npm run platform:demo`.
 
 Follow [the demonstration walkthrough](docs/demo.md) to use one credential in both applications and a private file room. Developers can start with [the standalone SDK integration](docs/sdk-integration.md). Read [the architecture and trust boundaries](docs/architecture.md) for the security model. Deployment, database checks and backup responsibilities are described in [operations](docs/operations.md).
 
@@ -62,7 +62,7 @@ Enable **Shared files** in a room, then distribute its updated invitation. An ad
 
 The browser creates a separate 256-bit room key and includes it only in the invitation fragment. The server stores its fingerprint, encrypted file metadata and encrypted chunks; the key and plaintext filenames are not sent to the server. The browser caches immutable encrypted chunks for retry and verifies the encrypted descriptor, chunk authentication, file size and complete manifest before saving a download. Files can be up to 250 MiB; browsers without private temporary file storage support downloads up to 50 MiB. Shared files and private submissions consume one combined 5 GiB encrypted-storage allowance. Shared uploads reserve their full ciphertext size before chunks are accepted.
 
-Keep the complete room invitation private and save it for recovery. Opening that invitation restores the shared-file key in an admitted browser; organizer account recovery alone does not restore it. The key cannot be replaced within an existing room. Use a new room for a different key or audience. Removing admission, closing a room and expiry block future server downloads; they cannot retract keys or files someone already received. Only a file's publisher or the organizer can delete a shared file. Room-wide deletion propagates to the file list. Shared files follow the room's automatic expiry cleanup setting, alongside private submissions; interrupted uploads are removed after 24 hours.
+Keep the complete room invitation private and save it for recovery. Opening that invitation restores the shared-file key in an admitted browser; organizer account recovery alone does not restore it. The organizer can rotate the shared-file key while the room is open and then send an updated invitation to participants who should retain access. Updated invitations unlock both earlier completed files and new files; an old invitation does not provide the replacement key, though matching keys already cached in that browser still work. Rotation removes unfinished server uploads and leaves completed ciphertext intact. A room supports up to 32 key epochs. See [shared-file key rotation](docs/shared-file-key-rotation.md) for recovery, stale browser plans, and participant removal details. Removing admission, closing a room and expiry block future server downloads; they cannot retract keys or files someone already received. Only a file's publisher or the organizer can delete a shared file. Room-wide deletion propagates to the file list. Shared files follow the room's automatic expiry cleanup setting, alongside private submissions; interrupted uploads are removed after 24 hours.
 
 ## Encrypted submission inbox
 

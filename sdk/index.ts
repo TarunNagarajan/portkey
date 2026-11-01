@@ -245,19 +245,48 @@ export function createPortkeyClient(config: PortkeyClientConfig) {
 }
 
 const jwksCache = new Map<string, { expires: number; keys: unknown[] }>();
-async function pinnedJwks(origin: string) {
+const jwksInflight = new Map<string, Promise<unknown[]>>();
+const lastForcedJwksRefresh = new Map<string, number>();
+const forcedJwksRefreshInterval = 1_000;
+
+async function fetchJwks(origin: string) {
+  const current = jwksInflight.get(origin);
+  if (current) return current;
+  const pending = (async () => {
+    const { response, value } = await boundedJson<{ keys?: unknown }>(
+      `${origin}/v1/.well-known/jwks.json`,
+      { cache: "no-store", redirect: "error" },
+      8_192,
+    );
+    if (!response.ok) throw new Error("Portkey signing keys are unavailable.");
+    if (!value || !Array.isArray(value.keys) || value.keys.length > 8)
+      throw new Error("Portkey signing keys are invalid.");
+    jwksCache.set(origin, { expires: Date.now() + 60_000, keys: value.keys });
+    return value.keys;
+  })();
+  jwksInflight.set(origin, pending);
+  try {
+    return await pending;
+  } finally {
+    if (jwksInflight.get(origin) === pending) jwksInflight.delete(origin);
+  }
+}
+
+async function pinnedJwks(origin: string, refresh = false) {
   const cached = jwksCache.get(origin);
-  if (cached && cached.expires > Date.now()) return cached.keys;
-  const { response, value } = await boundedJson<{ keys?: unknown }>(
-    `${origin}/v1/.well-known/jwks.json`,
-    { cache: "no-store", redirect: "error" },
-    8_192,
-  );
-  if (!response.ok) throw new Error("Portkey signing keys are unavailable.");
-  if (!value || !Array.isArray(value.keys) || value.keys.length > 8)
-    throw new Error("Portkey signing keys are invalid.");
-  jwksCache.set(origin, { expires: Date.now() + 60_000, keys: value.keys });
-  return value.keys;
+  if (!refresh && cached && cached.expires > Date.now()) return cached.keys;
+  if (refresh) {
+    const pending = jwksInflight.get(origin);
+    if (pending) return pending;
+    const now = Date.now();
+    const last = lastForcedJwksRefresh.get(origin);
+    if (last !== undefined && now - last < forcedJwksRefreshInterval) {
+      if (cached) return cached.keys;
+      throw new Error("Portkey signing keys are unavailable.");
+    }
+    lastForcedJwksRefresh.set(origin, now);
+  }
+  return fetchJwks(origin);
 }
 
 export async function verifyReceipt(
@@ -299,14 +328,16 @@ export async function verifyReceipt(
     Object.keys(header).sort().join(",") !== "alg,kid,typ"
   )
     throw new Error("Verification receipt algorithm is not accepted.");
-  const keys = await pinnedJwks(origin);
-  const jwk = keys.find((value): value is Record<string, unknown> =>
-    Boolean(
-      value &&
-        typeof value === "object" &&
-        (value as Record<string, unknown>).kid === header.kid,
-    ),
+  let keys = await pinnedJwks(origin);
+  let jwk = keys.find((value): value is Record<string, unknown> =>
+    Boolean(value && typeof value === "object" && (value as Record<string, unknown>).kid === header.kid),
   );
+  if (!jwk) {
+    keys = await pinnedJwks(origin, true);
+    jwk = keys.find((value): value is Record<string, unknown> =>
+      Boolean(value && typeof value === "object" && (value as Record<string, unknown>).kid === header.kid),
+    );
+  }
   if (
     !jwk ||
     jwk.kty !== "OKP" ||

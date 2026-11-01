@@ -67,6 +67,9 @@ export function PlatformPage() {
   const [issuerLabel, setIssuerLabel] = useState("");
   const [description, setDescription] = useState("");
   const [selectedGroups, setSelectedGroups] = useState<string[]>([]);
+  const [contractAdapter, setContractAdapter] = useState("semaphore-membership-v1");
+  const [verificationKeyText, setVerificationKeyText] = useState("");
+  const [signalNameText, setSignalNameText] = useState("challenge, eligibility result, nullifier");
   const [appName, setAppName] = useState("");
   const [appOrigin, setAppOrigin] = useState("");
   const [redirectPath, setRedirectPath] = useState("/portkey/callback");
@@ -127,12 +130,30 @@ export function PlatformPage() {
 
   async function createContract(event: FormEvent) {
     event.preventDefault();
+    let verificationKey: unknown;
+    if (contractAdapter === "groth16-bn254-v1") {
+      try {
+        verificationKey = JSON.parse(verificationKeyText);
+      } catch {
+        setError("Paste a valid verification key JSON document.");
+        return;
+      }
+    }
     await run("contract", async () => {
       await api("/platform/contracts", "POST", {
         name: contractName,
         issuerLabel,
         description,
-        groupIds: selectedGroups,
+        adapter: contractAdapter,
+        ...(contractAdapter === "groth16-bn254-v1"
+          ? {
+              groupIds: [],
+              verificationKey,
+              publicSignalNames: signalNameText
+                .split(",")
+                .map((item) => item.trim()),
+            }
+          : { groupIds: selectedGroups }),
       });
       setContractName("");
       setDescription("");
@@ -147,12 +168,34 @@ export function PlatformPage() {
     const form = new FormData(event.currentTarget as HTMLFormElement);
     const nextDescription = String(form.get("description") ?? "");
     const nextGroups = form.getAll("groupId").map(String);
+    const adapter = String(form.get("adapter") || "semaphore-membership-v1");
+    let verificationKey: unknown;
+    if (adapter === "groth16-bn254-v1") {
+      try {
+        verificationKey = JSON.parse(String(form.get("verificationKey") || ""));
+      } catch {
+        setError("Paste a valid verification key JSON document.");
+        return false;
+      }
+    }
     let published = false;
     await run(`version:${contract.id}`, async () => {
       const result = await api<{ version: number }>(
         "/platform/contracts/" + contract.id + "/versions",
         "POST",
-        { description: nextDescription, groupIds: nextGroups },
+        {
+          description: nextDescription,
+          adapter,
+          ...(adapter === "groth16-bn254-v1"
+            ? {
+                groupIds: [],
+                verificationKey,
+                publicSignalNames: String(form.get("publicSignalNames") || "")
+                  .split(",")
+                  .map((item) => item.trim()),
+              }
+            : { groupIds: nextGroups }),
+        },
       );
       published = true;
       setNotice(`Contract version ${result.version} is published.`);
@@ -402,7 +445,41 @@ export function PlatformPage() {
                 onChange={(event) => setDescription(event.target.value)}
               />
             </label>
-            <fieldset>
+            <label>
+              Proof adapter
+              <select value={contractAdapter} onChange={(event) => setContractAdapter(event.target.value)}>
+                <option value="semaphore-membership-v1">Semaphore membership</option>
+                <option value="groth16-bn254-v1">Custom Groth16 BN254 verifier key</option>
+              </select>
+            </label>
+            {contractAdapter === "groth16-bn254-v1" ? (
+              <>
+                <p>
+                  Upload the verification key for a circuit you trust. Required
+                  public signals are challenge, eligibility result (exactly 1),
+                  and nonzero nullifier at indices 0–2. Additional signals are
+                  disclosed to you before approval. Portkey verifies the proof;
+                  the issuer defines what the circuit means. Portkey does not
+                  run a witness or circuit.
+                </p>
+                <label>
+                  Verification key JSON
+                  <textarea
+                    required
+                    value={verificationKeyText}
+                    onChange={(event) => setVerificationKeyText(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Public signal names, in circuit order
+                  <input
+                    required
+                    value={signalNameText}
+                    onChange={(event) => setSignalNameText(event.target.value)}
+                  />
+                </label>
+              </>
+            ) : <fieldset>
               <legend>Accepted credential groups</legend>
               {groups.length === 0 ? (
                 <p>Create a credential group first.</p>
@@ -424,12 +501,13 @@ export function PlatformPage() {
                   </label>
                 ))
               )}
-            </fieldset>
+            </fieldset>}
             <button
               disabled={
                 busy !== "" ||
-                selectedGroups.length < 1 ||
-                selectedGroups.length > 4
+                (contractAdapter === "semaphore-membership-v1" &&
+                  (selectedGroups.length < 1 || selectedGroups.length > 4)) ||
+                (contractAdapter === "groth16-bn254-v1" && !verificationKeyText)
               }
             >
               {busy === "contract" ? "Publishing…" : "Publish version 1"}
@@ -782,6 +860,28 @@ function ContractVersions({
             Eligibility statement
             <textarea name="description" maxLength={500} required />
           </label>
+          <label>
+            Proof adapter
+            <select name="adapter" defaultValue="semaphore-membership-v1">
+              <option value="semaphore-membership-v1">Semaphore membership</option>
+              <option value="groth16-bn254-v1">Custom Groth16 BN254</option>
+            </select>
+          </label>
+          <label>
+            Verification key JSON for custom Groth16
+            <textarea name="verificationKey" />
+          </label>
+          <label>
+            Public signal names in circuit order
+            <input
+              name="publicSignalNames"
+              defaultValue="challenge, eligibility result, nullifier"
+            />
+          </label>
+          <p>
+            Custom Groth16 rules are chosen by the issuer; Portkey verifies
+            proofs but does not run a circuit or witness.
+          </p>
           <fieldset>
             <legend>Accepted groups</legend>
             {groups.map((group) => (

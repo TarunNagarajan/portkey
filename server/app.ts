@@ -42,6 +42,15 @@ export function createApp(database: Database, options: AppOptions) {
     }),
   );
   app.set("trust proxy", options.trustProxyHops ?? 0);
+  app.post(
+    ["/api/platform/contracts", "/api/platform/contracts/:id/versions"],
+    sessions.load,
+    sessions.authenticate,
+    sessions.checkOrigin,
+    sessions.checkCsrf,
+    express.json({ limit: "40kb" }),
+    (_request, _response, next) => next(),
+  );
   app.use(express.json({ limit: "8kb" }));
   app.use("/v1", platformPublicRoutes(database, options.origin));
   app.use("/v1", platformAppApiRoutes(database, options.origin));

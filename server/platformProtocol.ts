@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { type Request, type Response, type NextFunction } from "express";
 import { keccak256, toUtf8Bytes } from "ethers";
 import { z } from "zod";
+import type { Groth16AdapterConfig } from "../shared/platform.js";
 
 export const canonicalUuid = z.uuid().transform((value) => value.toLowerCase());
 import type { Database, Queries } from "./database.js";
 import { HttpError, requireCondition } from "./errors.js";
-import { semaphoreProofSchema } from "./semaphoreProof.js";
 
 export const hash = (value: string) =>
   createHash("sha256").update(value).digest();
@@ -35,7 +35,7 @@ export const proveInput = z
   .object({
     capability: token,
     challengeId: canonicalUuid,
-    proof: semaphoreProofSchema,
+    proof: z.unknown(),
   })
   .strict();
 export const returnInput = z.object({ capability: token }).strict();
@@ -136,6 +136,9 @@ export async function trustedContract(
     version: number;
     description: string;
     group_ids: string[];
+    adapter: string;
+    proof_depth: number | null;
+    adapter_config: Groth16AdapterConfig | null;
     digest: string;
     retired_at: Date | null;
     issuer_label: string;
@@ -143,7 +146,7 @@ export async function trustedContract(
     available: boolean;
     trust_revision: string;
   }>(
-    `SELECT v.contract_id AS id,v.version,v.description,v.group_ids,v.digest,v.retired_at,c.issuer_label,c.name AS contract_name,
+    `SELECT v.contract_id AS id,v.version,v.description,v.group_ids,v.digest,v.adapter,v.proof_depth,v.adapter_config,v.retired_at,c.issuer_label,c.name AS contract_name,
       s.available AS available,t.trust_revision
      FROM platform_app_trust t JOIN platform_contract_versions v ON v.contract_id=t.contract_id AND v.version=t.contract_version
      JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id
@@ -208,12 +211,15 @@ export async function lockRequestAuthority(
     retired: boolean;
     issuer_valid: boolean;
     digest: string;
+    adapter: string;
+    proof_depth: number | null;
+    adapter_config: Groth16AdapterConfig | null;
     group_ids: string[];
     description: string;
     contract_name: string;
     issuer_label: string;
   }>(
-    `SELECT v.retired_at IS NOT NULL AS retired,s.available AS issuer_valid,v.digest,v.group_ids,v.description,c.name AS contract_name,c.issuer_label
+    `SELECT v.retired_at IS NOT NULL AS retired,s.available AS issuer_valid,v.digest,v.group_ids,v.adapter,v.proof_depth,v.adapter_config,v.description,c.name AS contract_name,c.issuer_label
      FROM platform_contract_versions v JOIN platform_contracts c ON c.id=v.contract_id JOIN owner_authorities s ON s.id=c.owner_session_id
      WHERE v.contract_id=$1 AND v.version=$2 FOR UPDATE OF v`,
     [head.contract_id, head.contract_version],
