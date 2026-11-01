@@ -1,11 +1,29 @@
 import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { randomBytes } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
-const walletOrigin = "http://127.0.0.1:5300";
+const walletOrigin = "http://localhost:5300";
+const screenshotDirectory = resolve(
+  process.cwd(),
+  "test-results",
+  "verification-platform",
+);
 const relyingApps = [
   { origin: "http://northstar.localhost:5301", title: "Northstar Learning" },
   { origin: "http://fieldnote.localhost:5302", title: "Fieldnote Community" },
 ] as const;
+let ownedOrganizerContext: BrowserContext | null = null;
+let ownedExistingAccountContext: BrowserContext | null = null;
+test.afterEach(async () => {
+  await ownedOrganizerContext?.close();
+  ownedOrganizerContext = null;
+  await ownedExistingAccountContext?.close();
+  ownedExistingAccountContext = null;
+});
+test.beforeEach(async () => {
+  await mkdir(screenshotDirectory, { recursive: true });
+});
 async function checkApplication(
   page: Page,
   context: BrowserContext,
@@ -32,7 +50,7 @@ async function checkApplication(
     }));
     expect(pageWidths.content).toBeLessThanOrEqual(pageWidths.viewport);
     await page.screenshot({
-      path: "C:/Users/ultim/Documents/Codex/outputs/verification-platform/mobile-contract.png",
+      path: resolve(screenshotDirectory, "mobile-contract.png"),
       fullPage: true,
     });
   }
@@ -48,7 +66,7 @@ async function checkApplication(
   expect(await page.locator("iframe").count()).toBe(0);
   if (injectWrongState) {
     await page.screenshot({
-      path: "C:/Users/ultim/Documents/Codex/outputs/verification-platform/mobile-consent.png",
+      path: resolve(screenshotDirectory, "mobile-consent.png"),
       fullPage: true,
     });
   }
@@ -199,12 +217,168 @@ async function checkContractDraftPreservation(page: Page) {
     .click();
   await expect(page.getByText('"challenge"', { exact: false })).toBeVisible();
   await page.screenshot({
-    path: "C:/Users/ultim/Documents/Codex/outputs/verification-platform/mobile-portal.png",
+    path: resolve(screenshotDirectory, "mobile-portal.png"),
     fullPage: true,
   });
 }
 
-test("one enrollment unlocks two different RP backends through Portkey consent and strict built CSP", async ({
+async function setUpOrganizer(page: Page, context: BrowserContext) {
+  const capability = process.env.PORTKEY_PLATFORM_DEMO_BOOTSTRAP_TOKEN;
+  expect(capability).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+    },
+  });
+  await page.goto(`${walletOrigin}/account`);
+  await expect(page.getByRole("heading", { name: "Account" })).toBeVisible();
+  await page.getByLabel(/secure this browser’s current workspace/i).check();
+  await page.getByLabel("Passkey label").fill("Existing organizer account");
+  await page.getByRole("button", { name: "Create account with passkey" }).click();
+  await expect(page.getByText(/Your organizer account is ready/)).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.goto(`${walletOrigin}/credential-groups`);
+  await page.getByLabel("Group name").fill("Previous organizer workspace");
+  await page.getByRole("button", { name: "Create group" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Previous organizer workspace" }),
+  ).toBeVisible();
+  expect(
+    (await context.cookies(walletOrigin)).some(
+      (cookie) => cookie.name === "portkey_organizer",
+    ),
+  ).toBe(true);
+  ownedExistingAccountContext = await context.browser()!.newContext({
+    storageState: await context.storageState(),
+  });
+
+  const sessionResponse = await context.request.post(`${walletOrigin}/api/session`, {
+    headers: { Origin: walletOrigin },
+  });
+  expect(sessionResponse.ok()).toBeTruthy();
+  const session = (await sessionResponse.json()) as { csrfToken: string };
+  const foreignOrigin = await context.request.post(
+    `${walletOrigin}/platform-demo/claim`,
+    {
+      headers: {
+        Origin: "http://northstar.localhost:5301",
+        "X-CSRF-Token": session.csrfToken,
+      },
+      data: { capability },
+    },
+  );
+  expect(foreignOrigin.status()).toBe(403);
+  const noSessionContext = await context.browser()!.newContext();
+  try {
+    const missingSession = await noSessionContext.request.post(
+      `${walletOrigin}/platform-demo/claim`,
+      {
+        headers: {
+          Origin: walletOrigin,
+          "X-CSRF-Token": session.csrfToken,
+        },
+        data: { capability },
+      },
+    );
+    expect(missingSession.status()).toBe(403);
+  } finally {
+    await noSessionContext.close();
+  }
+
+  const claimResponsePromise = page.waitForResponse(
+    (response) => response.url() === `${walletOrigin}/platform-demo/claim`,
+  );
+  await page.goto(
+    `${walletOrigin}/platform-demo/organizer#setup=${capability}`,
+  );
+  const claimResponse = await claimResponsePromise;
+  expect(claimResponse.status()).toBe(204);
+  expect(
+    (await context.cookies(walletOrigin)).some(
+      (cookie) => cookie.name === "portkey_organizer",
+    ),
+  ).toBe(false);
+  await expect(page).toHaveURL(`${walletOrigin}/account`);
+  const claimedSessionResponse = await context.request.post(
+    `${walletOrigin}/api/session`,
+    { headers: { Origin: walletOrigin } },
+  );
+  expect(claimedSessionResponse.ok()).toBeTruthy();
+  const claimedSession = (await claimedSessionResponse.json()) as {
+    csrfToken: string;
+  };
+  const replay = await context.request.post(
+    `${walletOrigin}/platform-demo/claim`,
+    {
+      headers: {
+        Origin: walletOrigin,
+        "X-CSRF-Token": claimedSession.csrfToken,
+      },
+      data: { capability },
+    },
+  );
+  expect(replay.status()).toBe(410);
+
+  await expect(
+    page.getByText(/This browser has 0 rooms, 1 credential group, 1 contract/),
+  ).toBeVisible();
+  await page.getByLabel(/secure this browser’s current workspace/i).check();
+  await page.getByLabel("Passkey label").fill("Sample workspace organizer");
+  await page.getByRole("button", { name: "Create account with passkey" }).click();
+  await expect(page.getByText(/Your organizer account is ready/)).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.goto(`${walletOrigin}/credential-groups`);
+  await expect(
+    page.getByRole("heading", { name: "Credential groups" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Portkey demonstration members", { exact: true }),
+  ).toBeVisible();
+
+  const existingAccountPage = await ownedExistingAccountContext!.newPage();
+  await existingAccountPage.goto(`${walletOrigin}/credential-groups`);
+  await expect(
+    existingAccountPage.getByRole("heading", {
+      name: "Credential groups",
+    }),
+  ).toBeVisible();
+  await expect(
+    existingAccountPage.getByText("Previous organizer workspace", {
+      exact: true,
+    }),
+  ).toBeVisible();
+
+  await page.goto(`${walletOrigin}/#new-room`);
+  await page.getByLabel("Room title").fill("Portkey defining journey room");
+  await page.getByLabel("Admission").selectOption("proof");
+  await page.getByRole("button", { name: "Create draft" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Portkey defining journey room" }),
+  ).toBeVisible();
+  const reusable = page.getByRole("radio", { name: "Reusable credential groups" });
+  await reusable.check();
+  await page.getByLabel(/Portkey demonstration members/).check();
+  await page.getByRole("button", { name: "Save admission source" }).click();
+  await expect(page.getByText("Admission source saved.")).toBeVisible();
+  await page.getByRole("button", { name: "Enable encrypted inbox" }).click();
+  await expect(page.locator(".private-inbox code")).toHaveCount(1);
+  await page.getByRole("button", { name: "Open room" }).click();
+  await expect(page.getByRole("heading", { name: "Room access link" })).toBeVisible();
+  const roomUrl = await page.locator("a.join-link").getAttribute("href");
+  expect(roomUrl).toContain("#key=");
+  return { roomUrl: roomUrl!, cdp };
+}
+
+test("one passkey-owned group powers two RP backends, proof room admission and encrypted inbox", async ({
   page,
   context,
 }) => {
@@ -212,6 +386,7 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
   const externalTraffic: Array<{ url: string; body: string; cookie: string }> =
     [];
   const walletProofBodies: string[] = [];
+  const roomProofBodies: string[] = [];
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("request", (request) => {
@@ -224,8 +399,10 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
         body,
         cookie: headers.cookie ?? "",
       });
-    if (url.origin === walletOrigin && url.pathname.endsWith("/prove"))
-      walletProofBodies.push(body);
+    if (url.origin === walletOrigin && url.pathname.endsWith("/prove")) {
+      if (url.pathname.includes("/proof-requests/")) walletProofBodies.push(body);
+      if (url.pathname.startsWith("/api/join/")) roomProofBodies.push(body);
+    }
   });
 
   const readinessResponse = await page.request.get(
@@ -238,6 +415,17 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
   expect(readiness.applications).toEqual(
     relyingApps.map(({ origin, title }) => ({ name: title, origin })),
   );
+
+  ownedOrganizerContext = await context.browser()!.newContext();
+  await ownedOrganizerContext.addInitScript(() => {
+    Object.defineProperty(window, "showSaveFilePicker", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  const organizerPage = await ownedOrganizerContext.newPage();
+  organizerPage.on("pageerror", (error) => pageErrors.push(error.message));
+  const { roomUrl } = await setUpOrganizer(organizerPage, ownedOrganizerContext);
 
   const walletResponse = await page.goto(walletOrigin);
   expect(walletResponse?.headers()["content-security-policy"]).toContain(
@@ -298,6 +486,47 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
   await checkApplication(page, context, relyingApps[1], false);
   await checkContractDraftPreservation(page);
 
+  await page.goto(roomUrl);
+  await expect(
+    page.getByRole("heading", { name: "Prove credential eligibility" }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Prove membership and enter" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Portkey defining journey room" }),
+  ).toBeVisible({ timeout: 90_000 });
+  await expect(page.locator(".private-inbox")).toBeVisible();
+  const fileContents = "Portkey browser-encrypted defining journey proof.";
+  await page
+    .locator('.private-inbox input[type="file"]')
+    .setInputFiles({
+      name: "journey-note.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from(fileContents),
+    });
+  await page
+    .getByRole("button", { name: "Submit file privately" })
+    .click();
+  await expect(
+    page.getByText("Submission accepted at", { exact: false }),
+  ).toBeVisible({ timeout: 60_000 });
+
+  await organizerPage
+    .getByRole("button", { name: "Refresh inbox" })
+    .click();
+  const decryptButton = organizerPage.getByRole("button", {
+    name: "Decrypt and download",
+  });
+  await expect(decryptButton).toBeVisible({ timeout: 30_000 });
+  const [decryptedFile] = await Promise.all([
+    organizerPage.waitForEvent("download"),
+    decryptButton.click(),
+  ]);
+  const decryptedPath = await decryptedFile.path();
+  expect(decryptedPath).toBeTruthy();
+  expect(await readFile(decryptedPath!, "utf8")).toBe(fileContents);
+
   const emptyContext = await context.browser()!.newContext();
   const emptyWalletPage = await emptyContext.newPage();
   await emptyWalletPage.goto(relyingApps[0].origin);
@@ -340,6 +569,7 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
   }
 
   expect(walletProofBodies.length).toBe(2);
+  expect(roomProofBodies).toHaveLength(1);
   const proofNullifiers: string[] = [];
   for (const body of walletProofBodies) {
     const proofRequest = JSON.parse(body) as {
@@ -367,6 +597,25 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
     expect(proofRequest.proof).not.toHaveProperty("groupId");
     expect(proofRequest.proof).not.toHaveProperty("privateKey");
   }
+  for (const body of roomProofBodies) {
+    const proofRequest = JSON.parse(body) as {
+      proof?: Record<string, unknown>;
+    };
+    expect(Object.keys(proofRequest).sort()).toEqual(["challengeId", "proof"]);
+    expect(Object.keys(proofRequest.proof ?? {}).sort()).toEqual([
+      "merkleTreeDepth",
+      "merkleTreeRoot",
+      "message",
+      "nullifier",
+      "points",
+      "scope",
+    ]);
+    expect(proofRequest.proof).not.toHaveProperty("commitment");
+    expect(proofRequest.proof).not.toHaveProperty("groupId");
+    expect(proofRequest.proof).not.toHaveProperty("privateKey");
+    expect(body).not.toContain(walletCredentials[0].groupId);
+    expect(body).not.toContain(walletCredentials[0].privateKey);
+  }
   expect(externalTraffic.some((item) => item.body.includes("pk_live_"))).toBe(
     false,
   );
@@ -387,6 +636,9 @@ test("one enrollment unlocks two different RP backends through Portkey consent a
   }
   expect(
     externalTraffic.some((item) => item.cookie.includes("portkey_session")),
+  ).toBe(false);
+  expect(
+    externalTraffic.some((item) => item.cookie.includes("portkey_organizer")),
   ).toBe(false);
   expect(
     externalTraffic.some((item) =>

@@ -1,6 +1,6 @@
 # Portkey
 
-Room management, organizer activity, browser-encrypted private submissions, single-use workshop admission passes, and workshop proof admission. The frontend uses React and TypeScript; the API uses Express. PostgreSQL stores rooms, browser sessions, and membership decisions. Names and small functions carry the code structure.
+Portkey lets organizers issue membership credentials that participants can use in private rooms and separate applications. Participants save a credential once, then prove that they qualify when an application asks. Rooms also support approval, single-use passes, and browser-encrypted file submissions. The frontend uses React and TypeScript; the API uses Express and PostgreSQL.
 
 ## Run locally
 
@@ -14,7 +14,7 @@ The Vite development proxy targets port 3001; set `API_ORIGIN` when using anothe
 
 The included `render.yaml` creates one free Node web service from this repository's `main` branch. To deploy it, push the repository to a public GitHub repository, create a free Neon project, and copy its pooled PostgreSQL connection string with SSL enabled. In Render, choose **New → Blueprint**, connect the public repository, and apply the Blueprint. When prompted, set `DATABASE_URL` to the Neon pooled connection string as a secret. Never put the value in Git, an issue, or a chat. Render supplies the service's public HTTPS address; the app uses it as the invitation origin unless you explicitly set `APP_ORIGIN`.
 
-After deployment, open the Render HTTPS URL and create a room. Scan its QR code with a phone on a separate network, confirm the browser shows the same public host, and submit a join request. A free Render service can take a short while to wake after inactivity; the free web service sleeps after 15 minutes without inbound traffic. Neon currently lists 1 GB storage and 100 compute-unit hours per month for its free plan, with no credit card required. These are provider limits that can change. Portkey's 5 GiB per-room submission limit is an application ceiling, not storage promised by the free database plan; leave substantial room for indexes and room data. See [Render free services](https://render.com/docs/free), [Render Blueprint configuration](https://render.com/docs/blueprint-spec), and [Neon pricing](https://neon.tech/pricing) for current limits.
+After deployment, open the Render HTTPS URL and create a room. Scan its QR code with a phone on a separate network, confirm the browser shows the same public host, and submit a join request. Hosting quotas and free-plan availability change; check [Render free services](https://render.com/docs/free), [Render Blueprint configuration](https://render.com/docs/blueprint-spec), and [Neon pricing](https://neon.tech/pricing) before deploying. Portkey's 5 GiB per-room submission limit is an application ceiling, not storage promised by a database plan; leave substantial room for indexes and room data.
 
 If the Render hostname changes, the invitation origin changes too. Create new invitations from the new address. Existing browser cookies and locally stored organizer keys belong to that browser and origin; retain the encrypted key backup and its passphrase separately. Existing passkeys do not work at a changed hostname. Retain the database and recovery key, then use **Recover an account** at the new configured HTTPS origin to register a replacement passkey. Browser-local inbox keys still require the separate encrypted backup; attendee credentials remain local to their browser.
 
@@ -25,6 +25,8 @@ Install the official `cloudflared` executable separately, then run `npm run phon
 ## Cross-application verification
 
 Portkey supports issuer-published Semaphore membership contracts, application domain verification, explicit trust pins, and PKCE-bound signed eligibility receipts for separate relying applications. The supported adapter, backend SDK example, privacy boundaries, limits, and two-application local demo are documented in [the verification platform guide](docs/verification-platform.md). Run the complete demo with `npm run platform:demo`.
+
+Follow [the demonstration walkthrough](docs/demo.md) to use one credential in both applications and a private file room. Developers can start with [the standalone SDK integration](docs/sdk-integration.md). Read [the architecture and trust boundaries](docs/architecture.md) for the security model. Deployment, database checks and backup responsibilities are described in [operations](docs/operations.md).
 
 ## Use the module
 

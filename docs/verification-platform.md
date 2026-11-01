@@ -6,7 +6,7 @@ A relying application explicitly trusts an exact immutable contract version. It 
 
 ## Local two-application demo
 
-Run `npm run platform:demo`. The command builds the production client bundle and starts Portkey at `http://127.0.0.1:5300`, Northstar Learning at `http://northstar.localhost:5301`, and Fieldnote Community at `http://fieldnote.localhost:5302`. Demo data is isolated in `.data/platform-demo`; it does not read `.env`, connect to `DATABASE_URL`, or alter the normal application database. Stop the process with Ctrl+C.
+Run `npm run platform:demo`. The command builds the production client bundle and starts Portkey at `http://localhost:5300`, Northstar Learning at `http://northstar.localhost:5301`, and Fieldnote Community at `http://fieldnote.localhost:5302`. Demo data is isolated in `.data/platform-demo`; it does not read `.env`, connect to `DATABASE_URL`, or alter the normal application database. Stop the process with Ctrl+C.
 
 Open either application, choose **Get the issuer’s demo enrollment link**, and save that one-use credential in Portkey. Return to the app and choose **Continue with Portkey**. On Portkey, inspect the requesting origin, self-described issuer, accepted group, digest, callback and expiry before choosing **Prove membership and continue**. Choose **Return to application** to complete the backend exchange. Repeat in the other app; both apps trust the same contract version and the same browser-local credential can satisfy it. The demonstration issuer is fictional, its enrollment link is a sample, and one member makes the public Merkle root equal the enrolled commitment; this demo does not claim anonymity.
 
@@ -20,87 +20,21 @@ The application API key is shown once. Store it in a backend secret manager or e
 
 ## Backend SDK integration
 
-The Node SDK is in `sdk/index.ts`. It uses `fetch`, Node's cryptography APIs, and the built-in `crypto` module. Construct it only in a server process with the configured Portkey origin, once-shown app key, and app UUID:
+Build the dependency-free SDK with `npm run sdk:pack`, then install the resulting tarball in the application's backend. The package exposes the Node client at `portkey` and the browser callback reader at `portkey/browser`. See [SDK distribution](sdk-integration.md) and the [runnable relying-party example](../examples/relying-party/README.md).
 
 ```ts
-import { timingSafeEqual } from "node:crypto";
-import { createPortkeyClient } from "./sdk/index.js";
+import { createPortkeyClient } from "portkey";
 
 const portkey = createPortkeyClient({
   origin: process.env.PORTKEY_ORIGIN!,
   apiKey: process.env.PORTKEY_APP_KEY!,
   appId: process.env.PORTKEY_APP_ID!,
 });
-
-// These handlers assume the application already has a server-side session,
-// CSRF middleware, a registered callback URL, and an explicit contract pin.
-app.post(
-  "/auth/portkey/start",
-  requireAppSession,
-  requireCsrf,
-  async (req, res) => {
-    const contractId = process.env.PORTKEY_CONTRACT_ID!;
-    const contractVersion = Number(process.env.PORTKEY_CONTRACT_VERSION);
-    const flow = await portkey.createProofRequest({
-      contractId,
-      contractVersion,
-      redirectUri: "https://app.example/portkey/callback",
-    });
-
-    // Store these values in this server-side app session, never in browser storage.
-    req.session.portkeyPending = {
-      requestId: flow.requestId,
-      state: flow.state,
-      codeVerifier: flow.codeVerifier,
-      expiresAt: flow.expiresAt,
-      contractId,
-      contractVersion,
-    };
-    res.redirect(303, flow.walletUrl);
-  },
-);
-
-app.post(
-  "/portkey/callback",
-  requireAppSession,
-  requireCsrf,
-  async (req, res) => {
-    const pending = req.session.portkeyPending;
-    const { code, state } = req.body as { code?: unknown; state?: unknown };
-    if (!pending || typeof code !== "string" || typeof state !== "string") {
-      return res.status(400).send("Start a new verification request.");
-    }
-    const expectedState = Buffer.from(pending.state);
-    const returnedState = Buffer.from(state);
-    if (
-      expectedState.length !== returnedState.length ||
-      !timingSafeEqual(expectedState, returnedState)
-    ) {
-      return res
-        .status(403)
-        .send("This result belongs to a different application session.");
-    }
-
-    // Claim the pending callback atomically in the app's session store before
-    // awaiting the network, so a concurrent replay cannot exchange the same code.
-    delete req.session.portkeyPending;
-    const result = await portkey.exchange(
-      pending.requestId,
-      code,
-      pending.codeVerifier,
-      {
-        contractId: pending.contractId,
-        contractVersion: pending.contractVersion,
-        contractDigest: process.env.PORTKEY_CONTRACT_DIGEST!,
-      },
-    );
-    req.session.portkeyReceipt = result.claims;
-    res.redirect(303, "/benefit");
-  },
-);
 ```
 
-Adapt the session save/claim to the application's session store; the delete must be committed before network exchange. The callback page should read `code` and `state` from the URL **fragment**, immediately remove the fragment from browser history, then POST those values to the app backend with the app's normal session and CSRF protections. Never put the app API key, PKCE verifier, or wallet capability in a URL. The short-lived code and opaque state exist in the callback fragment only; do not persist them in browser storage. Reject a missing, expired, replayed, or session-mismatched callback.
+The complete example uses PostgreSQL-backed sessions, exact Origin and CSRF checks, bounded pending requests, a pinned contract, and a unique session/flow claim committed before exchanging a code. A local session-property deletion alone is not an atomic claim across concurrent requests or application instances. Use the example's committed database claim when adapting this flow.
+
+The callback page reads `code` and `state` from the URL **fragment**, immediately removes the fragment from browser history, then posts them to its own backend with the application session and CSRF token. Never put the app API key, PKCE verifier, or wallet capability in a callback URL. Do not persist callback codes or state in browser storage. Reject missing, expired, replayed, or session-mismatched callbacks.
 
 `createProofRequest` generates independent 32-byte random state and PKCE verifier values and returns them to the caller; it does not store them for the application. The app backend stores both in the pending server-side session. It sends this strict JSON body to `POST /v1/proof-requests`:
 
@@ -135,7 +69,7 @@ Organizer accounts use discoverable, user-verified passkeys. Creating an account
 
 Existing passkeys do not work at a changed hostname. Retain the database and recovery key, then use **Recover an account** at the new configured HTTPS origin to register a replacement passkey. Browser-local inbox keys still require the separate encrypted backup.
 
-Recovery requires the one-time recovery key and a replacement passkey. Recovery replaces all old passkeys and revokes every organizer sign-in session. It does not restore browser-local inbox decryption keys or attendee proof credentials; encrypted key backup remains separate. Passkeys belong to the configured Portkey hostname, so a changed tunnel or deployment domain requires enrolling a new passkey while account access is available.
+Recovery requires the recovery key and a replacement passkey. Recovery replaces all old passkeys and revokes every organizer sign-in session. It does not restore browser-local inbox decryption keys or attendee proof credentials; encrypted key backup remains separate.
 
 ## Public contract and keys
 

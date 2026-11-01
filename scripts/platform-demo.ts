@@ -1,5 +1,10 @@
-import express, { type Request, type Response } from "express";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import { serialize } from "cookie";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { basename, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,9 +12,22 @@ import { rm } from "node:fs/promises";
 import { createApp } from "../server/app.js";
 import { openDatabase } from "../server/database.js";
 import { migrate } from "../server/migrations.js";
+import { organizerCookieName } from "../server/sessions.js";
+import {
+  runSubmissionCleanupPass,
+  startCleanupScheduler,
+} from "../server/cleanup.js";
 import { createPortkeyClient, type ReceiptClaims } from "../sdk/index.js";
 
-const walletOrigin = "http://127.0.0.1:5300";
+const walletOrigin = "http://localhost:5300";
+const bootstrapToken =
+  process.env.PORTKEY_PLATFORM_DEMO_BOOTSTRAP_TOKEN ??
+  randomBytes(32).toString("base64url");
+if (!/^[A-Za-z0-9_-]{43}$/.test(bootstrapToken))
+  throw new Error("Invalid local demo bootstrap configuration.");
+const bootstrapDigest = createHash("sha256").update(bootstrapToken).digest();
+let bootstrapClaimed = false;
+let organizerCookie = "";
 const root = process.cwd();
 const demoData = resolve(
   process.env.PORTKEY_PLATFORM_DEMO_DATA_DIR ??
@@ -64,6 +82,7 @@ interface RPUserSession {
 const sessions = new Map<string, RPUserSession>();
 const servers: Server[] = [];
 let database: Awaited<ReturnType<typeof openDatabase>> | null = null;
+let cleanupScheduler: ReturnType<typeof startCleanupScheduler> | null = null;
 let stopped = false;
 let ready = false;
 let readyApplications: Array<{ name: string; origin: string }> = [];
@@ -80,10 +99,10 @@ function html(title: string, body: string, csrf = "") {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="csrf" content="${escapeHtml(csrf)}"><title>${escapeHtml(title)}</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head><body>${body}</body></html>`;
 }
 
-async function listen(server: Server, port: number) {
+async function listen(server: Server, port: number, host = "127.0.0.1") {
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, host, () => {
       server.off("error", reject);
       resolveListen();
     });
@@ -320,10 +339,9 @@ function createRelyingApp(config: DemoApp) {
       if (request.is("application/json"))
         response.json({ walletUrl: requestFlow.walletUrl });
       else response.redirect(303, requestFlow.walletUrl);
-    } catch (error) {
+    } catch {
       console.error(
-        "Demo relying-party request failed:",
-        error instanceof Error ? error.message : "unknown error",
+        "The Portkey membership request could not be started. Confirm the local wallet is ready and try again.",
       );
       response
         .status(503)
@@ -403,7 +421,10 @@ function createRelyingApp(config: DemoApp) {
       session.usedJtis.push(claims.jti);
       session.receipt = claims;
       response.json({ status: "verified" });
-    } catch {
+    } catch (error) {
+      console.error(
+        "Demo receipt exchange failed. Start a new membership check; if it repeats, restart the demo and review the local service status.",
+      );
       response.status(400).json({
         error: "The result could not be verified. Start a new request.",
       });
@@ -443,31 +464,149 @@ function createRelyingApp(config: DemoApp) {
   return createServer(server);
 }
 
+function parseDemoClaimBody(
+  request: Request,
+  response: Response,
+  next: NextFunction,
+) {
+  express.json({ limit: "2kb" })(request, response, (error) => {
+    if (!error) return next();
+    response
+      .status(error?.status === 413 ? 413 : 400)
+      .json({ error: "Request body is invalid or too large." });
+  });
+}
+
+async function claimDemoOrganizer(request: Request, response: Response) {
+  const origin = request.get("origin") ?? "";
+  const host = request.get("host") ?? "";
+  const sessionCookie = request.headers.cookie
+    ?.split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith("portkey_session="))
+    ?.slice("portkey_session=".length) ?? "";
+  const expectedCsrf = createHash("sha256")
+    .update(`csrf:${sessionCookie}`)
+    .digest("hex");
+  const suppliedCsrf = request.get("x-csrf-token") ?? "";
+  const capability = request.body?.capability;
+  const canonicalCapability =
+    typeof capability === "string" &&
+    /^[A-Za-z0-9_-]{43}$/.test(capability) &&
+    Buffer.from(capability, "base64url").length === 32 &&
+    Buffer.from(capability, "base64url").toString("base64url") === capability;
+  const suppliedDigest = canonicalCapability
+    ? createHash("sha256").update(capability).digest()
+    : Buffer.alloc(32);
+  const validCsrf =
+    /^[A-Za-z0-9_-]{43}$/.test(sessionCookie) &&
+    /^[a-f0-9]{64}$/.test(suppliedCsrf) &&
+    timingSafeEqual(Buffer.from(suppliedCsrf), Buffer.from(expectedCsrf));
+  const validCapability = timingSafeEqual(suppliedDigest, bootstrapDigest);
+  const [liveSession] = validCsrf
+    ? await database!.query<{ id: string }>(
+        "SELECT id FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp()",
+        [createHash("sha256").update(sessionCookie).digest("hex")],
+      )
+    : [];
+  if (
+    origin !== walletOrigin ||
+    host !== "localhost:5300" ||
+    !validCsrf ||
+    !liveSession
+  ) {
+    response.status(403).json({ error: "Request could not be verified." });
+    return;
+  }
+  if (bootstrapClaimed || !validCapability || !organizerCookie) {
+    response.status(410).json({ error: "Organizer setup is unavailable." });
+    return;
+  }
+  bootstrapClaimed = true;
+  const [cookieName, cookieToken] = organizerCookie.split("=", 2);
+  response.setHeader("Set-Cookie", [
+    serialize(cookieName, cookieToken, {
+      httpOnly: true,
+      secure: false,
+      sameSite: "strict",
+      path: "/",
+      maxAge: 30 * 24 * 60 * 60,
+    }),
+    serialize(organizerCookieName(false), "", {
+      httpOnly: true,
+      secure: false,
+      sameSite: "strict",
+      path: "/",
+      maxAge: 0,
+      expires: new Date(0),
+    }),
+  ]);
+  response.status(204).end();
+}
+
 async function setupDemo() {
   database = await openDatabase({ dataDir: demoData });
   await migrate(database);
-  const wallet = createApp(database, {
-    origin: walletOrigin,
-    secure: false,
-    geocoding: false,
+  cleanupScheduler = startCleanupScheduler(() =>
+    runSubmissionCleanupPass(database!),
+  );
+  const demoHost = express();
+  demoHost.disable("x-powered-by");
+  demoHost.use("/platform-demo", (_request, response, next) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("Referrer-Policy", "no-referrer");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    );
+    next();
   });
-  wallet.get("/platform-demo/ready", (_request, response) => {
+  demoHost.get("/platform-demo/ready", (_request, response) => {
     if (!ready) return response.sendStatus(503);
     response.json({ status: "ready", applications: readyApplications });
   });
-  const walletServer = createServer(wallet);
-  await listen(walletServer, 5300);
-  wallet.use(
+  demoHost.get("/platform-demo/organizer", (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response
+      .type("html")
+      .send(
+        `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Organizer setup</title><script src="/platform-demo/organizer.js" defer></script></head><body><main><h1>Organizer workspace setup</h1><p>This setup signs this browser out of its current organizer session on this local demo and switches to the sample workspace. Existing organizer accounts and workspaces remain intact. Create a passkey account for the sample workspace to continue.</p><p id="status" role="status">Claiming the local demonstration workspace…</p><p id="error" role="alert"></p></main></body></html>`,
+      );
+  });
+  demoHost.get("/platform-demo/organizer.js", (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.type("application/javascript").send(`(async()=>{const status=document.querySelector('#status');const error=document.querySelector('#error');const params=new URLSearchParams(location.hash.slice(1));const capability=params.get('setup');history.replaceState(null,'',location.pathname);try{if(!capability)throw new Error('Open the organizer setup link printed by the local demo process.');const sessionResponse=await fetch('/api/session',{method:'POST',credentials:'same-origin'});if(!sessionResponse.ok)throw new Error('Could not establish a browser session.');const session=await sessionResponse.json();const response=await fetch('/platform-demo/claim',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrfToken},body:JSON.stringify({capability})});if(!response.ok)throw new Error('This organizer setup link is invalid or has already been used. Restart the local demo for a new link.');location.replace('/account')}catch(cause){status.textContent='Setup was not completed.';error.textContent=cause instanceof Error?cause.message:'Unable to complete organizer setup.'}})();`);
+  });
+  demoHost.post("/platform-demo/claim", parseDemoClaimBody, claimDemoOrganizer);
+  demoHost.use(
+    createApp(database, {
+      origin: walletOrigin,
+      secure: false,
+      geocoding: false,
+    }),
+  );
+  demoHost.use(
     express.static(resolve(root, "dist/client"), {
       index: false,
       fallthrough: true,
     }),
   );
-  wallet.get("/{*path}", (_request, response) =>
+  demoHost.get("/{*path}", (_request, response) =>
     response.sendFile(resolve(root, "dist/client/index.html")),
   );
+  const walletServer = createServer(demoHost);
+  await listen(walletServer, 5300);
+  const address = walletServer.address();
+  if (
+    !address ||
+    typeof address === "string" ||
+    address.address !== "127.0.0.1"
+  )
+    throw new Error("The organizer demo must bind to the loopback interface.");
 
   const issuer = await startOwnerSession();
+  organizerCookie = issuer.cookie;
   const group = await postBrowser(
     "/credential-groups",
     issuer.cookie,
@@ -559,6 +698,7 @@ async function setupDemo() {
 async function shutdown() {
   if (stopped) return;
   stopped = true;
+  if (cleanupScheduler) await cleanupScheduler.stop();
   await Promise.all(
     servers.map(
       (server) =>
@@ -590,13 +730,16 @@ async function main() {
     console.log(`${app.name}: http://${app.host}:${app.port}`);
   console.log(`Portkey wallet: ${walletOrigin}`);
   console.log(
-    "Open either app, save the issuer demonstration credential once, then approve a request in Portkey. The same saved credential works in the other app.",
+    `Organizer workspace setup (one use, local only): ${walletOrigin}/platform-demo/organizer#setup=${bootstrapToken}`,
+  );
+  console.log(
+    "Open the organizer setup link first, adopt the workspace with a passkey, then use the same enrolled credential in both applications and the proof room.",
   );
 }
 
-void main().catch(async (error) => {
+void main().catch(async () => {
   console.error(
-    error instanceof Error ? error.message : "The demo could not start.",
+    "The demo could not start. Check whether its local ports are available and the built client assets are present.",
   );
   await shutdown();
   process.exitCode = 1;

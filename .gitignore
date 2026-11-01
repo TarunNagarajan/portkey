@@ -1,5 +1,6 @@
 node_modules/
 dist/
+/sdk-package/dist/
 .data/
 public/zk/*.wasm
 public/zk/*.zkey
@@ -8,3 +9,5 @@ public/zk/*.tmp
 coverage/
 test-results/
 playwright-report/
+*.tgz
+/work/

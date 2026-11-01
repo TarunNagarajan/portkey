@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  serial-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - run: npm run test:e2e:built
+      - run: npm run test:e2e:platform
+      - run: npm run test:e2e:platform-vite
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: portkey_test
+          POSTGRES_PASSWORD: portkey_test
+          POSTGRES_DB: portkey_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U portkey_test -d portkey_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:postgres
+        env:
+          PORTKEY_RUN_POSTGRES_TESTS: '1'
+          PORTKEY_TEST_DATABASE_URL: postgres://portkey_test:portkey_test@127.0.0.1:5432/portkey_test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run sdk:example:acceptance
+        env:
+          PORTKEY_SDK_EXAMPLE_DATABASE_URL: postgres://portkey_test:portkey_test@127.0.0.1:5432/portkey_test

@@ -241,6 +241,11 @@ export function WalletProofPage({ requestId }: { requestId: string }) {
     <section className="panel wallet-consent" aria-labelledby="consent-title">
       <p className="eyebrow">PORTKEY WALLET</p>
       <h1 id="consent-title">Membership check</h1>
+      <p className="proof-action-label">Check eligibility with a saved credential</p>
+      <p className="muted proof-local-note">
+        Portkey checks for an eligible credential in this browser and creates the membership proof here.
+        Your credential and proof are not sent to the application.
+      </p>
       {error && (
         <p className="error" role="alert">
           {error}
@@ -269,7 +274,7 @@ export function WalletProofPage({ requestId }: { requestId: string }) {
         <dd>
           {descriptor.contract.groups.map((group) => group.name).join(", ")}
         </dd>
-        <dt>Contract digest</dt>
+        <dt>Contract fingerprint</dt>
         <dd>
           <code>{descriptor.contract.digest}</code>
         </dd>
