@@ -11,3 +11,7 @@ credentials/
 
 .backups/
 *.dump
+
+# Local design inspections and benchmark output
+.taste-skill/
+benchmark-results/
