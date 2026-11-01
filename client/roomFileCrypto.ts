@@ -97,13 +97,49 @@ async function putStored(storeName: string, key: IDBValidKey, value: unknown): P
   } finally { database.close(); }
 }
 
+async function addStored(storeName: string, key: IDBValidKey, value: unknown): Promise<void> {
+  const database = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(storeName, 'readwrite');
+      let requestFailure: DOMException | null = null;
+      let synchronousFailure: unknown;
+      transaction.oncomplete = () => {
+        if (synchronousFailure !== undefined) reject(synchronousFailure);
+        else resolve();
+      };
+      transaction.onerror = () => {};
+      transaction.onabort = () => {
+        reject(
+          synchronousFailure ??
+            requestFailure ??
+            transaction.error ??
+            new Error('Could not preserve the pending room key rotation.'),
+        );
+      };
+
+      try {
+        const request = transaction.objectStore(storeName).add(value, key);
+        request.onerror = () => {
+          requestFailure = request.error;
+        };
+      } catch (error) {
+        synchronousFailure = error;
+        try {
+          transaction.abort();
+        } catch {
+          reject(error);
+        }
+      }
+    });
+  } finally {
+    database.close();
+  }
+}
+
 export async function loadRoomFileSecret(roomId: string): Promise<Uint8Array | null> {
   const value = await getStored<string>(STORE, roomId);
   return value ? decodeUrl(value) : null;
-}
-export async function saveRoomFileSecret(roomId: string, secret: Uint8Array): Promise<void> {
-  if (secret.length !== 32) throw new Error('Invalid room file key.');
-  await putStored(STORE, roomId, encodeUrl(secret));
 }
 export const roomFileFingerprint = (secret: Uint8Array) => hexDigest(secret);
 
@@ -111,18 +147,19 @@ export async function loadRoomFileHistory(roomId: string): Promise<Record<string
   return await getStored<Record<string, string>>(HISTORY, roomId) ?? {};
 }
 
-export async function saveRoomFileHistory(roomId: string, history: Record<string, string>): Promise<void> {
-  await putStored(HISTORY, roomId, history);
-}
-
 export async function commitRoomFileKeyState(
   roomId: string,
   secret: Uint8Array,
   history: Record<string, string>,
+  epoch: number,
   clearPendingFingerprint?: string,
 ): Promise<Record<string, string>> {
   if (secret.length !== 32) throw new Error('Invalid room file key.');
+  if (!Number.isInteger(epoch) || epoch < 0 || epoch > 32)
+    throw new Error('Shared file key epoch is invalid.');
   const validatedHistory = await validateRoomFileHistory(secret, history);
+  const fingerprint = await roomFileFingerprint(secret);
+  const stateKey = `key-state:${roomId}`;
   const database = await openDatabase();
   try {
     await new Promise<void>((resolve, reject) => {
@@ -142,19 +179,55 @@ export async function commitRoomFileKeyState(
       };
 
       try {
-        transaction.objectStore(STORE).put(encodeUrl(secret), roomId);
         const historyStore = transaction.objectStore(HISTORY);
-        historyStore.put(validatedHistory, roomId);
-        if (clearPendingFingerprint) {
-          const pendingRequest = historyStore.get(`rotation:${roomId}`);
-          pendingRequest.onsuccess = () => {
-            const pending = pendingRequest.result as
-              | { newFingerprint?: string }
+        const stateRequest = historyStore.get(stateKey);
+        stateRequest.onsuccess = () => {
+          try {
+            const storedState = stateRequest.result as
+              | { epoch: number; fingerprint: string }
               | undefined;
-            if (pending?.newFingerprint === clearPendingFingerprint)
-              historyStore.delete(`rotation:${roomId}`);
-          };
-        }
+            if (
+              storedState &&
+              (!Number.isInteger(storedState.epoch) ||
+                storedState.epoch < 0 ||
+                storedState.epoch > 32 ||
+                !/^[a-f0-9]{64}$/.test(storedState.fingerprint))
+            )
+              throw new Error('Stored shared-file key epoch metadata is invalid.');
+            if (
+              storedState &&
+              (storedState.epoch > epoch ||
+                (storedState.epoch === epoch && storedState.fingerprint !== fingerprint))
+            ) {
+              synchronousFailure = new Error(
+                'A newer shared-file key is already stored in this browser. Reload the room before continuing.',
+              );
+              transaction.abort();
+              return;
+            }
+
+            transaction.objectStore(STORE).put(encodeUrl(secret), roomId);
+            historyStore.put(validatedHistory, roomId);
+            historyStore.put({ epoch, fingerprint }, stateKey);
+            if (clearPendingFingerprint) {
+              const pendingRequest = historyStore.get(`rotation:${roomId}`);
+              pendingRequest.onsuccess = () => {
+                const pending = pendingRequest.result as
+                  | { newFingerprint?: string }
+                  | undefined;
+                if (pending?.newFingerprint === clearPendingFingerprint)
+                  historyStore.delete(`rotation:${roomId}`);
+              };
+            }
+          } catch (error) {
+            synchronousFailure = error;
+            try {
+              transaction.abort();
+            } catch {
+              reject(error);
+            }
+          }
+        };
       } catch (error) {
         synchronousFailure = error;
         try {
@@ -175,7 +248,13 @@ export async function loadPendingRoomFileRotation(roomId: string): Promise<Pendi
   return await getStored<PendingRoomFileRotation>(HISTORY, `rotation:${roomId}`) ?? null;
 }
 export async function savePendingRoomFileRotation(roomId: string, rotation: PendingRoomFileRotation): Promise<void> {
-  await putStored(HISTORY, `rotation:${roomId}`, rotation);
+  try {
+    await addStored(HISTORY, `rotation:${roomId}`, rotation);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'ConstraintError')
+      throw new Error('Another tab already saved a rotation candidate. Reload this room to recover it before retrying.');
+    throw error;
+  }
 }
 export async function clearPendingRoomFileRotation(roomId: string): Promise<void> {
   const database = await openDatabase();

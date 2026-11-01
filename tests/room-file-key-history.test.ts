@@ -7,6 +7,7 @@ import {
   encryptRoomFileHistory,
   roomFileBase64,
   roomFileFingerprint,
+  savePendingRoomFileRotation,
 } from '../client/roomFileCrypto.js';
 
 test('key history is bound to room and epoch and validates every prior key fingerprint', async () => {
@@ -30,6 +31,7 @@ test('failed credential transaction preserves the old key, history, and pending 
   const oldSecret = new Uint8Array(randomBytes(32));
   const nextSecret = new Uint8Array(randomBytes(32));
   const nextFingerprint = await roomFileFingerprint(nextSecret);
+  const oldFingerprint = await roomFileFingerprint(oldSecret);
   const priorSecret = new Uint8Array(randomBytes(32));
   const oldHistory = { [await roomFileFingerprint(priorSecret)]: roomFileBase64(priorSecret) };
   const nextHistory = { [await roomFileFingerprint(oldSecret)]: roomFileBase64(oldSecret) };
@@ -38,6 +40,7 @@ test('failed credential transaction preserves the old key, history, and pending 
   stores.set('history', new Map<IDBValidKey, unknown>([
     [roomId, oldHistory],
     [`rotation:${roomId}`, { newFingerprint: nextFingerprint }],
+    [`key-state:${roomId}`, { epoch: 1, fingerprint: oldFingerprint }],
   ]));
   stores.set('uploads', new Map<IDBValidKey, unknown>());
   let failHistoryWrite = true;
@@ -62,6 +65,20 @@ test('failed credential transaction preserves the old key, history, and pending 
                 if (failHistoryWrite && name === 'history' && key === roomId)
                   throw new Error('Simulated IndexedDB quota failure.');
                 staged.push(() => stores.get(name)!.set(key, value));
+              },
+              add(value: unknown, key: IDBValidKey) {
+                const request: Record<string, unknown> = {};
+                if (stores.get(name)!.has(key)) {
+                  queueMicrotask(() => {
+                    request.error = new DOMException('Key already exists.', 'ConstraintError');
+                    (request.onerror as (() => void) | undefined)?.();
+                    aborted = true;
+                    (transaction.onabort as (() => void) | undefined)?.();
+                  });
+                } else {
+                  staged.push(() => stores.get(name)!.set(key, value));
+                }
+                return request;
               },
               delete(key: IDBValidKey) { staged.push(() => stores.get(name)!.delete(key)); },
               get(key: IDBValidKey) {
@@ -93,16 +110,92 @@ test('failed credential transaction preserves the old key, history, and pending 
   const originalIndexedDB = globalThis.indexedDB;
   Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: fakeIndexedDB });
   try {
-    await assert.rejects(commitRoomFileKeyState(roomId, nextSecret, nextHistory, nextFingerprint), /Simulated IndexedDB quota failure/);
+    const pending = {
+      expectedFingerprint: 'a'.repeat(64),
+      newFingerprint: nextFingerprint,
+      secret: roomFileBase64(nextSecret),
+      historyEnvelope: 'pending-envelope',
+      epoch: 2,
+    };
+    const otherRoomId = randomUUID();
+    await savePendingRoomFileRotation(otherRoomId, pending);
+    assert.deepEqual(stores.get('history')!.get(`rotation:${otherRoomId}`), pending);
+    await assert.rejects(
+      savePendingRoomFileRotation(otherRoomId, { ...pending, secret: roomFileBase64(oldSecret) }),
+      /Another tab already saved a rotation candidate/,
+    );
+    assert.deepEqual(stores.get('history')!.get(`rotation:${otherRoomId}`), pending);
+
+    await assert.rejects(
+      commitRoomFileKeyState(roomId, nextSecret, nextHistory, 2, nextFingerprint),
+      /Simulated IndexedDB quota failure/,
+    );
     assert.equal(stores.get('secrets')!.get(roomId), roomFileBase64(oldSecret));
     assert.deepEqual(stores.get('history')!.get(roomId), oldHistory);
     assert.ok(stores.get('history')!.has(`rotation:${roomId}`));
 
     failHistoryWrite = false;
-    await commitRoomFileKeyState(roomId, nextSecret, nextHistory, nextFingerprint);
+    await commitRoomFileKeyState(roomId, nextSecret, nextHistory, 2, nextFingerprint);
     assert.equal(stores.get('secrets')!.get(roomId), roomFileBase64(nextSecret));
     assert.deepEqual(stores.get('history')!.get(roomId), nextHistory);
     assert.equal(stores.get('history')!.has(`rotation:${roomId}`), false);
+    assert.deepEqual(stores.get('history')!.get(`key-state:${roomId}`), {
+      epoch: 2,
+      fingerprint: nextFingerprint,
+    });
+
+    const newestSecret = new Uint8Array(randomBytes(32));
+    const newestFingerprint = await roomFileFingerprint(newestSecret);
+    const newestHistory = {
+      ...nextHistory,
+      [nextFingerprint]: roomFileBase64(nextSecret),
+    };
+    await commitRoomFileKeyState(roomId, newestSecret, newestHistory, 3);
+    const newestPending = {
+      expectedFingerprint: nextFingerprint,
+      newFingerprint: newestFingerprint,
+      secret: roomFileBase64(newestSecret),
+      historyEnvelope: 'newest-envelope',
+      epoch: 3,
+    };
+    await savePendingRoomFileRotation(roomId, newestPending);
+    const delayedCommit = commitRoomFileKeyState.bind(
+      null,
+      roomId,
+      nextSecret,
+      nextHistory,
+      2,
+      nextFingerprint,
+    );
+    await assert.rejects(
+      delayedCommit(),
+      /newer shared-file key is already stored/,
+    );
+    assert.equal(stores.get('secrets')!.get(roomId), roomFileBase64(newestSecret));
+    assert.deepEqual(stores.get('history')!.get(roomId), newestHistory);
+    assert.deepEqual(stores.get('history')!.get(`key-state:${roomId}`), {
+      epoch: 3,
+      fingerprint: newestFingerprint,
+    });
+    assert.deepEqual(stores.get('history')!.get(`rotation:${roomId}`), newestPending);
+
+    await commitRoomFileKeyState(roomId, newestSecret, newestHistory, 3);
+    const conflictingSecret = new Uint8Array(randomBytes(32));
+    const conflictingHistory = {
+      ...newestHistory,
+      [newestFingerprint]: roomFileBase64(newestSecret),
+    };
+    await assert.rejects(
+      commitRoomFileKeyState(roomId, conflictingSecret, conflictingHistory, 3),
+      /newer shared-file key is already stored/,
+    );
+    assert.equal(stores.get('secrets')!.get(roomId), roomFileBase64(newestSecret));
+    assert.deepEqual(stores.get('history')!.get(roomId), newestHistory);
+    assert.deepEqual(stores.get('history')!.get(`key-state:${roomId}`), {
+      epoch: 3,
+      fingerprint: newestFingerprint,
+    });
+    assert.deepEqual(stores.get('history')!.get(`rotation:${roomId}`), newestPending);
   } finally {
     Object.defineProperty(globalThis, 'indexedDB', { configurable: true, value: originalIndexedDB });
   }

@@ -292,6 +292,7 @@ export function RoomFiles({
             room.id,
             candidate,
             allHistory,
+            serverKey.epoch,
             pendingRotation && candidateFingerprint === pendingRotation.newFingerprint
               ? pendingRotation.newFingerprint
               : undefined,
@@ -406,6 +407,7 @@ export function RoomFiles({
             room.id,
             fragment.secret!,
             allHistory,
+            serverKey.epoch,
             pending && fingerprint === pending.newFingerprint
               ? pending.newFingerprint
               : undefined,
@@ -489,7 +491,12 @@ export function RoomFiles({
       const recoveredHistory = await decryptRoomFileHistory(room.id, current.epoch, candidate, current.historyEnvelope);
       const priorHistory = await loadRoomFileHistory(room.id);
       const allHistory = { ...priorHistory, ...recoveredHistory };
-      const committedHistory = await commitRoomFileKeyState(room.id, candidate, allHistory);
+      const committedHistory = await commitRoomFileKeyState(
+        room.id,
+        candidate,
+        allHistory,
+        current.epoch,
+      );
       if (!current.fingerprint) {
         try {
           await api(`/rooms/${room.id}/files/key`, 'POST', { fingerprint });
@@ -593,6 +600,7 @@ export function RoomFiles({
         room.id,
         candidate,
         previous,
+        latest.epoch + 1,
         fingerprint,
       );
       setHistory(committedHistory);
