@@ -6,6 +6,7 @@ import type { Database, Queries } from "./database.js";
 import { requireCondition } from "./errors.js";
 import { roomId } from "../shared/rooms.js";
 import { reclaimStaleUploads } from "./staleUploads.js";
+import { requireRoomLocation } from "./roomAccess.js";
 
 const MAX_ROOM_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
@@ -94,6 +95,7 @@ async function requireSubmitter(
     "ADMISSION_REQUIRED",
     "Organizer approval is required.",
   );
+  await requireRoomLocation(queries, room.id, sessionId);
 }
 
 async function requireVisible(
@@ -120,6 +122,7 @@ async function requireVisible(
     "ADMISSION_REQUIRED",
     "Organizer approval is required.",
   );
+  await requireRoomLocation(queries, room.id, sessionId);
   return "submitter";
 }
 
@@ -386,7 +389,8 @@ export function submissionRoutes(database: Database) {
       }
       await reclaimStaleUploads(transaction, id, 1000);
       const [usage] = await transaction.query<{ total: string }>(
-        `SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM private_submissions WHERE room_id = $1`,
+        `SELECT (COALESCE((SELECT SUM(encrypted_bytes) FROM private_submissions WHERE room_id = $1), 0) +
+                COALESCE((SELECT SUM(encrypted_bytes) FROM room_files WHERE room_id = $1), 0))::text AS total`,
         [id],
       );
       requireCondition(
@@ -660,7 +664,7 @@ export function submissionRoutes(database: Database) {
           "The file exceeds the 250 MiB encrypted upload limit.",
         );
         const [usage] = await transaction.query<{ total: string }>(
-          "SELECT COALESCE(SUM(encrypted_bytes), 0)::text AS total FROM private_submissions WHERE room_id = $1",
+          "SELECT (COALESCE((SELECT SUM(encrypted_bytes) FROM private_submissions WHERE room_id = $1), 0) + COALESCE((SELECT SUM(encrypted_bytes) FROM room_files WHERE room_id = $1), 0))::text AS total",
           [roomIdValue],
         );
         requireCondition(

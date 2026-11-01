@@ -15,7 +15,7 @@ after(async () => {
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
-test('migrations 010 and 011 upgrade populated migrations 001–009 without changing existing records', async () => {
+test('migrations 010 through 012 upgrade populated migrations 001–009 without changing existing records', async () => {
   directory = await mkdtemp(join(tmpdir(), 'portkey-platform-migration-'));
   database = await openDatabase({ dataDir: directory });
   await database.exec(`CREATE TABLE schema_migrations (
@@ -61,6 +61,7 @@ test('migrations 010 and 011 upgrade populated migrations 001–009 without chan
       ...migrations,
       '010_verification_platform.sql',
       '011_organizer_accounts.sql',
+      '012_room_files.sql',
     ],
   );
 });

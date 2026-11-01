@@ -3,7 +3,7 @@ import type { PlaceSuggestion } from '../shared/rooms.js';
 let csrfToken = '';
 let publicOrigin = '';
 
-export function buildInvitationUrl(origin: string, code: string, fingerprint?: string | null, passToken?: string): string {
+export function buildInvitationUrl(origin: string, code: string, fingerprint?: string | null, passToken?: string, filesKey?: string | null): string {
   let base: URL;
   try { base = new URL(origin); } catch { throw new Error('Invitation origin is invalid.'); }
   if (
@@ -27,11 +27,12 @@ export function buildInvitationUrl(origin: string, code: string, fingerprint?: s
   const fragment = new URLSearchParams();
   if (passToken !== undefined) fragment.set('pass', passToken);
   if (fingerprint) fragment.set('key', fingerprint);
+  if (filesKey) { if (!/^[A-Za-z0-9_-]{43}$/.test(filesKey)) throw new Error('Shared files key is invalid.'); fragment.set('files', filesKey); }
   if (fragment.size) url.hash = fragment.toString();
   return url.toString();
 }
 
-export function buildWorkshopEnrollmentUrl(origin: string, code: string, fingerprint: string | null, token: string) {
+export function buildWorkshopEnrollmentUrl(origin: string, code: string, fingerprint: string | null, token: string, filesKey?: string | null) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('Workshop enrollment link is invalid.');
   try {
     const decoded = atob(token.replaceAll('-', '+').replaceAll('_', '/') + '=');
@@ -40,7 +41,7 @@ export function buildWorkshopEnrollmentUrl(origin: string, code: string, fingerp
   } catch {
     throw new Error('Workshop enrollment link is invalid.');
   }
-  const url = new URL(buildInvitationUrl(origin, code, fingerprint));
+  const url = new URL(buildInvitationUrl(origin, code, fingerprint, undefined, filesKey));
   const fragment = new URLSearchParams(url.hash.slice(1));
   fragment.set('enroll', token);
   url.hash = fragment.toString();

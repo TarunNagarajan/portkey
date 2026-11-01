@@ -19,9 +19,11 @@ interface IssuedPass extends PassInfo {
 export function PassesPanel({
   room,
   fingerprint,
+  filesKey,
 }: {
   room: Room;
   fingerprint: string | null;
+  filesKey?: string | null;
 }) {
   const [passes, setPasses] = useState<PassInfo[]>([]);
   const [batch, setBatch] = useState<IssuedPass[] | null>(null);
@@ -45,6 +47,7 @@ export function PassesPanel({
           room.joinCode,
           fingerprint,
           selectedPass.token,
+          filesKey,
         )
       : '';
 
@@ -142,6 +145,7 @@ export function PassesPanel({
         room.joinCode,
         fingerprint,
         pass.token,
+        filesKey,
       );
       return `${pass.number},${quote(link)}`;
     });

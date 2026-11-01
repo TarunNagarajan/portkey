@@ -39,9 +39,12 @@ async function browser() {
     .set('Origin', origin)
     .expect(200);
   const csrf = response.body.csrfToken as string;
+  const cookie = response.headers['set-cookie'][0].split(';')[0].split('=')[1];
+  const [session] = await database.query<{ id: string }>('SELECT id FROM sessions WHERE token_hash = $1', [createHash('sha256').update(cookie).digest('hex')]);
   return {
     agent,
     csrf,
+    sessionId: session.id,
     get: (path: string) => agent.get(`/api${path}`),
     post: (path: string, body: object = {}) =>
       agent
@@ -211,6 +214,37 @@ test('private submission keys are immutable and completed chunks are visible onl
   assert.deepEqual(downloaded.body, chunk);
   await owner.post(`/rooms/${room.id}/close`).expect(200);
   await owner.get(`/rooms/${room.id}/submissions`).expect(410);
+});
+
+test('geofenced submissions reject stale and outside direct API access and recover with a fresh inside check', async () => {
+  const owner = await browser();
+  const participant = await browser();
+  const room = await makeRoom(owner);
+  await participant.post(`/join/${room.joinCode}`, { label: 'Located attendee' }).expect(200);
+  const member = (await owner.get(`/rooms/${room.id}/members`).expect(200)).body[0];
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'approved' }).expect(200);
+  await database.query('UPDATE rooms SET geo_lat = 17.385, geo_lng = 78.487, geo_radius_m = 500, geo_label = $2 WHERE id = $1', [room.id, 'Workshop']);
+  await database.query("UPDATE memberships SET last_inside = TRUE, last_checked_at = clock_timestamp() WHERE room_id = $1 AND session_id = $2", [room.id, participant.sessionId]);
+  await owner.post(`/rooms/${room.id}/submissions/owner-key`, { publicKey: base64(await createPublicKey()) }).expect(201);
+  await participant.post(`/rooms/${room.id}/submissions/submitter-key`, { publicKey: base64(await createPublicKey()) }).expect(201);
+  const upload = await participant.post(`/rooms/${room.id}/submissions`, { uploadId: randomUUID() }).expect(201);
+  const descriptor = Buffer.alloc(69, 7), envelope = { enc: Buffer.alloc(65, 4).toString('base64'), ciphertext: Buffer.alloc(16, 8).toString('base64') };
+  await participant.put(`/rooms/${room.id}/submissions/${upload.body.id}/metadata`, { descriptor: descriptor.toString('base64'), ownerEnvelope: envelope, submitterEnvelope: envelope }).expect(204);
+  const chunk = Buffer.alloc(16, 9);
+  await participant.put(`/rooms/${room.id}/submissions/${upload.body.id}/chunks/0`, chunk, 'application/octet-stream').expect(201);
+  const digest = sha256(chunk), manifest = sha256(Buffer.concat([descriptor, digest])).toString('hex');
+  await participant.post(`/rooms/${room.id}/submissions/${upload.body.id}/complete`, { chunkCount: 1, manifestSha256: manifest }).expect(200);
+  await database.query("UPDATE memberships SET last_checked_at = clock_timestamp() - interval '6 minutes' WHERE room_id = $1 AND session_id = $2", [room.id, participant.sessionId]);
+  await participant.get(`/rooms/${room.id}/submissions/keys`).expect(403);
+  await participant.get(`/rooms/${room.id}/submissions`).expect(403);
+  await participant.get(`/rooms/${room.id}/submissions/${upload.body.id}/chunks/0`).expect(403);
+  await owner.get(`/rooms/${room.id}/submissions`).expect(200);
+  await database.query('UPDATE memberships SET last_inside = FALSE, last_checked_at = clock_timestamp() WHERE room_id = $1 AND session_id = $2', [room.id, participant.sessionId]);
+  await participant.get(`/rooms/${room.id}/submissions`).expect(403);
+  await database.query('UPDATE memberships SET last_inside = TRUE, last_checked_at = clock_timestamp() WHERE room_id = $1 AND session_id = $2', [room.id, participant.sessionId]);
+  await participant.get(`/rooms/${room.id}/submissions`).expect(200);
+  await owner.patch(`/rooms/${room.id}/members/${member.id}`, { status: 'revoked' }).expect(200);
+  await participant.get(`/rooms/${room.id}/submissions`).expect(403);
 });
 
 test('submission start and chunk writes require origin, CSRF and current approved membership', async () => {

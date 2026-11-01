@@ -32,10 +32,7 @@ function removePassFragment() {
   );
 }
 
-function inboxKeyFragment() {
-  const key = new URLSearchParams(window.location.hash.slice(1)).get('key');
-  return key && /^[a-f0-9]{64}$/.test(key) ? `#key=${encodeURIComponent(key)}` : '';
-}
+function roomKeyFragment() { const params=new URLSearchParams();const key=new URLSearchParams(window.location.hash.slice(1)).get('key');const files=new URLSearchParams(window.location.hash.slice(1)).getAll('files');if(key&&/^[a-f0-9]{64}$/.test(key))params.set('key',key);if(files.length===1&&/^[A-Za-z0-9_-]{43}$/.test(files[0]))params.set('files',files[0]);return params.size?`#${params}`:''; }
 
 export function JoinPage({ code }: { code: string }) {
   const [room, setRoom] = useState<PublicRoom | null>(null);
@@ -149,9 +146,9 @@ export function JoinPage({ code }: { code: string }) {
       <p className="muted">
         {room.submissionCleanupEnabled
           ? room.submissionsPurgedAt
-            ? 'The server has removed encrypted submissions for this room.'
-            : 'Completed encrypted submissions are scheduled for removal after this deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
-          : 'Automatic room deadline cleanup is disabled. Incomplete uploads are still removed after 24 hours.'}
+            ? 'The server has removed encrypted private submissions and shared files for this room.'
+            : 'Completed encrypted private submissions and shared files are scheduled for removal after this deadline, usually within a minute while running and longer with a backlog or downtime. Unfinished uploads are removed after 24 hours.'
+          : 'Automatic room deadline cleanup is disabled. Incomplete private submissions and shared file uploads are still removed after 24 hours.'}
       </p>
       {loadError && (
         <p role="alert" className="error">
@@ -170,7 +167,7 @@ export function JoinPage({ code }: { code: string }) {
             : 'This room has closed.'}
         </p>
       ) : room.isOwner || room.membershipStatus === 'approved' ? (
-        <a className="button" href={`/rooms/${room.id}${inboxKeyFragment()}`}>
+        <a className="button" href={`/rooms/${room.id}${roomKeyFragment()}`}>
           Enter room
         </a>
       ) : room.membershipStatus === 'pending' && room.admissionPolicy === 'approval' ? (
@@ -184,7 +181,7 @@ export function JoinPage({ code }: { code: string }) {
           room={room}
           code={code}
           onAdmitted={() => {
-            window.location.assign(`/rooms/${room.id}${inboxKeyFragment()}`);
+            window.location.assign(`/rooms/${room.id}${roomKeyFragment()}`);
           }}
         />
       ) : room.admissionPolicy === 'pass' && !passToken ? (

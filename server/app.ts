@@ -8,6 +8,7 @@ import { createGeocoder } from "./geocoding.js";
 import { roomRoutes } from "./rooms.js";
 import { sessionControls } from "./sessions.js";
 import { submissionRoutes } from "./submissions.js";
+import { roomFilesRoutes } from "./roomFiles.js";
 import { passRoutes } from "./passes.js";
 import { proofAdmissionRoutes } from "./proofAdmission.js";
 import { credentialGroupRoutes } from "./credentialGroups.js";
@@ -116,6 +117,7 @@ export function createApp(database: Database, options: AppOptions) {
     }),
   );
   app.use("/api", submissionRoutes(database));
+  app.use("/api", roomFilesRoutes(database));
   app.use("/api", (_request, response) => {
     response.status(404).json({
       error: { code: "NOT_FOUND", message: "API endpoint not found." },
