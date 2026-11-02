@@ -1,3 +1,5 @@
+Sumedh and Tarun completed their FSD Presentations on 02/11/2026!
+
 # Portkey
 
 A temporary-room file-sharing platform built with React, TypeScript, Express and PostgreSQL/PGlite. Organizers distribute browser-encrypted files to approved participants. Optional Groth16 credential proofs admit eligible students without sending their credential secret, signature, name or roll number to the API.
